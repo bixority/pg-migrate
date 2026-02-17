@@ -1,0 +1,75 @@
+services:
+  db-old:
+    image: postgres:9.5
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: "postgres"
+      POSTGRES_PASSWORD: "dev"
+      POSTGRES_USER: "dev"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h $$(hostname -i)" ]
+      interval: 3s
+      timeout: 15s
+      retries: 10
+    volumes:
+      - db-old:/var/lib/postgresql/9.5
+      - ./.docker/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      common:
+        aliases:
+          - db-old
+
+  db-new:
+    image: postgres:18.2
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: "postgres"
+      POSTGRES_PASSWORD: "dev"
+      POSTGRES_USER: "dev"
+    healthcheck:
+      test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h $$(hostname -i)" ]
+      interval: 3s
+      timeout: 15s
+      retries: 10
+    volumes:
+      - db-new:/var/lib/postgresql/18
+    networks:
+      common:
+        aliases:
+          - db-new
+
+  pg-migrate:
+    build:
+      context: ./
+      dockerfile: Containerfile
+    image: localhost/pg-migrate
+    command: [
+      "--from-host", "db-old",
+      "--from-port", "5432",
+      "--from-user", "dev",
+      "--from-pass", "dev",
+      "--to-host", "db-new",
+      "--to-port", "5432",
+      "--to-user", "dev",
+      "--to-pass", "dev",
+    ]
+    depends_on:
+      db-old:
+        condition: service_healthy
+      db-new:
+        condition: service_healthy
+    networks:
+      common:
+        aliases:
+          - pg-migrate
+
+volumes:
+  db-old:
+  db-new:
+
+
+networks:
+  common:
+    driver: bridge
