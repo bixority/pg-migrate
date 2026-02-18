@@ -225,7 +225,7 @@ jobs:
       - name: Publish crate to codeberg
         run: cargo publish --registry bixority-codeberg
         env:
-          CARGO_REGISTRIES_BIXORITY_CODEBERG_TOKEN: ${{ secrets.CODEBERG_TOKEN }}
+          CARGO_REGISTRIES_BIXORITY_CODEBERG_TOKEN: Bearer ${{ secrets.CODEBERG_TOKEN }}
 
   push:
     name: Publish image to container registry
