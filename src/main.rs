@@ -33,9 +33,11 @@ struct Args {
     #[arg(long, default_value = "postgres")]
     to_db: String,
 
-    #[arg(short, long, default_value_t = 4)]
-    jobs: usize,
-    #[arg(short, long, default_value_t = 4)]
+    #[arg(long, default_value_t = 24)]
+    dump_jobs: usize,
+    #[arg(long, default_value_t = 12)]
+    restore_jobs: usize,
+    #[arg(short = 'p', long, default_value_t = 6)]
     max_parallel: usize,
     #[arg(long, default_value = "pg_dumps")]
     dump_root: String,
@@ -59,7 +61,8 @@ async fn main() -> Result<()> {
         to_user: args.to_user,
         to_pass: args.to_pass,
         to_db: args.to_db,
-        jobs: args.jobs,
+        dump_jobs: args.dump_jobs,
+        restore_jobs: args.restore_jobs,
         max_parallel: args.max_parallel,
         dump_root: args.dump_root.into(),
         migrate_globals: args.migrate_globals,
