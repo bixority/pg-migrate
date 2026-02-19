@@ -99,7 +99,7 @@ async fn main() -> Result<()> {
 
     for db in dbs.clone() {
         if done_marker(&db).exists() {
-            println!("Skipping {db}");
+            mp.println(format!("Skipping {db}"))?;
             continue;
         }
 

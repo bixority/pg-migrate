@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
 use std::{
     collections::BTreeMap,
     env,
@@ -157,14 +157,22 @@ pub async fn migrate_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Re
     .parse::<u64>()
     .unwrap_or(0);
 
-    pb.set_length(size * 2);
+    // Total bar represents two phases: dump (0-50%) and restore (50-100%).
+    // Use percentage display to avoid confusion with doubled byte counters.
+    let mut bar_total = size.saturating_mul(2);
+    if bar_total == 0 {
+        // Fallback to a 0-100 percentage bar when size is unknown/unavailable
+        bar_total = 100;
+    }
+    let phase_mid = bar_total / 2;
+    let phase_end = bar_total;
+
+    pb.set_length(bar_total);
     pb.set_style(
-        ProgressStyle::with_template(
-            "[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta}) {msg}",
-        )?
-        .progress_chars("#>-"),
+        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {percent:>3}% {msg}")?
+            .progress_chars("#>-"),
     );
-    pb.set_message(format!("Dumping {db}"));
+    pb.set_message(format!("Dumping {db} ({})", HumanBytes(size)));
 
     let dump_path = dump_dir(&config.dump_root, db);
     fs::create_dir_all(&dump_path)?;
@@ -199,8 +207,8 @@ pub async fn migrate_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Re
         }
     }
 
-    pb.set_position(size);
-    pb.set_message(format!("Restoring {db}"));
+    pb.set_position(phase_mid);
+    pb.set_message(format!("Restoring {db} ({})", HumanBytes(size)));
 
     let out = Command::new("pg_restore")
         .env("PGPASSWORD", &config.to_pass)
@@ -227,7 +235,7 @@ pub async fn migrate_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Re
         anyhow::bail!("pg_restore failed for {db}: {stderr}");
     }
 
-    pb.set_position(size * 2);
+    pb.set_position(phase_end);
     pb.finish_with_message(format!("{db} complete"));
     fs::write(done_marker(db), "")?;
     Ok(())
