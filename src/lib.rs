@@ -7,6 +7,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 use tokio::process::Command;
 
@@ -135,6 +136,14 @@ pub async fn discover_databases(config: &Config) -> Result<Vec<String>> {
 ///
 /// Panics if the dump path cannot be converted to a string.
 pub async fn migrate_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Result<()> {
+    let pb = mp.add(ProgressBar::new(0));
+    pb.set_style(
+        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {msg}")?
+            .progress_chars("#>-"),
+    );
+    pb.enable_steady_tick(Duration::from_secs(1));
+    pb.set_message(format!("Calculating size of {db}"));
+
     let size = db_size(
         &config.from_host,
         &config.from_port,
@@ -146,7 +155,7 @@ pub async fn migrate_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Re
     .parse::<u64>()
     .unwrap_or(0);
 
-    let pb = mp.add(ProgressBar::new(size * 2));
+    pb.set_length(size * 2);
     pb.set_style(
         ProgressStyle::with_template(
             "[{elapsed_precise}] {bar:40.cyan/blue} {bytes}/{total_bytes} ({eta}) {msg}",
