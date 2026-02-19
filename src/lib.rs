@@ -28,6 +28,7 @@ pub struct Config {
 
     pub dump_root: PathBuf,
     pub migrate_globals: bool,
+    pub disable_dst_optimizations: bool,
 }
 
 impl Default for Config {
@@ -47,6 +48,7 @@ impl Default for Config {
             max_parallel: 10,
             dump_root: home().join("pg_dumps"),
             migrate_globals: true,
+            disable_dst_optimizations: false,
         }
     }
 }

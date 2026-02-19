@@ -41,6 +41,8 @@ struct Args {
     dump_root: String,
     #[arg(long, default_value_t = true)]
     migrate_globals: bool,
+    #[arg(long, default_value_t = false)]
+    disable_dst_optimizations: bool,
 }
 
 #[tokio::main]
@@ -61,6 +63,7 @@ async fn main() -> Result<()> {
         max_parallel: args.max_parallel,
         dump_root: args.dump_root.into(),
         migrate_globals: args.migrate_globals,
+        disable_dst_optimizations: args.disable_dst_optimizations,
     });
 
     fs::create_dir_all(state_dir())?;
@@ -74,7 +77,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    enable_fast_restore(&config).await?;
+    if !config.disable_dst_optimizations {
+        enable_fast_restore(&config).await?;
+    }
 
     if config.migrate_globals {
         migrate_globals(&config).await?;
@@ -110,7 +115,10 @@ async fn main() -> Result<()> {
     }
 
     verify_all(&config, &dbs).await?;
-    restore_safe_settings(&config).await?;
+
+    if !config.disable_dst_optimizations {
+        restore_safe_settings(&config).await?;
+    }
 
     println!("\nMigration complete.");
     Ok(())
