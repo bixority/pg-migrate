@@ -20,7 +20,7 @@ cli = ["dep:clap"]
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }
-anyhow = "1.0.101"
+anyhow = "1.0.102"
 indicatif = "0.18.4"
 clap = { version = "4.5.60", features = ["derive"], optional = true }
 
