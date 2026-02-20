@@ -5,10 +5,6 @@ edition = "2024"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
 
-[lib]
-name = "pg_migrate"
-crate-type = ["rlib", "cdylib"]
-
 [[bin]]
 name = "pg-migrate"
 path = "src/main.rs"

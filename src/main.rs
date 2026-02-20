@@ -1,13 +1,64 @@
+mod db;
+mod tui;
+
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
 use log::info;
-use pg_migrate::{
-    Config, create_dbs, discover_databases, done_marker, enable_fast_restore, migrate_db,
-    migrate_globals, restore_safe_settings, state_dir, verify_all, verify_dir,
-};
-use std::{fs, sync::Arc};
+use std::{env, fs, path::PathBuf, sync::Arc};
 use tokio::sync::Semaphore;
+
+pub struct Config {
+    pub from_host: String,
+    pub from_port: String,
+    pub from_user: String,
+    pub from_pass: String,
+    pub from_db: String,
+
+    pub to_host: String,
+    pub to_port: String,
+    pub to_user: String,
+    pub to_pass: String,
+    pub to_db: String,
+
+    pub dump_jobs: usize,
+    pub restore_jobs: usize,
+    pub max_parallel: usize,
+
+    pub dump_root: PathBuf,
+    pub migrate_globals: bool,
+    pub disable_dst_optimizations: bool,
+}
+
+/// Returns the user's home directory.
+///
+/// # Panics
+///
+/// Panics if the `HOME` environment variable is not set.
+#[must_use]
+pub fn home() -> PathBuf {
+    PathBuf::from(env::var("HOME").expect("HOME not set"))
+}
+
+/// Returns the directory used for state markers.
+///
+/// # Panics
+///
+/// Panics if the `HOME` environment variable is not set.
+#[must_use]
+pub fn state_dir() -> PathBuf {
+    home().join("pg_migrate_state")
+}
+
+/// Returns the directory used for verification markers.
+///
+/// # Panics
+///
+/// Panics if the `HOME` environment variable is not set.
+#[must_use]
+pub fn verify_dir() -> PathBuf {
+    home().join("pg_verify_state")
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -85,7 +136,7 @@ async fn main() -> Result<()> {
     fs::create_dir_all(state_dir())?;
     fs::create_dir_all(verify_dir())?;
 
-    let dbs_with_sizes = discover_databases(&config).await?;
+    let dbs_with_sizes = db::discover_databases(&config).await?;
     let db_names: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
     info!("Databases: {db_names:?}");
 
@@ -95,21 +146,21 @@ async fn main() -> Result<()> {
     }
 
     if !config.disable_dst_optimizations {
-        enable_fast_restore(&config).await?;
+        db::enable_fast_restore(&config).await?;
     }
 
     if config.migrate_globals {
-        migrate_globals(&config).await?;
+        db::migrate_globals(&config).await?;
     }
 
-    create_dbs(&config, &db_names).await?;
+    db::create_dbs(&config, &db_names).await?;
 
     let sem = Arc::new(Semaphore::new(config.max_parallel));
 
     let mut tasks = vec![];
 
     for (db, size) in dbs_with_sizes {
-        if done_marker(&db).exists() {
+        if db::done_marker(&db).exists() {
             info!("Skipping {db}");
             continue;
         }
@@ -120,7 +171,7 @@ async fn main() -> Result<()> {
 
         tasks.push(tokio::spawn(async move {
             let _p = permit;
-            migrate_db(&config, &db, size, mp).await
+            db::migrate_db(&config, &db, size, mp).await
         }));
     }
 
@@ -128,10 +179,10 @@ async fn main() -> Result<()> {
         t.await??;
     }
 
-    verify_all(&config, &db_names).await?;
+    db::verify_all(&config, &db_names).await?;
 
     if !config.disable_dst_optimizations {
-        restore_safe_settings(&config).await?;
+        db::restore_safe_settings(&config).await?;
     }
 
     info!("Migration complete.");
