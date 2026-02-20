@@ -72,10 +72,11 @@ async fn main() -> Result<()> {
     fs::create_dir_all(state_dir())?;
     fs::create_dir_all(verify_dir())?;
 
-    let dbs = discover_databases(&config).await?;
-    println!("Databases: {dbs:?}");
+    let dbs_with_sizes = discover_databases(&config).await?;
+    let db_names: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
+    println!("Databases: {db_names:?}");
 
-    if dbs.is_empty() {
+    if dbs_with_sizes.is_empty() {
         println!("No databases found to migrate.");
         return Ok(());
     }
@@ -88,7 +89,7 @@ async fn main() -> Result<()> {
         migrate_globals(&config).await?;
     }
 
-    create_dbs(&config, &dbs).await?;
+    create_dbs(&config, &db_names).await?;
 
     let mp = Arc::new(MultiProgress::with_draw_target(
         ProgressDrawTarget::stdout_with_hz(10),
@@ -97,7 +98,7 @@ async fn main() -> Result<()> {
 
     let mut tasks = vec![];
 
-    for db in dbs.clone() {
+    for (db, size) in dbs_with_sizes {
         if done_marker(&db).exists() {
             mp.println(format!("Skipping {db}"))?;
             continue;
@@ -109,7 +110,7 @@ async fn main() -> Result<()> {
 
         tasks.push(tokio::spawn(async move {
             let _p = permit;
-            migrate_db(&config, &db, mp).await
+            migrate_db(&config, &db, size, mp).await
         }));
     }
 
@@ -117,7 +118,7 @@ async fn main() -> Result<()> {
         t.await??;
     }
 
-    verify_all(&config, &dbs).await?;
+    verify_all(&config, &db_names).await?;
 
     if !config.disable_dst_optimizations {
         restore_safe_settings(&config).await?;

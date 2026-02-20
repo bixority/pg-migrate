@@ -10,6 +10,7 @@ use std::{
     time::Duration,
 };
 use tokio::process::Command;
+use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
 pub struct Config {
     pub from_host: String,
@@ -90,42 +91,47 @@ fn dump_dir(root: &Path, db: &str) -> PathBuf {
     root.join(db)
 }
 
-/// Discovers databases to migrate.
+async fn pg_pool(host: &str, port: &str, user: &str, pass: &str, db: &str) -> Result<PgPool> {
+    let url = format!("postgres://{user}:{pass}@{host}:{port}/{db}");
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await?;
+    Ok(pool)
+}
+
+/// Discovers databases to migrate and their sizes.
 ///
 /// # Errors
 ///
-/// Returns an error if the `psql` command fails or if the output cannot be parsed.
-pub async fn discover_databases(config: &Config) -> Result<Vec<String>> {
-    let out = Command::new("psql")
-        .env("PGPASSWORD", &config.from_pass)
-        .args([
-            "-h",
-            &config.from_host,
-            "-p",
-            &config.from_port,
-            "-U",
-            &config.from_user,
-            "-d",
-            &config.from_db,
-            "-At",
-            "-c",
-            "SELECT datname FROM pg_database \
-             WHERE datname NOT IN ('postgres','template0','template1') \
-             AND datallowconn IS TRUE \
-             ORDER BY datname;",
-        ])
-        .output()
-        .await?;
+/// Returns an error if the query fails or if the output cannot be parsed.
+pub async fn discover_databases(config: &Config) -> Result<Vec<(String, u64)>> {
+    let pool = pg_pool(
+        &config.from_host,
+        &config.from_port,
+        &config.from_user,
+        &config.from_pass,
+        &config.from_db,
+    )
+    .await?;
 
-    if !out.status.success() {
-        anyhow::bail!("psql failed: {}", String::from_utf8_lossy(&out.stderr));
+    let rows = sqlx::query(
+        "SELECT datname, pg_database_size(datname) AS size \
+         FROM pg_database \
+         WHERE datname NOT IN ('postgres','template0','template1') \
+         AND datallowconn IS TRUE \
+         ORDER BY pg_database_size(datname) ASC;",
+    )
+    .fetch_all(&pool)
+    .await?;
+
+    let mut dbs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.get(0);
+        let size: i64 = row.get(1);
+        dbs.push((name, size.max(0).try_into().unwrap_or(0)));
     }
-
-    Ok(String::from_utf8(out.stdout)?
-        .lines()
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-        .collect())
+    Ok(dbs)
 }
 
 /// Migrates a single database.
@@ -137,25 +143,18 @@ pub async fn discover_databases(config: &Config) -> Result<Vec<String>> {
 /// # Panics
 ///
 /// Panics if the dump path cannot be converted to a string.
-pub async fn migrate_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Result<()> {
+pub async fn migrate_db(
+    config: &Config,
+    db: &str,
+    size: u64,
+    mp: Arc<MultiProgress>,
+) -> Result<()> {
     let pb = mp.add(ProgressBar::new(0));
     pb.set_style(
         ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {msg}")?
             .progress_chars("#>-"),
     );
     pb.enable_steady_tick(Duration::from_secs(1));
-    pb.set_message(format!("Calculating size of {db}"));
-
-    let size = db_size(
-        &config.from_host,
-        &config.from_port,
-        &config.from_pass,
-        &config.from_user,
-        db,
-    )
-    .await?
-    .parse::<u64>()
-    .unwrap_or(0);
 
     // Total bar represents two phases: dump (0-50%) and restore (50-100%).
     // Use percentage display to avoid confusion with doubled byte counters.
@@ -373,32 +372,21 @@ pub async fn stat_counts(
     user: &str,
     db: &str,
 ) -> Result<String> {
-    let out = Command::new("psql")
-        .env("PGPASSWORD", pass)
-        .args([
-            "-h",
-            host,
-            "-p",
-            port,
-            "-U",
-            user,
-            "-d",
-            db,
-            "-At",
-            "-c",
-            "SELECT schemaname||'.'||relname||':'||n_live_tup FROM pg_stat_user_tables ORDER BY 1",
-        ])
-        .output()
-        .await?;
+    let pool = pg_pool(host, port, user, pass, db).await?;
+    let rows = sqlx::query(
+        "SELECT schemaname, relname, n_live_tup FROM pg_stat_user_tables ORDER BY 1, 2",
+    )
+    .fetch_all(&pool)
+    .await?;
 
-    if !out.status.success() {
-        anyhow::bail!(
-            "stat_counts psql failed: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
+    let mut out = String::new();
+    for row in rows {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+        let n: i64 = row.get(2);
+        let _ = writeln!(out, "{}.{}:{}", schema, table, n.max(0));
     }
-
-    Ok(String::from_utf8(out.stdout)?)
+    Ok(out)
 }
 
 /// Returns the size of a database in bytes.
@@ -407,29 +395,13 @@ pub async fn stat_counts(
 ///
 /// Returns an error if the `psql` command fails or if the output cannot be parsed.
 pub async fn db_size(host: &str, port: &str, pass: &str, user: &str, db: &str) -> Result<String> {
-    let out = Command::new("psql")
-        .env("PGPASSWORD", pass)
-        .args([
-            "-h",
-            host,
-            "-p",
-            port,
-            "-U",
-            user,
-            "-d",
-            db, // ensure we can connect even if default DB doesn't exist
-            "-At",
-            "-c",
-            &format!("SELECT pg_database_size('{db}')"),
-        ])
-        .output()
+    let pool = pg_pool(host, port, user, pass, db).await?;
+    let row = sqlx::query("SELECT pg_database_size($1) AS size")
+        .bind(db)
+        .fetch_one(&pool)
         .await?;
-
-    if !out.status.success() {
-        anyhow::bail!("psql failed: {}", String::from_utf8_lossy(&out.stderr));
-    }
-
-    Ok(String::from_utf8(out.stdout)?.trim().to_string())
+    let size: i64 = row.get("size");
+    Ok(size.max(0).to_string())
 }
 
 /// Enables fast restore settings on the destination server.
@@ -446,47 +418,21 @@ pub async fn enable_fast_restore(config: &Config) -> Result<()> {
         ("checkpoint_completion_target", "0.9"),
     ];
 
+    let pool = pg_pool(
+        &config.to_host,
+        &config.to_port,
+        &config.to_user,
+        &config.to_pass,
+        &config.to_db,
+    )
+    .await?;
+
     for (k, v) in settings {
-        let status = Command::new("psql")
-            .env("PGPASSWORD", &config.to_pass)
-            .args([
-                "-h",
-                &config.to_host,
-                "-p",
-                &config.to_port,
-                "-U",
-                &config.to_user,
-                "-d",
-                &config.to_db,
-                "-c",
-                &format!("ALTER SYSTEM SET {k} TO {v};"),
-            ])
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!("Failed to set {k} to {v}");
-        }
+        let sql = format!("ALTER SYSTEM SET {k} TO {v};");
+        sqlx::query(&sql).execute(&pool).await?;
     }
 
-    let status = Command::new("psql")
-        .env("PGPASSWORD", &config.to_pass)
-        .args([
-            "-h",
-            &config.to_host,
-            "-p",
-            &config.to_port,
-            "-U",
-            &config.to_user,
-            "-d",
-            &config.to_db,
-            "-c",
-            "SELECT pg_reload_conf();",
-        ])
-        .status()
-        .await?;
-    if !status.success() {
-        anyhow::bail!("Failed to reload config");
-    }
+    sqlx::query("SELECT pg_reload_conf();").execute(&pool).await?;
     Ok(())
 }
 
@@ -498,43 +444,20 @@ pub async fn enable_fast_restore(config: &Config) -> Result<()> {
 pub async fn restore_safe_settings(config: &Config) -> Result<()> {
     let settings = ["fsync", "synchronous_commit", "full_page_writes"];
 
+    let pool = pg_pool(
+        &config.to_host,
+        &config.to_port,
+        &config.to_user,
+        &config.to_pass,
+        &config.to_db,
+    )
+    .await?;
+
     for s in settings {
-        let status = Command::new("psql")
-            .env("PGPASSWORD", &config.to_pass)
-            .args([
-                "-h",
-                &config.to_host,
-                "-p",
-                &config.to_port,
-                "-U",
-                &config.to_user,
-                "-d",
-                &config.to_db,
-                "-c",
-                &format!("ALTER SYSTEM RESET {s};"),
-            ])
-            .status()
-            .await?;
-        if !status.success() {
-            anyhow::bail!("Failed to reset {s}");
-        }
+        let sql = format!("ALTER SYSTEM RESET {s};");
+        sqlx::query(&sql).execute(&pool).await?;
     }
-    Command::new("psql")
-        .env("PGPASSWORD", &config.to_pass)
-        .args([
-            "-h",
-            &config.to_host,
-            "-p",
-            &config.to_port,
-            "-U",
-            &config.to_user,
-            "-d",
-            &config.to_db,
-            "-c",
-            "SELECT pg_reload_conf();",
-        ])
-        .status()
-        .await?;
+    sqlx::query("SELECT pg_reload_conf();").execute(&pool).await?;
     Ok(())
 }
 
@@ -544,26 +467,20 @@ pub async fn restore_safe_settings(config: &Config) -> Result<()> {
 ///
 /// Returns an error if `CREATE DATABASE` fails.
 pub async fn create_dbs(config: &Config, dbs: &[String]) -> Result<()> {
+    let pool = pg_pool(
+        &config.to_host,
+        &config.to_port,
+        &config.to_user,
+        &config.to_pass,
+        &config.to_db,
+    )
+    .await?;
+
     for db in dbs {
-        let status = Command::new("psql")
-            .env("PGPASSWORD", &config.to_pass)
-            .args([
-                "-h",
-                &config.to_host,
-                "-p",
-                &config.to_port,
-                "-U",
-                &config.to_user,
-                "-d",
-                &config.to_db,
-                "-c",
-                &format!("CREATE DATABASE \"{db}\";"),
-            ])
-            .status()
-            .await?;
-        if !status.success() {
+        let sql = format!("CREATE DATABASE \"{db}\"");
+        if let Err(e) = sqlx::query(&sql).execute(&pool).await {
             // It might already exist, which is fine for resume
-            println!("Warning: CREATE DATABASE \"{db}\" failed or already exists.");
+            println!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
         }
     }
     Ok(())
@@ -663,44 +580,34 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
     }
     fs::write(&globals_path, filtered_content.join("\n"))?;
 
-    let out = Command::new("psql")
-        .env("PGPASSWORD", &config.to_pass)
-        .args([
-            "-h",
-            &config.to_host,
-            "-p",
-            &config.to_port,
-            "-U",
-            &config.to_user,
-            "-d",
-            &config.to_db,
-            "-f",
-            globals_path.to_str().expect("invalid globals path"),
-        ])
-        .output()
-        .await
-        .context("restoring globals failed")?;
+    // Execute globals via sqlx instead of psql
+    let pool = pg_pool(
+        &config.to_host,
+        &config.to_port,
+        &config.to_user,
+        &config.to_pass,
+        &config.to_db,
+    )
+    .await?;
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let mut filtered_stderr = Vec::new();
-        for line in stderr.lines() {
-            if line.contains("ERROR:  role") && line.contains("already exists") {
+    let sql = fs::read_to_string(&globals_path)?;
+    // Naively split statements by semicolon followed by newline; skip empty chunks
+    for stmt in sql.split(";\n") {
+        let s = stmt.trim();
+        if s.is_empty() { continue; }
+        // add back the semicolon to be safe for certain commands
+        let exec_sql = format!("{s};");
+        if let Err(e) = sqlx::query(&exec_sql).execute(&pool).await {
+            let msg = format!("{e}");
+            if msg.contains("already exists") {
                 continue;
             }
-            if line.contains("WARNING:  setting an MD5-encrypted password")
-                || line.contains("DETAIL:  MD5 password support is deprecated")
-                || line.contains("HINT:  Refer to the PostgreSQL documentation")
+            if msg.contains("MD5-encrypted password")
+                || msg.contains("MD5 password support is deprecated")
             {
                 continue;
             }
-            filtered_stderr.push(line);
-        }
-        if !filtered_stderr.is_empty() {
-            println!(
-                "Warning: psql restored globals with some errors:\n{}",
-                filtered_stderr.join("\n")
-            );
+            println!("Warning: executing globals statement failed: {msg}");
         }
     }
 
