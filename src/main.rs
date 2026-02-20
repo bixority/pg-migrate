@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressDrawTarget};
+use log::info;
 use pg_migrate::{
     Config, create_dbs, discover_databases, done_marker, enable_fast_restore, migrate_db,
     migrate_globals, restore_safe_settings, state_dir, verify_all, verify_dir,
@@ -50,6 +51,18 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     let args = Args::parse();
+
+    let logger =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
+
+    let mp = Arc::new(MultiProgress::with_draw_target(
+        ProgressDrawTarget::stderr_with_hz(10),
+    ));
+
+    indicatif_log_bridge::LogWrapper::new((*mp).clone(), logger)
+        .try_init()
+        .expect("failed to init log wrapper");
+
     let config = Arc::new(Config {
         from_host: args.from_host,
         from_port: args.from_port,
@@ -74,10 +87,10 @@ async fn main() -> Result<()> {
 
     let dbs_with_sizes = discover_databases(&config).await?;
     let db_names: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
-    println!("Databases: {db_names:?}");
+    info!("Databases: {db_names:?}");
 
     if dbs_with_sizes.is_empty() {
-        println!("No databases found to migrate.");
+        info!("No databases found to migrate.");
         return Ok(());
     }
 
@@ -91,16 +104,13 @@ async fn main() -> Result<()> {
 
     create_dbs(&config, &db_names).await?;
 
-    let mp = Arc::new(MultiProgress::with_draw_target(
-        ProgressDrawTarget::stdout_with_hz(10),
-    ));
     let sem = Arc::new(Semaphore::new(config.max_parallel));
 
     let mut tasks = vec![];
 
     for (db, size) in dbs_with_sizes {
         if done_marker(&db).exists() {
-            mp.println(format!("Skipping {db}"))?;
+            info!("Skipping {db}");
             continue;
         }
 
@@ -124,6 +134,6 @@ async fn main() -> Result<()> {
         restore_safe_settings(&config).await?;
     }
 
-    println!("\nMigration complete.");
+    info!("Migration complete.");
     Ok(())
 }

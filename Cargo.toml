@@ -19,11 +19,14 @@ default = ["cli"]
 cli = ["dep:clap"]
 
 [dependencies]
-tokio = { version = "1.49.0", features = ["full"] }
 anyhow = "1.0.102"
-indicatif = "0.18.4"
 clap = { version = "4.5.60", features = ["derive"], optional = true }
+env_logger = "0.11.9"
+indicatif = "0.18.4"
+indicatif-log-bridge = "0.2.3"
+log = "0.4.26"
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "macros", "tls-rustls"] }
+tokio = { version = "1.49.0", features = ["full"] }
 
 [profile.release]
 codegen-units = 1

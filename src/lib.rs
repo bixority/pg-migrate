@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar, ProgressStyle};
+use log::{info, warn};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::{
     collections::BTreeMap,
     env,
@@ -10,7 +12,6 @@ use std::{
     time::Duration,
 };
 use tokio::process::Command;
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
 
 pub struct Config {
     pub from_host: String,
@@ -350,12 +351,12 @@ pub async fn verify_db(config: &Config, db: &str) -> Result<()> {
     }
 
     if mismatch {
-        println!("{output}");
+        info!("{output}");
         anyhow::bail!("Verification failed for {db}: tables or row counts mismatch");
     }
 
-    println!("{output}");
-    println!("Verified {db}: {} tables, all rows match", tables.len());
+    info!("{output}");
+    info!("Verified {db}: {} tables, all rows match", tables.len());
     fs::write(verify_marker(db), "")?;
     Ok(())
 }
@@ -432,7 +433,9 @@ pub async fn enable_fast_restore(config: &Config) -> Result<()> {
         sqlx::query(&sql).execute(&pool).await?;
     }
 
-    sqlx::query("SELECT pg_reload_conf();").execute(&pool).await?;
+    sqlx::query("SELECT pg_reload_conf();")
+        .execute(&pool)
+        .await?;
     Ok(())
 }
 
@@ -457,7 +460,9 @@ pub async fn restore_safe_settings(config: &Config) -> Result<()> {
         let sql = format!("ALTER SYSTEM RESET {s};");
         sqlx::query(&sql).execute(&pool).await?;
     }
-    sqlx::query("SELECT pg_reload_conf();").execute(&pool).await?;
+    sqlx::query("SELECT pg_reload_conf();")
+        .execute(&pool)
+        .await?;
     Ok(())
 }
 
@@ -480,7 +485,7 @@ pub async fn create_dbs(config: &Config, dbs: &[String]) -> Result<()> {
         let sql = format!("CREATE DATABASE \"{db}\"");
         if let Err(e) = sqlx::query(&sql).execute(&pool).await {
             // It might already exist, which is fine for resume
-            println!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
+            warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
         }
     }
     Ok(())
@@ -525,7 +530,7 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
         return Ok(());
     }
 
-    println!("Migrating global objects...");
+    info!("Migrating global objects...");
 
     let globals_path = config.dump_root.join("globals.sql");
     fs::create_dir_all(&config.dump_root)?;
@@ -559,7 +564,7 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
         if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
             && line.contains(&format!(" {} ", config.to_user))
         {
-            println!(
+            info!(
                 "Skipping migration of role '{}' to avoid password overwrite.",
                 config.to_user
             );
@@ -569,7 +574,7 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
         if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
             && line.ends_with(&format!(" {};", config.to_user))
         {
-            println!(
+            info!(
                 "Skipping migration of role '{}' to avoid password overwrite.",
                 config.to_user
             );
@@ -594,7 +599,9 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
     // Naively split statements by semicolon followed by newline; skip empty chunks
     for stmt in sql.split(";\n") {
         let s = stmt.trim();
-        if s.is_empty() { continue; }
+        if s.is_empty() {
+            continue;
+        }
         // add back the semicolon to be safe for certain commands
         let exec_sql = format!("{s};");
         if let Err(e) = sqlx::query(&exec_sql).execute(&pool).await {
@@ -607,7 +614,7 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
             {
                 continue;
             }
-            println!("Warning: executing globals statement failed: {msg}");
+            warn!("Warning: executing globals statement failed: {msg}");
         }
     }
 
