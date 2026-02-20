@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar};
 use log::{info, warn};
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::{
     collections::BTreeMap,
     fmt::Write,
@@ -12,8 +12,8 @@ use std::{
 };
 use tokio::process::Command;
 
-use crate::tui::{migration_style, render_verification_report};
 use crate::Config;
+use crate::tui::{migration_style, render_verification_report};
 use crate::{state_dir, verify_dir};
 
 pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
