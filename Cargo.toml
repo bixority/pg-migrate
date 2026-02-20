@@ -1,6 +1,6 @@
 [package]
 name = "pg-migrate"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
@@ -23,6 +23,7 @@ indicatif-log-bridge = "0.2.3"
 log = "0.4.26"
 sqlx = { version = "0.8.6", features = ["runtime-tokio", "postgres", "macros", "tls-rustls"] }
 tokio = { version = "1.49.0", features = ["full"] }
+tokio-util = "0.7.18"
 
 [profile.release]
 codegen-units = 1

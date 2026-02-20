@@ -7,6 +7,7 @@ use indicatif::{MultiProgress, ProgressDrawTarget};
 use log::info;
 use std::{env, fs, path::PathBuf, sync::Arc};
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 
 pub struct Config {
     pub from_host: String,
@@ -136,6 +137,17 @@ async fn main() -> Result<()> {
     fs::create_dir_all(state_dir())?;
     fs::create_dir_all(verify_dir())?;
 
+    let cancel = CancellationToken::new();
+
+    let cancel_signal = cancel.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c()
+            .await
+            .expect("failed to listen for ctrl-c");
+        eprintln!("\nInterrupt received, killing child processes…");
+        cancel_signal.cancel();
+    });
+
     let dbs_with_sizes = db::discover_databases(&config).await?;
     let db_names: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
     info!("Databases: {db_names:?}");
@@ -156,7 +168,6 @@ async fn main() -> Result<()> {
     db::create_dbs(&config, &db_names).await?;
 
     let sem = Arc::new(Semaphore::new(config.max_parallel));
-
     let mut tasks = vec![];
 
     for (db, size) in dbs_with_sizes {
@@ -168,15 +179,24 @@ async fn main() -> Result<()> {
         let permit = sem.clone().acquire_owned().await?;
         let mp = mp.clone();
         let config = config.clone();
+        let cancel_clone = cancel.clone();
 
         tasks.push(tokio::spawn(async move {
             let _p = permit;
-            db::migrate_db(&config, &db, size, mp).await
+            db::migrate_db(&config, &db, size, mp, cancel_clone).await
         }));
     }
 
     for t in tasks {
-        t.await??;
+        match t.await? {
+            Ok(()) => {}
+            Err(e) => {
+                if cancel.is_cancelled() {
+                    anyhow::bail!("Migration cancelled by user");
+                }
+                return Err(e);
+            }
+        }
     }
 
     db::verify_all(&config, &db_names).await?;

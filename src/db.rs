@@ -1,3 +1,6 @@
+use crate::Config;
+use crate::tui::{migration_style, render_verification_report};
+use crate::{state_dir, verify_dir};
 use anyhow::{Context, Result};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar};
 use log::{info, warn};
@@ -11,10 +14,8 @@ use std::{
     time::Duration,
 };
 use tokio::process::Command;
-
-use crate::Config;
-use crate::tui::{migration_style, render_verification_report};
-use crate::{state_dir, verify_dir};
+use tokio::select;
+use tokio_util::sync::CancellationToken;
 
 pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
     root.join(db)
@@ -63,6 +64,7 @@ pub async fn migrate_db(
     db: &str,
     size: u64,
     mp: Arc<MultiProgress>,
+    cancel: CancellationToken, // <-- add this
 ) -> Result<()> {
     let pb = mp.add(ProgressBar::new(0));
     pb.set_style(migration_style()?);
@@ -83,7 +85,8 @@ pub async fn migrate_db(
 
     if !dump_path.join("toc.dat").exists() {
         pb.set_message(format!("Dumping {db}"));
-        let out = Command::new("pg_dump")
+
+        let mut child = Command::new("pg_dump")
             .env("PGPASSWORD", &config.from_pass)
             .args([
                 "-h",
@@ -101,20 +104,26 @@ pub async fn migrate_db(
                 dump_path.to_str().expect("invalid dump path"),
                 db,
             ])
-            .output()
-            .await
-            .context("pg_dump failed to execute")?;
+            .spawn() // spawn, don't block
+            .context("pg_dump failed to start")?;
 
-        if !out.status.success() {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            anyhow::bail!("pg_dump failed for {db}: {stderr}");
+        let status = select! {
+            res = child.wait() => res.context("pg_dump wait failed")?,
+            () = cancel.cancelled() => {
+                let _ = child.kill().await;
+                anyhow::bail!("cancelled during pg_dump of {db}");
+            }
+        };
+
+        if !status.success() {
+            anyhow::bail!("pg_dump failed for {db}");
         }
     }
 
     pb.set_position(phase_mid);
     pb.set_message(format!("Restoring {db} ({})", HumanBytes(size)));
 
-    let out = Command::new("pg_restore")
+    let mut child = Command::new("pg_restore")
         .env("PGPASSWORD", &config.to_pass)
         .args([
             "-h",
@@ -130,13 +139,19 @@ pub async fn migrate_db(
             db,
             dump_path.to_str().expect("invalid dump path"),
         ])
-        .output()
-        .await
-        .context("pg_restore failed to execute")?;
+        .spawn()
+        .context("pg_restore failed to start")?;
 
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        anyhow::bail!("pg_restore failed for {db}: {stderr}");
+    let status = select! {
+        res = child.wait() => res.context("pg_restore wait failed")?,
+        () = cancel.cancelled() => {
+            let _ = child.kill().await;
+            anyhow::bail!("cancelled during pg_restore of {db}");
+        }
+    };
+
+    if !status.success() {
+        anyhow::bail!("pg_restore failed for {db}");
     }
 
     pb.set_position(phase_end);
