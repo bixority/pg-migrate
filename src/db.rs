@@ -76,15 +76,16 @@ pub async fn migrate_db(
     }
     let phase_mid = bar_total / 2;
     let phase_end = bar_total;
+    let human_size = HumanBytes(size);
 
     pb.set_length(bar_total);
-    pb.set_message(format!("Dumping {db} ({})", HumanBytes(size)));
+    pb.set_message(format!("Dumping {db} ({human_size})"));
 
     let dump_path = dump_dir(&config.dump_root, db);
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
-        pb.set_message(format!("Dumping {db}"));
+        pb.set_message(format!("Dumping {db} ({human_size})"));
 
         let mut child = Command::new("pg_dump")
             .env("PGPASSWORD", &config.from_pass)
@@ -121,7 +122,7 @@ pub async fn migrate_db(
     }
 
     pb.set_position(phase_mid);
-    pb.set_message(format!("Restoring {db} ({})", HumanBytes(size)));
+    pb.set_message(format!("Restoring {db} ({human_size})"));
 
     let mut child = Command::new("pg_restore")
         .env("PGPASSWORD", &config.to_pass)
@@ -155,7 +156,7 @@ pub async fn migrate_db(
     }
 
     pb.set_position(phase_end);
-    pb.finish_with_message(format!("{db} complete"));
+    pb.finish_with_message(format!("{db} ({human_size}) complete"));
     fs::write(done_marker(db), "")?;
     Ok(())
 }
