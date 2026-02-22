@@ -7,7 +7,6 @@ use log::{info, warn};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::{
     collections::BTreeMap,
-    fmt::Write,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -161,18 +160,18 @@ pub async fn migrate_db(
     Ok(())
 }
 
-pub async fn verify_all(config: &Config, dbs: &[String]) -> Result<()> {
+pub async fn verify_all(config: &Config, dbs: &[String], mp: Arc<MultiProgress>) -> Result<()> {
     for db in dbs {
         if verify_marker(db).exists() {
             continue;
         }
-        verify_db(config, db).await?;
+        verify_db(config, db, mp.clone()).await?;
     }
     Ok(())
 }
 
-pub async fn verify_db(config: &Config, db: &str) -> Result<()> {
-    let src_counts_str = stat_counts(
+pub async fn verify_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Result<()> {
+    let src_map = stat_counts(
         &config.from_host,
         &config.from_port,
         &config.from_pass,
@@ -180,7 +179,7 @@ pub async fn verify_db(config: &Config, db: &str) -> Result<()> {
         db,
     )
     .await?;
-    let dst_counts_str = stat_counts(
+    let dst_map = stat_counts(
         &config.to_host,
         &config.to_port,
         &config.to_pass,
@@ -189,35 +188,20 @@ pub async fn verify_db(config: &Config, db: &str) -> Result<()> {
     )
     .await?;
 
-    let src_map = parse_counts(&src_counts_str);
-    let dst_map = parse_counts(&dst_counts_str);
-
     let (output, mismatch) = render_verification_report(db, &src_map, &dst_map);
 
     if mismatch {
-        info!("{output}");
+        let _ = mp.println(&output);
         anyhow::bail!("Verification failed for {db}: tables or row counts mismatch");
     }
 
-    info!("{output}");
-    info!("Verified {db}: {} tables, all rows match", src_map.len());
+    let _ = mp.println(&output);
+    let _ = mp.println(format!(
+        "Verified {db}: {} tables, all rows match",
+        src_map.len()
+    ));
     fs::write(verify_marker(db), "")?;
     Ok(())
-}
-
-fn parse_counts(counts_str: &str) -> BTreeMap<String, String> {
-    counts_str
-        .lines()
-        .filter(|l| !l.is_empty())
-        .filter_map(|l| {
-            let parts: Vec<&str> = l.split(':').collect();
-            if parts.len() == 2 {
-                Some((parts[0].to_string(), parts[1].to_string()))
-            } else {
-                None
-            }
-        })
-        .collect()
 }
 
 pub async fn stat_counts(
@@ -226,22 +210,24 @@ pub async fn stat_counts(
     pass: &str,
     user: &str,
     db: &str,
-) -> Result<String> {
+) -> Result<BTreeMap<String, String>> {
     let pool = pg_pool(host, port, user, pass, db).await?;
-    let rows = sqlx::query(
-        "SELECT schemaname, relname, n_live_tup FROM pg_stat_user_tables ORDER BY 1, 2",
-    )
-    .fetch_all(&pool)
-    .await?;
 
-    let mut out = String::new();
-    for row in rows {
+    let tables = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2")
+        .fetch_all(&pool)
+        .await?;
+
+    let mut counts = BTreeMap::new();
+    for row in tables {
         let schema: String = row.get(0);
         let table: String = row.get(1);
-        let n: i64 = row.get(2);
-        let _ = writeln!(out, "{}.{}:{}", schema, table, n.max(0));
+        let full_name = format!("\"{schema}\".\"{table}\"");
+        let count_query = format!("SELECT count(*) FROM {full_name}");
+        let count: i64 = sqlx::query(&count_query).fetch_one(&pool).await?.get(0);
+
+        counts.insert(format!("{schema}.{table}"), count.to_string());
     }
-    Ok(out)
+    Ok(counts)
 }
 
 pub async fn enable_fast_restore(config: &Config) -> Result<()> {

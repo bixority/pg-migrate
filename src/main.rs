@@ -3,9 +3,14 @@ mod tui;
 
 use anyhow::Result;
 use clap::Parser;
-use indicatif::{MultiProgress, ProgressDrawTarget};
+use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
-use std::{env, fs, path::PathBuf, sync::Arc};
+use std::{
+    env, fs,
+    path::PathBuf,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -102,6 +107,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let start_time = Instant::now();
     let args = Args::parse();
 
     let logger =
@@ -114,6 +120,13 @@ async fn main() -> Result<()> {
     indicatif_log_bridge::LogWrapper::new((*mp).clone(), logger)
         .try_init()
         .expect("failed to init log wrapper");
+
+    let total_time_pb = mp.add(ProgressBar::new_spinner());
+    total_time_pb.set_style(
+        ProgressStyle::with_template("{spinner:.green} Total elapsed time: {elapsed_precise}")
+            .expect("Invalid template"),
+    );
+    total_time_pb.enable_steady_tick(Duration::from_millis(100));
 
     let config = Arc::new(Config {
         from_host: args.from_host,
@@ -149,7 +162,7 @@ async fn main() -> Result<()> {
     });
 
     let dbs_with_sizes = db::discover_databases(&config).await?;
-    let db_names: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
+    let db_names: Vec<&String> = dbs_with_sizes.iter().map(|(n, _)| n).collect();
     info!("Databases: {db_names:?}");
 
     if dbs_with_sizes.is_empty() {
@@ -165,7 +178,8 @@ async fn main() -> Result<()> {
         db::migrate_globals(&config).await?;
     }
 
-    db::create_dbs(&config, &db_names).await?;
+    let db_names_owned: Vec<String> = db_names.iter().map(|s| (*s).clone()).collect();
+    db::create_dbs(&config, &db_names_owned).await?;
 
     let sem = Arc::new(Semaphore::new(config.max_parallel));
     let mut tasks = vec![];
@@ -199,12 +213,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    db::verify_all(&config, &db_names).await?;
+    db::verify_all(&config, &db_names_owned, mp.clone()).await?;
 
     if !config.disable_dst_optimizations {
         db::restore_safe_settings(&config).await?;
     }
 
-    info!("Migration complete.");
+    total_time_pb.finish_and_clear();
+    let elapsed = start_time.elapsed();
+    info!(
+        "Migration complete in {}.",
+        indicatif::HumanDuration(elapsed)
+    );
     Ok(())
 }

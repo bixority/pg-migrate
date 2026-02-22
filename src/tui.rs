@@ -23,10 +23,10 @@ pub fn render_verification_report(
     src_map: &BTreeMap<String, String>,
     dst_map: &BTreeMap<String, String>,
 ) -> (String, bool) {
-    let mut tables: Vec<String> = src_map.keys().cloned().collect();
+    let mut tables: Vec<&String> = src_map.keys().collect();
     for k in dst_map.keys() {
         if !src_map.contains_key(k) {
-            tables.push(k.clone());
+            tables.push(k);
         }
     }
     tables.sort_unstable();
@@ -41,18 +41,18 @@ pub fn render_verification_report(
     let _ = writeln!(output, "{:-<40}-|-{:-<15}-|-{:-<15}-|--------", "", "", "");
 
     for t in &tables {
-        let src_row = src_map.get(t).map_or("MISSING", String::as_str);
-        let dst_row = dst_map.get(t).map_or("MISSING", String::as_str);
+        let src_row = src_map.get(*t).map_or("MISSING", String::as_str);
+        let dst_row = dst_map.get(*t).map_or("MISSING", String::as_str);
 
         let src_disp = if src_row == "MISSING" {
             format!("\x1b[31m{src_row}\x1b[0m")
         } else {
-            src_row.to_string()
+            (*src_row).to_string()
         };
         let dst_disp = if dst_row == "MISSING" {
             format!("\x1b[31m{dst_row}\x1b[0m")
         } else {
-            dst_row.to_string()
+            (*dst_row).to_string()
         };
 
         let status_colored = if src_row == dst_row {
