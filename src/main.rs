@@ -1,6 +1,11 @@
 mod db;
+mod phases;
 mod tui;
+mod verification;
 
+use crate::phases::{
+    phase_compute_source_counts, phase_dump_all, phase_restore_all, phase_verify_all,
+};
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
@@ -151,8 +156,8 @@ async fn main() -> Result<()> {
     fs::create_dir_all(verify_dir())?;
 
     let cancel = CancellationToken::new();
-
     let cancel_signal = cancel.clone();
+
     tokio::spawn(async move {
         tokio::signal::ctrl_c()
             .await
@@ -162,8 +167,9 @@ async fn main() -> Result<()> {
     });
 
     let dbs_with_sizes = db::discover_databases(&config).await?;
-    let db_names: Vec<&String> = dbs_with_sizes.iter().map(|(n, _)| n).collect();
-    info!("Databases: {db_names:?}");
+    let db_names_owned: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
+
+    info!("Databases: {db_names_owned:?}");
 
     if dbs_with_sizes.is_empty() {
         info!("No databases found to migrate.");
@@ -178,52 +184,34 @@ async fn main() -> Result<()> {
         db::migrate_globals(&config).await?;
     }
 
-    let db_names_owned: Vec<String> = db_names.iter().map(|s| (*s).clone()).collect();
     db::create_dbs(&config, &db_names_owned).await?;
 
     let sem = Arc::new(Semaphore::new(config.max_parallel));
-    let mut tasks = vec![];
 
-    for (db, size) in dbs_with_sizes {
-        if db::done_marker(&db).exists() {
-            info!("Skipping {db}");
-            continue;
-        }
+    // Phase 1: Dump all databases in parallel
+    phase_dump_all(&config, &dbs_with_sizes, mp.clone(), &cancel, sem.clone()).await?;
 
-        let permit = sem.clone().acquire_owned().await?;
-        let mp = mp.clone();
-        let config = config.clone();
-        let cancel_clone = cancel.clone();
+    // Phase 2: Compute source row counts sequentially
+    phase_compute_source_counts(&config, &db_names_owned).await?;
 
-        tasks.push(tokio::spawn(async move {
-            let _p = permit;
-            db::migrate_db(&config, &db, size, mp, cancel_clone).await
-        }));
-    }
+    // Phase 3: Restore all databases in parallel
+    phase_restore_all(&config, &dbs_with_sizes, mp.clone(), &cancel, sem).await?;
 
-    for t in tasks {
-        match t.await? {
-            Ok(()) => {}
-            Err(e) => {
-                if cancel.is_cancelled() {
-                    anyhow::bail!("Migration cancelled by user");
-                }
-                return Err(e);
-            }
-        }
-    }
-
-    db::verify_all(&config, &db_names_owned, mp.clone()).await?;
+    // Phase 4: Compute destination row counts and verify
+    phase_verify_all(&config, &db_names_owned, mp).await?;
 
     if !config.disable_dst_optimizations {
         db::restore_safe_settings(&config).await?;
     }
 
     total_time_pb.finish_and_clear();
+
     let elapsed = start_time.elapsed();
+
     info!(
         "Migration complete in {}.",
         indicatif::HumanDuration(elapsed)
     );
+
     Ok(())
 }

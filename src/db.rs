@@ -1,12 +1,11 @@
 use crate::Config;
-use crate::tui::{migration_style, render_verification_report};
-use crate::{state_dir, verify_dir};
+use crate::state_dir;
+use crate::tui::migration_style;
 use anyhow::{Context, Result};
 use indicatif::{HumanBytes, MultiProgress, ProgressBar};
 use log::{info, warn};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::{
-    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::Arc,
@@ -58,12 +57,29 @@ pub async fn discover_databases(config: &Config) -> Result<Vec<(String, u64)>> {
     Ok(dbs)
 }
 
+#[allow(dead_code)]
 pub async fn migrate_db(
     config: &Config,
     db: &str,
     size: u64,
     mp: Arc<MultiProgress>,
     cancel: CancellationToken, // <-- add this
+) -> Result<()> {
+    // Kept for backward compatibility: performs dump then restore
+    dump_db(config, db, size, mp.clone(), cancel.clone()).await?;
+    restore_db(config, db, size, mp, cancel).await
+}
+
+pub fn dump_done_marker(db: &str) -> PathBuf {
+    state_dir().join(format!("{db}.dumped"))
+}
+
+pub async fn dump_db(
+    config: &Config,
+    db: &str,
+    size: u64,
+    mp: Arc<MultiProgress>,
+    cancel: CancellationToken,
 ) -> Result<()> {
     let pb = mp.insert_from_back(1, ProgressBar::new(0));
     pb.set_style(migration_style()?);
@@ -74,7 +90,6 @@ pub async fn migrate_db(
         bar_total = 100;
     }
     let phase_mid = bar_total / 2;
-    let phase_end = bar_total;
     let human_size = HumanBytes(size);
 
     pb.set_length(bar_total);
@@ -121,7 +136,34 @@ pub async fn migrate_db(
     }
 
     pb.set_position(phase_mid);
+    fs::write(dump_done_marker(db), "")?;
+    Ok(())
+}
+
+pub async fn restore_db(
+    config: &Config,
+    db: &str,
+    size: u64,
+    mp: Arc<MultiProgress>,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let pb = mp.insert_from_back(1, ProgressBar::new(0));
+    pb.set_style(migration_style()?);
+    pb.enable_steady_tick(Duration::from_secs(1));
+
+    let bar_total = size.saturating_mul(2);
+    let phase_end = bar_total;
+    let human_size = HumanBytes(size);
+
+    pb.set_length(bar_total);
     pb.set_message(format!("Restoring {db} ({human_size})"));
+
+    let dump_path = dump_dir(&config.dump_root, db);
+    fs::create_dir_all(&dump_path)?;
+
+    if !dump_path.join("toc.dat").exists() {
+        anyhow::bail!("Dump not found for {db} at {}", dump_path.display());
+    }
 
     let mut child = Command::new("pg_restore")
         .env("PGPASSWORD", &config.to_pass)
@@ -155,79 +197,9 @@ pub async fn migrate_db(
     }
 
     pb.set_position(phase_end);
-    pb.finish_with_message(format!("{db} ({human_size}) complete"));
+    pb.finish_with_message(format!("{db} ({human_size}) restored"));
     fs::write(done_marker(db), "")?;
     Ok(())
-}
-
-pub async fn verify_all(config: &Config, dbs: &[String], mp: Arc<MultiProgress>) -> Result<()> {
-    for db in dbs {
-        if verify_marker(db).exists() {
-            continue;
-        }
-        verify_db(config, db, mp.clone()).await?;
-    }
-    Ok(())
-}
-
-pub async fn verify_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Result<()> {
-    let src_map = stat_counts(
-        &config.from_host,
-        &config.from_port,
-        &config.from_pass,
-        &config.from_user,
-        db,
-    )
-    .await?;
-    let dst_map = stat_counts(
-        &config.to_host,
-        &config.to_port,
-        &config.to_pass,
-        &config.to_user,
-        db,
-    )
-    .await?;
-
-    let (output, mismatch) = render_verification_report(db, &src_map, &dst_map);
-
-    if mismatch {
-        let _ = mp.println(&output);
-        anyhow::bail!("Verification failed for {db}: tables or row counts mismatch");
-    }
-
-    let _ = mp.println(&output);
-    let _ = mp.println(format!(
-        "Verified {db}: {} tables, all rows match",
-        src_map.len()
-    ));
-    fs::write(verify_marker(db), "")?;
-    Ok(())
-}
-
-pub async fn stat_counts(
-    host: &str,
-    port: &str,
-    pass: &str,
-    user: &str,
-    db: &str,
-) -> Result<BTreeMap<String, String>> {
-    let pool = pg_pool(host, port, user, pass, db).await?;
-
-    let tables = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2")
-        .fetch_all(&pool)
-        .await?;
-
-    let mut counts = BTreeMap::new();
-    for row in tables {
-        let schema: String = row.get(0);
-        let table: String = row.get(1);
-        let full_name = format!("\"{schema}\".\"{table}\"");
-        let count_query = format!("SELECT count(*) FROM {full_name}");
-        let count: i64 = sqlx::query(&count_query).fetch_one(&pool).await?.get(0);
-
-        counts.insert(format!("{schema}.{table}"), count.to_string());
-    }
-    Ok(counts)
 }
 
 pub async fn enable_fast_restore(config: &Config) -> Result<()> {
@@ -302,10 +274,6 @@ pub async fn create_dbs(config: &Config, dbs: &[String]) -> Result<()> {
 
 pub fn done_marker(db: &str) -> PathBuf {
     state_dir().join(format!("{db}.done"))
-}
-
-pub fn verify_marker(db: &str) -> PathBuf {
-    verify_dir().join(format!("{db}.ok"))
 }
 
 pub fn globals_marker() -> PathBuf {

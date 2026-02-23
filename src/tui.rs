@@ -14,10 +14,6 @@ pub fn migration_style() -> Result<ProgressStyle, indicatif::style::TemplateErro
     )
 }
 
-/// Renders a verification report for a database.
-///
-/// Returns a tuple containing the formatted report string and a boolean indicating if there was a mismatch.
-#[must_use]
 pub fn render_verification_report(
     db: &str,
     src_map: &BTreeMap<String, String>,
