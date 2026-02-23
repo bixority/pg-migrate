@@ -65,7 +65,7 @@ pub async fn migrate_db(
     mp: Arc<MultiProgress>,
     cancel: CancellationToken, // <-- add this
 ) -> Result<()> {
-    let pb = mp.add(ProgressBar::new(0));
+    let pb = mp.insert_from_back(1, ProgressBar::new(0));
     pb.set_style(migration_style()?);
     pb.enable_steady_tick(Duration::from_secs(1));
 
