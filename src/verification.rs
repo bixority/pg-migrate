@@ -3,12 +3,11 @@ use crate::db::pg_pool;
 use crate::tui::render_verification_report;
 use crate::verify_dir;
 use anyhow::Result;
-use indicatif::MultiProgress;
+use indicatif::ProgressBar;
 use sqlx::Row;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 pub fn verify_marker(db: &str) -> PathBuf {
     verify_dir().join(format!("{db}.verify"))
@@ -23,17 +22,22 @@ pub fn dst_counts_path(db: &str) -> PathBuf {
 }
 
 #[allow(dead_code)]
-pub async fn verify_all(config: &Config, dbs: &[String], mp: Arc<MultiProgress>) -> Result<()> {
+pub async fn verify_all(
+    config: &Config,
+    dbs: &[String],
+    pbs: &HashMap<String, ProgressBar>,
+) -> Result<()> {
     for db in dbs {
         if verify_marker(db).exists() {
             continue;
         }
-        verify_db(config, db, mp.clone()).await?;
+        let pb = pbs.get(db).cloned().expect("missing pb");
+        verify_db(config, db, pb).await?;
     }
     Ok(())
 }
 
-pub async fn verify_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Result<()> {
+pub async fn verify_db(config: &Config, db: &str, pb: ProgressBar) -> Result<()> {
     let src_counts_path = src_counts_path(db);
     let dst_counts_path = dst_counts_path(db);
 
@@ -74,16 +78,17 @@ pub async fn verify_db(config: &Config, db: &str, mp: Arc<MultiProgress>) -> Res
     let (output, mismatch) = render_verification_report(db, &src_map, &dst_map);
 
     if mismatch {
-        let _ = mp.println(&output);
+        pb.println(&output);
         anyhow::bail!("Verification failed for {db}: tables or row counts mismatch");
     }
 
-    let _ = mp.println(&output);
-    let _ = mp.println(format!(
+    pb.println(&output);
+    pb.println(format!(
         "Verified {db}: {} tables, all rows match",
         src_map.len()
     ));
     fs::write(verify_marker(db), "")?;
+    pb.finish_with_message(format!("Migration complete for {db}"));
     Ok(())
 }
 

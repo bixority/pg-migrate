@@ -1,15 +1,12 @@
 use crate::Config;
 use crate::state_dir;
-use crate::tui::migration_style;
 use anyhow::{Context, Result};
-use indicatif::{HumanBytes, MultiProgress, ProgressBar};
+use indicatif::{HumanBytes, ProgressBar};
 use log::{info, warn};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::{
     fs,
     path::{Path, PathBuf},
-    sync::Arc,
-    time::Duration,
 };
 use tokio::process::Command;
 use tokio::select;
@@ -62,12 +59,12 @@ pub async fn migrate_db(
     config: &Config,
     db: &str,
     size: u64,
-    mp: Arc<MultiProgress>,
-    cancel: CancellationToken, // <-- add this
+    pb: ProgressBar,
+    cancel: CancellationToken,
 ) -> Result<()> {
     // Kept for backward compatibility: performs dump then restore
-    dump_db(config, db, size, mp.clone(), cancel.clone()).await?;
-    restore_db(config, db, size, mp, cancel).await
+    dump_db(config, db, size, pb.clone(), cancel.clone()).await?;
+    restore_db(config, db, size, pb, cancel).await
 }
 
 pub fn dump_done_marker(db: &str) -> PathBuf {
@@ -78,13 +75,9 @@ pub async fn dump_db(
     config: &Config,
     db: &str,
     size: u64,
-    mp: Arc<MultiProgress>,
+    pb: ProgressBar,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let pb = mp.insert_from_back(1, ProgressBar::new(0));
-    pb.set_style(migration_style()?);
-    pb.enable_steady_tick(Duration::from_secs(1));
-
     let mut bar_total = size.saturating_mul(2);
     if bar_total == 0 {
         bar_total = 100;
@@ -144,13 +137,9 @@ pub async fn restore_db(
     config: &Config,
     db: &str,
     size: u64,
-    mp: Arc<MultiProgress>,
+    pb: ProgressBar,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let pb = mp.insert_from_back(1, ProgressBar::new(0));
-    pb.set_style(migration_style()?);
-    pb.enable_steady_tick(Duration::from_secs(1));
-
     let bar_total = size.saturating_mul(2);
     let phase_end = bar_total;
     let human_size = HumanBytes(size);

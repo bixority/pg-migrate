@@ -1,6 +1,7 @@
 use crate::{Config, db, verification};
-use indicatif::MultiProgress;
+use indicatif::ProgressBar;
 use log::info;
+use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -9,7 +10,7 @@ use tokio_util::sync::CancellationToken;
 pub async fn phase_dump_all(
     config: &Config,
     dbs_with_sizes: &[(String, u64)],
-    mp: Arc<MultiProgress>,
+    pbs: &HashMap<String, ProgressBar>,
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
@@ -17,7 +18,7 @@ pub async fn phase_dump_all(
 
     for (db, size) in dbs_with_sizes {
         let permit = sem.clone().acquire_owned().await?;
-        let mp = mp.clone();
+        let pb = pbs.get(db).cloned().expect("missing pb");
         let config_clone = Arc::new(Config {
             from_host: config.from_host.clone(),
             from_port: config.from_port.clone(),
@@ -42,7 +43,7 @@ pub async fn phase_dump_all(
 
         dump_tasks.push(tokio::spawn(async move {
             let _p = permit;
-            db::dump_db(&config_clone, &db_clone, size_val, mp, cancel_clone).await
+            db::dump_db(&config_clone, &db_clone, size_val, pb, cancel_clone).await
         }));
     }
 
@@ -86,7 +87,7 @@ pub async fn phase_compute_source_counts(
 pub async fn phase_restore_all(
     config: &Config,
     dbs_with_sizes: &[(String, u64)],
-    mp: Arc<MultiProgress>,
+    pbs: &HashMap<String, ProgressBar>,
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
@@ -95,11 +96,15 @@ pub async fn phase_restore_all(
     for (db, size) in dbs_with_sizes {
         if db::done_marker(db).exists() {
             info!("Skipping restore for {db}");
+            if let Some(pb) = pbs.get(db) {
+                pb.set_position(size.saturating_mul(2));
+                pb.set_message(format!("Restoration skipped (already done) for {db}"));
+            }
             continue;
         }
 
         let permit = sem.clone().acquire_owned().await?;
-        let mp = mp.clone();
+        let pb = pbs.get(db).cloned().expect("missing pb");
         let config_clone = Arc::new(Config {
             from_host: config.from_host.clone(),
             from_port: config.from_port.clone(),
@@ -124,7 +129,7 @@ pub async fn phase_restore_all(
 
         restore_tasks.push(tokio::spawn(async move {
             let _p = permit;
-            db::restore_db(&config_clone, &db_clone, size_val, mp, cancel_clone).await
+            db::restore_db(&config_clone, &db_clone, size_val, pb, cancel_clone).await
         }));
     }
 
@@ -145,9 +150,10 @@ pub async fn phase_restore_all(
 pub async fn phase_verify_all(
     config: &Config,
     db_names: &[String],
-    mp: Arc<MultiProgress>,
+    pbs: &HashMap<String, ProgressBar>,
 ) -> anyhow::Result<()> {
     for db in db_names {
+        let pb = pbs.get(db).cloned().expect("missing pb");
         let dst_path = verification::dst_counts_path(db);
 
         if !dst_path.exists() {
@@ -163,7 +169,7 @@ pub async fn phase_verify_all(
             let content = serde_json::to_string(&counts)?;
             fs::write(&dst_path, content)?;
         }
-        verification::verify_db(config, db, mp.clone()).await?;
+        verification::verify_db(config, db, pb).await?;
     }
     Ok(())
 }

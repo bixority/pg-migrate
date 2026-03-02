@@ -6,11 +6,13 @@ mod verification;
 use crate::phases::{
     phase_compute_source_counts, phase_dump_all, phase_restore_all, phase_verify_all,
 };
+use crate::tui::migration_style;
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
 use std::{
+    collections::HashMap,
     env, fs,
     path::PathBuf,
     sync::Arc,
@@ -176,6 +178,14 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
+    let mut pbs = HashMap::new();
+    for (db, _size) in &dbs_with_sizes {
+        let pb = mp.add(ProgressBar::new(0));
+        pb.set_style(migration_style()?);
+        pb.enable_steady_tick(Duration::from_secs(1));
+        pbs.insert(db.clone(), pb);
+    }
+
     if !config.disable_dst_optimizations {
         db::enable_fast_restore(&config).await?;
     }
@@ -189,16 +199,16 @@ async fn main() -> Result<()> {
     let sem = Arc::new(Semaphore::new(config.max_parallel));
 
     // Phase 1: Dump all databases in parallel
-    phase_dump_all(&config, &dbs_with_sizes, mp.clone(), &cancel, sem.clone()).await?;
+    phase_dump_all(&config, &dbs_with_sizes, &pbs, &cancel, sem.clone()).await?;
 
     // Phase 2: Compute source row counts sequentially
     phase_compute_source_counts(&config, &db_names_owned).await?;
 
     // Phase 3: Restore all databases in parallel
-    phase_restore_all(&config, &dbs_with_sizes, mp.clone(), &cancel, sem).await?;
+    phase_restore_all(&config, &dbs_with_sizes, &pbs, &cancel, sem).await?;
 
     // Phase 4: Compute destination row counts and verify
-    phase_verify_all(&config, &db_names_owned, mp).await?;
+    phase_verify_all(&config, &db_names_owned, &pbs).await?;
 
     if !config.disable_dst_optimizations {
         db::restore_safe_settings(&config).await?;
