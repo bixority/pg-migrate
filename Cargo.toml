@@ -17,7 +17,7 @@ cli = ["dep:clap"]
 [dependencies]
 anyhow = "1.0.102"
 clap = { version = "4.6.0", features = ["derive"], optional = true }
-env_logger = "0.11.9"
+env_logger = "0.11.10"
 indicatif = "0.18.4"
 indicatif-log-bridge = "0.2.3"
 log = "0.4.29"
