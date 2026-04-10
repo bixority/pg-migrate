@@ -94,37 +94,43 @@ pub async fn dump_db(
     if !dump_path.join("toc.dat").exists() {
         pb.set_message(format!("Dumping {db} ({human_size})"));
 
+        use tokio::process::Command;
+        use std::process::Stdio;
+        use tokio::io::AsyncReadExt;
+
         let mut child = Command::new("pg_dump")
             .env("PGPASSWORD", &config.from_pass)
             .args([
-                "-h",
-                &config.from_host,
-                "-p",
-                &config.from_port,
-                "-U",
-                &config.from_user,
+                "-h", &config.from_host,
+                "-p", &config.from_port,
+                "-U", &config.from_user,
                 "-Fd",
-                "-j",
-                &config.dump_jobs.to_string(),
-                "-Z",
-                "zstd:5",
-                "-f",
-                dump_path.to_str().expect("invalid dump path"),
+                "-j", &config.dump_jobs.to_string(),
+                "-Z", "zstd:5",
+                "-f", dump_path.to_str().expect("invalid dump path"),
                 db,
             ])
-            .spawn() // spawn, don't block
+            .stderr(Stdio::piped())
+            .spawn()
             .context("pg_dump failed to start")?;
 
+        let stderr = child.stderr.take();
+
         let status = select! {
-            res = child.wait() => res.context("pg_dump wait failed")?,
-            () = cancel.cancelled() => {
-                let _ = child.kill().await;
-                anyhow::bail!("cancelled during pg_dump of {db}");
-            }
-        };
+    res = child.wait() => res.context("pg_dump wait failed")?,
+    () = cancel.cancelled() => {
+        let _ = child.kill().await;
+        anyhow::bail!("cancelled during pg_dump of {db}");
+    }
+};
+
+        let mut err_output = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut err_output).await;
+        }
 
         if !status.success() {
-            anyhow::bail!("pg_dump failed for {db}");
+            anyhow::bail!("pg_dump failed for {db}: {}", err_output.trim());
         }
     }
 
