@@ -1,9 +1,9 @@
-use crate::state_dir;
 use crate::Config;
+use crate::state_dir;
 use anyhow::{Context, Result};
 use indicatif::{HumanBytes, ProgressBar};
 use log::{info, warn};
-use sqlx::{postgres::PgPoolOptions, PgPool, Row};
+use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::process::Stdio;
 use std::{
     fs,
