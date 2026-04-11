@@ -56,19 +56,6 @@ pub async fn discover_databases(config: &Config) -> Result<Vec<(String, u64)>> {
     Ok(dbs)
 }
 
-#[allow(dead_code)]
-pub async fn migrate_db(
-    config: &Config,
-    db: &str,
-    size: u64,
-    pb: ProgressBar,
-    cancel: CancellationToken,
-) -> Result<()> {
-    // Kept for backward compatibility: performs dump then restore
-    dump_db(config, db, size, pb.clone(), cancel.clone()).await?;
-    restore_db(config, db, size, pb, cancel).await
-}
-
 pub fn dump_done_marker(db: &str) -> PathBuf {
     state_dir().join(format!("{db}.dumped"))
 }
