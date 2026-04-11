@@ -9,16 +9,16 @@ use tokio_util::sync::CancellationToken;
 
 pub async fn phase_dump_all(
     config: &Config,
-    dbs_with_sizes: &[(String, u64)],
-    pbs: &HashMap<String, ProgressBar>,
+    db_names_with_sizes: &[(String, u64)],
+    pbs: &HashMap<&String, ProgressBar>,
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let mut dump_tasks = vec![];
 
-    for (db, size) in dbs_with_sizes {
+    for (db_name, size) in db_names_with_sizes {
         let permit = sem.clone().acquire_owned().await?;
-        let pb = pbs.get(db).cloned().expect("missing pb");
+        let pb = pbs.get(db_name).cloned().expect("missing pb");
         let config_clone = Arc::new(Config {
             from_host: config.from_host.clone(),
             from_port: config.from_port.clone(),
@@ -38,7 +38,7 @@ pub async fn phase_dump_all(
             disable_dst_optimizations: config.disable_dst_optimizations,
         });
         let cancel_clone = cancel.clone();
-        let db_clone = db.clone();
+        let db_clone = db_name.clone();
         let size_val = *size;
 
         dump_tasks.push(tokio::spawn(async move {
@@ -65,8 +65,8 @@ pub async fn phase_compute_source_counts(
     config: &Config,
     db_names: &[String],
 ) -> anyhow::Result<()> {
-    for db in db_names {
-        let src_path = verification::src_counts_path(db);
+    for db_name in db_names {
+        let src_path = verification::src_counts_path(db_name);
 
         if !src_path.exists() {
             let counts = verification::stat_counts(
@@ -74,7 +74,7 @@ pub async fn phase_compute_source_counts(
                 &config.from_port,
                 &config.from_pass,
                 &config.from_user,
-                db,
+                db_name,
             )
             .await?;
             let content = serde_json::to_string(&counts)?;
@@ -86,25 +86,25 @@ pub async fn phase_compute_source_counts(
 
 pub async fn phase_restore_all(
     config: &Config,
-    dbs_with_sizes: &[(String, u64)],
-    pbs: &HashMap<String, ProgressBar>,
+    db_names_with_sizes: &[(String, u64)],
+    pbs: &HashMap<&String, ProgressBar>,
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
     let mut restore_tasks = vec![];
 
-    for (db, size) in dbs_with_sizes {
-        if db::done_marker(db).exists() {
-            info!("Skipping restore for {db}");
-            if let Some(pb) = pbs.get(db) {
+    for (db_name, size) in db_names_with_sizes {
+        if db::done_marker(db_name).exists() {
+            info!("Skipping restore for {db_name}");
+            if let Some(pb) = pbs.get(db_name) {
                 pb.set_position(size.saturating_mul(2));
-                pb.set_message(format!("Restoration skipped (already done) for {db}"));
+                pb.set_message(format!("Restoration skipped (already done) for {db_name}"));
             }
             continue;
         }
 
         let permit = sem.clone().acquire_owned().await?;
-        let pb = pbs.get(db).cloned().expect("missing pb");
+        let pb = pbs.get(db_name).cloned().expect("missing pb");
         let config_clone = Arc::new(Config {
             from_host: config.from_host.clone(),
             from_port: config.from_port.clone(),
@@ -124,7 +124,7 @@ pub async fn phase_restore_all(
             disable_dst_optimizations: config.disable_dst_optimizations,
         });
         let cancel_clone = cancel.clone();
-        let db_clone = db.clone();
+        let db_clone = db_name.clone();
         let size_val = *size;
 
         restore_tasks.push(tokio::spawn(async move {
@@ -150,11 +150,11 @@ pub async fn phase_restore_all(
 pub async fn phase_verify_all(
     config: &Config,
     db_names: &[String],
-    pbs: &HashMap<String, ProgressBar>,
+    pbs: &HashMap<&String, ProgressBar>,
 ) -> anyhow::Result<()> {
-    for db in db_names {
-        let pb = pbs.get(db).cloned().expect("missing pb");
-        let dst_path = verification::dst_counts_path(db);
+    for db_name in db_names {
+        let pb = pbs.get(db_name).cloned().expect("missing pb");
+        let dst_path = verification::dst_counts_path(db_name);
 
         if !dst_path.exists() {
             let counts = verification::stat_counts(
@@ -162,14 +162,14 @@ pub async fn phase_verify_all(
                 &config.to_port,
                 &config.to_pass,
                 &config.to_user,
-                db,
+                db_name,
             )
             .await?;
 
             let content = serde_json::to_string(&counts)?;
             fs::write(&dst_path, content)?;
         }
-        verification::verify_db(config, db, pb).await?;
+        verification::verify_db(config, db_name, pb).await?;
     }
     Ok(())
 }

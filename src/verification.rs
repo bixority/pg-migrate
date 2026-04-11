@@ -9,12 +9,12 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::PathBuf;
 
-pub fn verify_marker(db: &str) -> PathBuf {
-    verify_dir().join(format!("{db}.verify"))
+pub fn verify_marker(db_name: &str) -> PathBuf {
+    verify_dir().join(format!("{db_name}.verify"))
 }
 
-pub fn src_counts_path(db: &str) -> PathBuf {
-    verify_dir().join(format!("{db}.src_counts.json"))
+pub fn src_counts_path(db_name: &str) -> PathBuf {
+    verify_dir().join(format!("{db_name}.src_counts.json"))
 }
 
 pub fn dst_counts_path(db: &str) -> PathBuf {
@@ -24,22 +24,22 @@ pub fn dst_counts_path(db: &str) -> PathBuf {
 #[allow(dead_code)]
 pub async fn verify_all(
     config: &Config,
-    dbs: &[String],
+    db_names: &[String],
     pbs: &HashMap<String, ProgressBar>,
 ) -> Result<()> {
-    for db in dbs {
-        if verify_marker(db).exists() {
+    for db_name in db_names {
+        if verify_marker(db_name).exists() {
             continue;
         }
-        let pb = pbs.get(db).cloned().expect("missing pb");
-        verify_db(config, db, pb).await?;
+        let pb = pbs.get(db_name).cloned().expect("missing pb");
+        verify_db(config, db_name, pb).await?;
     }
     Ok(())
 }
 
-pub async fn verify_db(config: &Config, db: &str, pb: ProgressBar) -> Result<()> {
-    let src_counts_path = src_counts_path(db);
-    let dst_counts_path = dst_counts_path(db);
+pub async fn verify_db(config: &Config, db_name: &str, pb: ProgressBar) -> Result<()> {
+    let src_counts_path = src_counts_path(db_name);
+    let dst_counts_path = dst_counts_path(db_name);
 
     let src_map: BTreeMap<String, String> = if src_counts_path.exists() {
         let content = fs::read_to_string(&src_counts_path)?;
@@ -50,7 +50,7 @@ pub async fn verify_db(config: &Config, db: &str, pb: ProgressBar) -> Result<()>
             &config.from_port,
             &config.from_pass,
             &config.from_user,
-            db,
+            db_name,
         )
         .await?;
         let content = serde_json::to_string(&counts)?;
@@ -67,7 +67,7 @@ pub async fn verify_db(config: &Config, db: &str, pb: ProgressBar) -> Result<()>
             &config.to_port,
             &config.to_pass,
             &config.to_user,
-            db,
+            db_name,
         )
         .await?;
         let content = serde_json::to_string(&counts)?;
@@ -75,20 +75,20 @@ pub async fn verify_db(config: &Config, db: &str, pb: ProgressBar) -> Result<()>
         counts
     };
 
-    let (output, mismatch) = render_verification_report(db, &src_map, &dst_map);
+    let (output, mismatch) = render_verification_report(db_name, &src_map, &dst_map);
 
     if mismatch {
         pb.println(&output);
-        anyhow::bail!("Verification failed for {db}: tables or row counts mismatch");
+        anyhow::bail!("Verification failed for {db_name}: tables or row counts mismatch");
     }
 
     pb.println(&output);
     pb.println(format!(
-        "Verified {db}: {} tables, all rows match",
+        "Verified {db_name}: {} tables, all rows match",
         src_map.len()
     ));
-    fs::write(verify_marker(db), "")?;
-    pb.finish_with_message(format!("Migration complete for {db}"));
+    fs::write(verify_marker(db_name), "")?;
+    pb.finish_with_message(format!("Migration complete for {db_name}"));
     Ok(())
 }
 
@@ -97,9 +97,9 @@ pub async fn stat_counts(
     port: &str,
     pass: &str,
     user: &str,
-    db: &str,
+    db_name: &str,
 ) -> Result<BTreeMap<String, String>> {
-    let pool = pg_pool(host, port, user, pass, db).await?;
+    let pool = pg_pool(host, port, user, pass, db_name).await?;
 
     let tables = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2")
         .fetch_all(&pool)

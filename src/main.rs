@@ -179,11 +179,12 @@ async fn main() -> Result<()> {
     }
 
     let mut pbs = HashMap::new();
-    for (db, _size) in &dbs_with_sizes {
+    
+    for (db_name, _size) in &dbs_with_sizes {
         let pb = mp.add(ProgressBar::new(0));
         pb.set_style(migration_style()?);
         pb.enable_steady_tick(Duration::from_secs(1));
-        pbs.insert(db.clone(), pb);
+        pbs.insert(db_name, pb);
     }
 
     if !config.disable_dst_optimizations {
