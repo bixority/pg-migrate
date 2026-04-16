@@ -1,6 +1,6 @@
 [package]
 name = "pg-migrate"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2024"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
@@ -16,7 +16,7 @@ cli = ["dep:clap"]
 
 [dependencies]
 anyhow = "1.0.102"
-clap = { version = "4.6.0", features = ["derive"], optional = true }
+clap = { version = "4.6.1", features = ["derive"], optional = true }
 env_logger = "0.11.10"
 indicatif = "0.18.4"
 indicatif-log-bridge = "0.2.3"

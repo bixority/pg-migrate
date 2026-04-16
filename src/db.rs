@@ -14,6 +14,11 @@ use tokio::process::Command;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
+pub struct MigrationState {
+    step: u8,
+    display: String,
+}
+
 pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
     root.join(db)
 }
