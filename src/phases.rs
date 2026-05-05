@@ -5,171 +5,126 @@ use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-pub async fn phase_dump_all(
-    config: &Config,
+pub async fn phase_migrate_all(
+    config: Arc<Config>,
     db_names_with_sizes: &[(String, u64)],
     pbs: &HashMap<&String, ProgressBar>,
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
-    let mut dump_tasks = vec![];
+    let mut pipeline_tasks = JoinSet::new();
 
     for (db_name, size) in db_names_with_sizes {
-        let permit = sem.clone().acquire_owned().await?;
-        let pb = pbs.get(db_name).cloned().expect("missing pb");
-        let config_clone = Arc::new(Config {
-            from_host: config.from_host.clone(),
-            from_port: config.from_port.clone(),
-            from_user: config.from_user.clone(),
-            from_pass: config.from_pass.clone(),
-            from_db: config.from_db.clone(),
-            to_host: config.to_host.clone(),
-            to_port: config.to_port.clone(),
-            to_user: config.to_user.clone(),
-            to_pass: config.to_pass.clone(),
-            to_db: config.to_db.clone(),
-            dump_jobs: config.dump_jobs,
-            restore_jobs: config.restore_jobs,
-            max_parallel: config.max_parallel,
-            dump_root: config.dump_root.clone(),
-            migrate_globals: config.migrate_globals,
-            disable_dst_optimizations: config.disable_dst_optimizations,
-        });
+        let config_clone = config.clone();
         let cancel_clone = cancel.clone();
+        let sem_clone = sem.clone();
         let db_clone = db_name.clone();
         let size_val = *size;
+        let pb = pbs.get(db_name).cloned().expect("missing pb");
 
-        dump_tasks.push(tokio::spawn(async move {
-            let _p = permit;
-            db::dump_db(&config_clone, &db_clone, size_val, pb, cancel_clone).await
-        }));
+        pipeline_tasks.spawn(async move {
+            let _permit = sem_clone.acquire_owned().await?;
+
+            phase_migrate_one(
+                &config_clone,
+                &db_clone,
+                size_val,
+                pb,
+                &cancel_clone,
+            )
+            .await
+        });
     }
 
-    for dump_task in dump_tasks {
-        match dump_task.await? {
+    while let Some(pipeline_result) = pipeline_tasks.join_next().await {
+        match pipeline_result? {
             Ok(()) => {}
             Err(e) => {
-                if cancel.is_cancelled() {
+                let was_cancelled = cancel.is_cancelled();
+
+                if !was_cancelled {
+                    cancel.cancel();
+                }
+
+                pipeline_tasks.abort_all();
+
+                if was_cancelled {
                     anyhow::bail!("Migration cancelled by user");
                 }
+
                 return Err(e);
             }
         }
     }
+
     Ok(())
 }
 
-pub async fn phase_compute_source_counts(
+async fn phase_migrate_one(
     config: &Config,
-    db_names: &[String],
-) -> anyhow::Result<()> {
-    for db_name in db_names {
-        let src_path = verification::src_counts_path(db_name);
-
-        if !src_path.exists() {
-            let counts = verification::stat_counts(
-                &config.from_host,
-                &config.from_port,
-                &config.from_pass,
-                &config.from_user,
-                db_name,
-            )
-            .await?;
-            let content = serde_json::to_string(&counts)?;
-            fs::write(&src_path, content)?;
-        }
-    }
-    Ok(())
-}
-
-pub async fn phase_restore_all(
-    config: &Config,
-    db_names_with_sizes: &[(String, u64)],
-    pbs: &HashMap<&String, ProgressBar>,
+    db_name: &str,
+    size: u64,
+    pb: ProgressBar,
     cancel: &CancellationToken,
-    sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
-    let mut restore_tasks = vec![];
+    db::dump_db(config, db_name, size, pb.clone(), cancel.clone()).await?;
 
-    for (db_name, size) in db_names_with_sizes {
-        if db::done_marker(db_name).exists() {
-            info!("Skipping restore for {db_name}");
-            if let Some(pb) = pbs.get(db_name) {
-                pb.set_position(size.saturating_mul(2));
-                pb.set_message(format!("Restoration skipped (already done) for {db_name}"));
-            }
-            continue;
-        }
+    compute_source_counts(config, db_name).await?;
 
-        let permit = sem.clone().acquire_owned().await?;
-        let pb = pbs.get(db_name).cloned().expect("missing pb");
-        let config_clone = Arc::new(Config {
-            from_host: config.from_host.clone(),
-            from_port: config.from_port.clone(),
-            from_user: config.from_user.clone(),
-            from_pass: config.from_pass.clone(),
-            from_db: config.from_db.clone(),
-            to_host: config.to_host.clone(),
-            to_port: config.to_port.clone(),
-            to_user: config.to_user.clone(),
-            to_pass: config.to_pass.clone(),
-            to_db: config.to_db.clone(),
-            dump_jobs: config.dump_jobs,
-            restore_jobs: config.restore_jobs,
-            max_parallel: config.max_parallel,
-            dump_root: config.dump_root.clone(),
-            migrate_globals: config.migrate_globals,
-            disable_dst_optimizations: config.disable_dst_optimizations,
-        });
-        let cancel_clone = cancel.clone();
-        let db_clone = db_name.clone();
-        let size_val = *size;
-
-        restore_tasks.push(tokio::spawn(async move {
-            let _p = permit;
-            db::restore_db(&config_clone, &db_clone, size_val, pb, cancel_clone).await
-        }));
+    if db::done_marker(db_name).exists() {
+        info!("Skipping restore for {db_name}");
+        pb.set_position(size.saturating_mul(2));
+        pb.set_message(format!("Restoration skipped (already done) for {db_name}"));
+    } else {
+        db::restore_db(config, db_name, size, pb.clone(), cancel.clone()).await?;
     }
 
-    for restore_task in restore_tasks {
-        match restore_task.await? {
-            Ok(()) => {}
-            Err(e) => {
-                if cancel.is_cancelled() {
-                    anyhow::bail!("Migration cancelled by user");
-                }
-                return Err(e);
-            }
-        }
-    }
+    compute_destination_counts(config, db_name).await?;
+
+    verification::verify_db(config, db_name, pb).await?;
+
     Ok(())
 }
 
-pub async fn phase_verify_all(
-    config: &Config,
-    db_names: &[String],
-    pbs: &HashMap<&String, ProgressBar>,
-) -> anyhow::Result<()> {
-    for db_name in db_names {
-        let pb = pbs.get(db_name).cloned().expect("missing pb");
-        let dst_path = verification::dst_counts_path(db_name);
+async fn compute_source_counts(config: &Config, db_name: &str) -> anyhow::Result<()> {
+    let src_path = verification::src_counts_path(db_name);
 
-        if !dst_path.exists() {
-            let counts = verification::stat_counts(
-                &config.to_host,
-                &config.to_port,
-                &config.to_pass,
-                &config.to_user,
-                db_name,
-            )
-            .await?;
+    if !src_path.exists() {
+        let counts = verification::stat_counts(
+            &config.from_host,
+            &config.from_port,
+            &config.from_pass,
+            &config.from_user,
+            db_name,
+        )
+        .await?;
 
-            let content = serde_json::to_string(&counts)?;
-            fs::write(&dst_path, content)?;
-        }
-        verification::verify_db(config, db_name, pb).await?;
+        let content = serde_json::to_string(&counts)?;
+        fs::write(&src_path, content)?;
     }
+
+    Ok(())
+}
+
+async fn compute_destination_counts(config: &Config, db_name: &str) -> anyhow::Result<()> {
+    let dst_path = verification::dst_counts_path(db_name);
+
+    if !dst_path.exists() {
+        let counts = verification::stat_counts(
+            &config.to_host,
+            &config.to_port,
+            &config.to_pass,
+            &config.to_user,
+            db_name,
+        )
+        .await?;
+
+        let content = serde_json::to_string(&counts)?;
+        fs::write(&dst_path, content)?;
+    }
+
     Ok(())
 }

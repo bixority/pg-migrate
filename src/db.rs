@@ -172,8 +172,13 @@ pub async fn restore_db(
             db,
             dump_path.to_str().expect("invalid dump path"),
         ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .context("pg_restore failed to start")?;
+
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
 
     let status = select! {
         res = child.wait() => res.context("pg_restore wait failed")?,
@@ -183,8 +188,22 @@ pub async fn restore_db(
         }
     };
 
+    let mut stdout_output = String::new();
+    if let Some(mut stdout) = stdout.take() {
+        let _ = stdout.read_to_string(&mut stdout_output).await;
+    }
+
+    let mut stderr_output = String::new();
+    if let Some(mut stderr) = stderr.take() {
+        let _ = stderr.read_to_string(&mut stderr_output).await;
+    }
+
     if !status.success() {
-        anyhow::bail!("pg_restore failed for {db}");
+        anyhow::bail!(
+            "pg_restore failed for {db} with status {status}\nstdout:\n{}\nstderr:\n{}",
+            stdout_output.trim(),
+            stderr_output.trim(),
+        );
     }
 
     pb.set_position(phase_end);

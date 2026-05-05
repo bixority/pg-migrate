@@ -3,9 +3,7 @@ mod phases;
 mod tui;
 mod verification;
 
-use crate::phases::{
-    phase_compute_source_counts, phase_dump_all, phase_restore_all, phase_verify_all,
-};
+use crate::phases::phase_migrate_all;
 use crate::tui::migration_style;
 use anyhow::Result;
 use clap::Parser;
@@ -199,17 +197,7 @@ async fn main() -> Result<()> {
 
     let sem = Arc::new(Semaphore::new(config.max_parallel));
 
-    // Phase 1: Dump all databases in parallel
-    phase_dump_all(&config, &dbs_with_sizes, &pbs, &cancel, sem.clone()).await?;
-
-    // Phase 2: Compute source row counts sequentially
-    phase_compute_source_counts(&config, &db_names_owned).await?;
-
-    // Phase 3: Restore all databases in parallel
-    phase_restore_all(&config, &dbs_with_sizes, &pbs, &cancel, sem).await?;
-
-    // Phase 4: Compute destination row counts and verify
-    phase_verify_all(&config, &db_names_owned, &pbs).await?;
+    phase_migrate_all(config.clone(), &dbs_with_sizes, &pbs, &cancel, sem).await?;
 
     if !config.disable_dst_optimizations {
         db::restore_safe_settings(&config).await?;
