@@ -20,7 +20,7 @@ pub fn render_verification_report(
     dst_map: &BTreeMap<String, String>,
 ) -> (String, bool) {
     let mut tables: Vec<&String> = src_map.keys().collect();
-    
+
     for k in dst_map.keys() {
         if !src_map.contains_key(k) {
             tables.push(k);
@@ -46,7 +46,7 @@ pub fn render_verification_report(
         } else {
             (*src_row).to_string()
         };
-        
+
         let dst_disp = if dst_row == "MISSING" {
             format!("\x1b[31m{dst_row}\x1b[0m")
         } else {

@@ -28,14 +28,7 @@ pub async fn phase_migrate_all(
         pipeline_tasks.spawn(async move {
             let _permit = sem_clone.acquire_owned().await?;
 
-            phase_migrate_one(
-                &config_clone,
-                &db_clone,
-                size_val,
-                pb,
-                &cancel_clone,
-            )
-            .await
+            phase_migrate_one(&config_clone, &db_clone, size_val, pb, &cancel_clone).await
         });
     }
 

@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
     }
 
     let mut pbs = HashMap::new();
-    
+
     for (db_name, _size) in &dbs_with_sizes {
         let pb = mp.add(ProgressBar::new(0));
         pb.set_style(migration_style()?);
