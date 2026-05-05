@@ -4,13 +4,12 @@ mod tui;
 mod verification;
 
 use crate::phases::phase_migrate_all;
-use crate::tui::migration_style;
+use crate::tui::{migration_style, redraw_loop, shared_migration_states};
 use anyhow::Result;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
 use std::{
-    collections::HashMap,
     env, fs,
     path::PathBuf,
     sync::Arc,
@@ -176,14 +175,19 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let mut pbs = HashMap::new();
+    let states = shared_migration_states(&dbs_with_sizes);
 
-    for (db_name, _size) in &dbs_with_sizes {
-        let pb = mp.add(ProgressBar::new(0));
-        pb.set_style(migration_style()?);
-        pb.enable_steady_tick(Duration::from_secs(1));
-        pbs.insert(db_name, pb);
-    }
+    let table_pb = mp.add(ProgressBar::new_spinner());
+    table_pb.set_style(migration_style()?);
+    table_pb.enable_steady_tick(Duration::from_secs(1));
+
+    let redraw_cancel = cancel.clone();
+    let redraw_states = states.clone();
+    let redraw_pb = table_pb.clone();
+
+    let redraw_task = tokio::spawn(async move {
+        redraw_loop(redraw_states, redraw_pb, redraw_cancel).await;
+    });
 
     if !config.disable_dst_optimizations {
         db::enable_fast_restore(&config).await?;
@@ -197,12 +201,25 @@ async fn main() -> Result<()> {
 
     let sem = Arc::new(Semaphore::new(config.max_parallel));
 
-    phase_migrate_all(config.clone(), &dbs_with_sizes, &pbs, &cancel, sem).await?;
+    let migrate_result = phase_migrate_all(
+        config.clone(),
+        &dbs_with_sizes,
+        states.clone(),
+        &cancel,
+        sem,
+    )
+    .await;
+
+    cancel.cancel();
+    let _ = redraw_task.await;
+
+    migrate_result?;
 
     if !config.disable_dst_optimizations {
         db::restore_safe_settings(&config).await?;
     }
 
+    table_pb.finish_with_message(states.read().await.render_table());
     total_time_pb.finish_and_clear();
 
     let elapsed = start_time.elapsed();

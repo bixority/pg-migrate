@@ -1,17 +1,124 @@
-use indicatif::ProgressStyle;
+use crate::db::{MigrationPhase, MigrationState};
+use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fmt::Write;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Returns the style used for migration progress bars.
+/// Returns the style used for the state table.
 ///
 /// # Errors
 ///
 /// Returns an error if the template is invalid.
 pub fn migration_style() -> Result<ProgressStyle, indicatif::style::TemplateError> {
-    Ok(
-        ProgressStyle::with_template("[{elapsed_precise}] {bar:40.cyan/blue} {percent:>3}% {msg}")?
-            .progress_chars("#>-"),
-    )
+    ProgressStyle::with_template("{msg}")
+}
+
+#[derive(Clone, Debug)]
+pub struct MigrationStates {
+    states: BTreeMap<String, MigrationState>,
+}
+
+impl MigrationStates {
+    #[must_use]
+    pub fn new(dbs_with_sizes: &[(String, u64)]) -> Self {
+        let states = dbs_with_sizes
+            .iter()
+            .map(|(db, size)| (db.clone(), MigrationState::new(db.clone(), *size)))
+            .collect();
+
+        Self { states }
+    }
+
+    pub fn update(
+        &mut self,
+        db: &str,
+        phase: MigrationPhase,
+        step: u8,
+        display: impl Into<String>,
+    ) {
+        if let Some(state) = self.states.get_mut(db) {
+            state.set_phase(phase, step, display);
+        }
+    }
+
+    pub fn fail(&mut self, db: &str, error: impl Into<String>) {
+        if let Some(state) = self.states.get_mut(db) {
+            state.fail(error);
+        }
+    }
+
+    #[must_use]
+    pub fn render_table(&self) -> String {
+        let mut output = String::new();
+
+        let _ = writeln!(
+            output,
+            "{:<32} | {:>7} | {:<16} | {:>4} | Status",
+            "Database", "Size", "Phase", "%"
+        );
+        let _ = writeln!(
+            output,
+            "{:-<32}-|-{:-<7}-|-{:-<16}-|-{:-<4}-|-{:-<40}",
+            "", "", "", "", ""
+        );
+
+        for state in self.states.values() {
+            let size = indicatif::HumanBytes(state.size);
+            let phase = colored_phase(&state.phase);
+            let percent = state.percent();
+
+            let _ = writeln!(
+                output,
+                "{:<32} | {:>7} | {:<16} | {:>3}% | {}",
+                state.db, size, phase, percent, state.display
+            );
+        }
+
+        output
+    }
+}
+
+fn colored_phase(phase: &MigrationPhase) -> String {
+    match phase {
+        MigrationPhase::Complete => format!("\x1b[32m{}\x1b[0m", phase.as_str()),
+        MigrationPhase::Failed => format!("\x1b[31m{}\x1b[0m", phase.as_str()),
+        MigrationPhase::Skipped => format!("\x1b[33m{}\x1b[0m", phase.as_str()),
+        MigrationPhase::Pending => phase.as_str().to_string(),
+        _ => format!("\x1b[36m{}\x1b[0m", phase.as_str()),
+    }
+}
+
+pub type SharedMigrationStates = Arc<RwLock<MigrationStates>>;
+
+#[must_use]
+pub fn shared_migration_states(dbs_with_sizes: &[(String, u64)]) -> SharedMigrationStates {
+    Arc::new(RwLock::new(MigrationStates::new(dbs_with_sizes)))
+}
+
+pub async fn redraw_loop(
+    states: SharedMigrationStates,
+    pb: ProgressBar,
+    cancel: CancellationToken,
+) {
+    let mut interval = tokio::time::interval(Duration::from_millis(250));
+
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let rendered = states.read().await.render_table();
+                pb.set_message(rendered);
+            }
+            () = cancel.cancelled() => {
+                let rendered = states.read().await.render_table();
+                pb.set_message(rendered);
+                break;
+            }
+        }
+    }
 }
 
 pub fn render_verification_report(

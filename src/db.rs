@@ -1,7 +1,7 @@
 use crate::Config;
 use crate::state_dir;
 use anyhow::{Context, Result};
-use indicatif::{HumanBytes, ProgressBar};
+use indicatif::HumanBytes;
 use log::{info, warn};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
 use std::process::Stdio;
@@ -14,9 +14,86 @@ use tokio::process::Command;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Debug)]
+pub enum MigrationPhase {
+    Pending,
+    Dumping,
+    SourceCounts,
+    Restoring,
+    DestinationCounts,
+    Verifying,
+    Complete,
+    Skipped,
+    Failed,
+}
+
+impl MigrationPhase {
+    #[must_use]
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Dumping => "dumping",
+            Self::SourceCounts => "source counts",
+            Self::Restoring => "restoring",
+            Self::DestinationCounts => "dest counts",
+            Self::Verifying => "verifying",
+            Self::Complete => "complete",
+            Self::Skipped => "skipped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct MigrationState {
-    step: u8,
-    display: String,
+    pub db: String,
+    pub size: u64,
+    pub phase: MigrationPhase,
+    pub step: u8,
+    pub total_steps: u8,
+    pub display: String,
+    pub error: Option<String>,
+}
+
+impl MigrationState {
+    #[must_use]
+    pub fn new(db: impl Into<String>, size: u64) -> Self {
+        let db = db.into();
+
+        Self {
+            display: "waiting".to_string(),
+            db,
+            size,
+            phase: MigrationPhase::Pending,
+            step: 0,
+            total_steps: 6,
+            error: None,
+        }
+    }
+
+    pub fn set_phase(&mut self, phase: MigrationPhase, step: u8, display: impl Into<String>) {
+        self.phase = phase;
+        self.step = step;
+        self.display = display.into();
+    }
+
+    pub fn fail(&mut self, error: impl Into<String>) {
+        let error = error.into();
+
+        self.phase = MigrationPhase::Failed;
+        self.display.clone_from(&error);
+        self.error = Some(error);
+    }
+
+    #[must_use]
+    pub fn percent(&self) -> u8 {
+        if self.total_steps == 0 {
+            return 0;
+        }
+
+        let percent = u16::from(self.step).saturating_mul(100) / u16::from(self.total_steps);
+        percent.min(100) as u8
+    }
 }
 
 pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
@@ -69,25 +146,14 @@ pub async fn dump_db(
     config: &Config,
     db: &str,
     size: u64,
-    pb: ProgressBar,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let mut bar_total = size.saturating_mul(2);
-    if bar_total == 0 {
-        bar_total = 100;
-    }
-    let phase_mid = bar_total / 2;
     let human_size = HumanBytes(size);
-
-    pb.set_length(bar_total);
-    pb.set_message(format!("Dumping {db} ({human_size})"));
 
     let dump_path = dump_dir(&config.dump_root, db);
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
-        pb.set_message(format!("Dumping {db} ({human_size})"));
-
         let mut child = Command::new("pg_dump")
             .env("PGPASSWORD", &config.from_pass)
             .args([
@@ -130,7 +196,7 @@ pub async fn dump_db(
         }
     }
 
-    pb.set_position(phase_mid);
+    info!("Dumped {db} ({human_size})");
     fs::write(dump_done_marker(db), "")?;
     Ok(())
 }
@@ -139,15 +205,9 @@ pub async fn restore_db(
     config: &Config,
     db: &str,
     size: u64,
-    pb: ProgressBar,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let bar_total = size.saturating_mul(2);
-    let phase_end = bar_total;
     let human_size = HumanBytes(size);
-
-    pb.set_length(bar_total);
-    pb.set_message(format!("Restoring {db} ({human_size})"));
 
     let dump_path = dump_dir(&config.dump_root, db);
     fs::create_dir_all(&dump_path)?;
@@ -206,8 +266,7 @@ pub async fn restore_db(
         );
     }
 
-    pb.set_position(phase_end);
-    pb.finish_with_message(format!("{db} ({human_size}) restored"));
+    info!("Restored {db} ({human_size})");
     fs::write(done_marker(db), "")?;
     Ok(())
 }

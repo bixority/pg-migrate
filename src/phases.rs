@@ -1,7 +1,7 @@
+use crate::db::MigrationPhase;
+use crate::tui::SharedMigrationStates;
 use crate::{Config, db, verification};
-use indicatif::ProgressBar;
 use log::info;
-use std::collections::HashMap;
 use std::fs;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 pub async fn phase_migrate_all(
     config: Arc<Config>,
     db_names_with_sizes: &[(String, u64)],
-    pbs: &HashMap<&String, ProgressBar>,
+    states: SharedMigrationStates,
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
@@ -21,14 +21,30 @@ pub async fn phase_migrate_all(
         let config_clone = config.clone();
         let cancel_clone = cancel.clone();
         let sem_clone = sem.clone();
+        let states_clone = states.clone();
         let db_clone = db_name.clone();
         let size_val = *size;
-        let pb = pbs.get(db_name).cloned().expect("missing pb");
 
         pipeline_tasks.spawn(async move {
             let _permit = sem_clone.acquire_owned().await?;
 
-            phase_migrate_one(&config_clone, &db_clone, size_val, pb, &cancel_clone).await
+            let result = phase_migrate_one(
+                &config_clone,
+                &db_clone,
+                size_val,
+                states_clone.clone(),
+                &cancel_clone,
+            )
+            .await;
+
+            if let Err(error) = &result {
+                states_clone
+                    .write()
+                    .await
+                    .fail(&db_clone, error.to_string());
+            }
+
+            result
         });
     }
 
@@ -60,24 +76,65 @@ async fn phase_migrate_one(
     config: &Config,
     db_name: &str,
     size: u64,
-    pb: ProgressBar,
+    states: SharedMigrationStates,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    db::dump_db(config, db_name, size, pb.clone(), cancel.clone()).await?;
+    states
+        .write()
+        .await
+        .update(db_name, MigrationPhase::Dumping, 1, "dumping database");
+
+    db::dump_db(config, db_name, size, cancel.clone()).await?;
+
+    states.write().await.update(
+        db_name,
+        MigrationPhase::SourceCounts,
+        2,
+        "computing source row counts",
+    );
 
     compute_source_counts(config, db_name).await?;
 
     if db::done_marker(db_name).exists() {
         info!("Skipping restore for {db_name}");
-        pb.set_position(size.saturating_mul(2));
-        pb.set_message(format!("Restoration skipped (already done) for {db_name}"));
+
+        states.write().await.update(
+            db_name,
+            MigrationPhase::Skipped,
+            4,
+            "restore skipped; already done",
+        );
     } else {
-        db::restore_db(config, db_name, size, pb.clone(), cancel.clone()).await?;
+        states
+            .write()
+            .await
+            .update(db_name, MigrationPhase::Restoring, 3, "restoring database");
+
+        db::restore_db(config, db_name, size, cancel.clone()).await?;
     }
+
+    states.write().await.update(
+        db_name,
+        MigrationPhase::DestinationCounts,
+        5,
+        "computing destination row counts",
+    );
 
     compute_destination_counts(config, db_name).await?;
 
-    verification::verify_db(config, db_name, pb).await?;
+    states.write().await.update(
+        db_name,
+        MigrationPhase::Verifying,
+        6,
+        "verifying row counts",
+    );
+
+    verification::verify_db(config, db_name).await?;
+
+    states
+        .write()
+        .await
+        .update(db_name, MigrationPhase::Complete, 6, "migration complete");
 
     Ok(())
 }
