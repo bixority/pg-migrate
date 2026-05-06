@@ -163,9 +163,7 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 fn wildcard_matches_inner(pattern: &[u8], value: &[u8]) -> bool {
     match (pattern, value) {
         ([], []) => true,
-        ([], _) => false,
-        ([b'*', remaining_pattern @ ..], []) => wildcard_matches_inner(remaining_pattern, value),
-        ([_, ..], []) => false,
+        ([], _) | ([_, ..], []) => false,
         ([b'*', remaining_pattern @ ..], [_, remaining_value @ ..]) => {
             wildcard_matches_inner(remaining_pattern, value)
                 || wildcard_matches_inner(pattern, remaining_value)
