@@ -38,6 +38,7 @@ pub struct Config {
     pub dump_root: PathBuf,
     pub migrate_globals: bool,
     pub disable_dst_optimizations: bool,
+    pub exclude_table_data: Vec<String>,
 }
 
 /// Returns the user's home directory.
@@ -107,6 +108,8 @@ struct Args {
     migrate_globals: bool,
     #[arg(long, default_value_t = false)]
     disable_dst_optimizations: bool,
+    #[arg(long, value_name = "DATABASE.TABLE_PATTERN")]
+    exclude_table_data: Vec<String>,
 }
 
 #[tokio::main]
@@ -149,6 +152,7 @@ async fn main() -> Result<()> {
         dump_root: args.dump_root.into(),
         migrate_globals: args.migrate_globals,
         disable_dst_optimizations: args.disable_dst_optimizations,
+        exclude_table_data: args.exclude_table_data,
     });
 
     fs::create_dir_all(state_dir())?;

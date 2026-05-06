@@ -23,7 +23,7 @@ CREATE DATABASE db8;
 CREATE DATABASE db9;
 CREATE DATABASE db10;
 
--- Populate each database
+
 \c db1
 SELECT populate_db_func();
 
@@ -52,4 +52,16 @@ SELECT populate_db_func();
 SELECT populate_db_func();
 
 \c db10
+SELECT populate_db_func();
+
+
+-- For --exclude-table-data testing
+
+CREATE DATABASE pdb1;
+CREATE DATABASE pdb2;
+
+\c pdb1
+SELECT populate_db_func();
+
+\c pdb2
 SELECT populate_db_func();

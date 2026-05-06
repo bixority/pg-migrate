@@ -36,7 +36,7 @@ pub async fn verify_db(config: &Config, db_name: &str) -> Result<()> {
     let src_counts_path = src_counts_path(db_name);
     let dst_counts_path = dst_counts_path(db_name);
 
-    let src_map: BTreeMap<String, String> = if src_counts_path.exists() {
+    let mut src_map: BTreeMap<String, String> = if src_counts_path.exists() {
         let content = fs::read_to_string(&src_counts_path)?;
         serde_json::from_str(&content)?
     } else {
@@ -46,6 +46,7 @@ pub async fn verify_db(config: &Config, db_name: &str) -> Result<()> {
             &config.from_pass,
             &config.from_user,
             db_name,
+            &config.exclude_table_data,
         )
         .await?;
         let content = serde_json::to_string(&counts)?;
@@ -53,7 +54,7 @@ pub async fn verify_db(config: &Config, db_name: &str) -> Result<()> {
         counts
     };
 
-    let dst_map: BTreeMap<String, String> = if dst_counts_path.exists() {
+    let mut dst_map: BTreeMap<String, String> = if dst_counts_path.exists() {
         let content = fs::read_to_string(&dst_counts_path)?;
         serde_json::from_str(&content)?
     } else {
@@ -63,12 +64,16 @@ pub async fn verify_db(config: &Config, db_name: &str) -> Result<()> {
             &config.to_pass,
             &config.to_user,
             db_name,
+            &config.exclude_table_data,
         )
         .await?;
         let content = serde_json::to_string(&counts)?;
         fs::write(&dst_counts_path, content)?;
         counts
     };
+
+    filter_excluded_counts(db_name, &config.exclude_table_data, &mut src_map);
+    filter_excluded_counts(db_name, &config.exclude_table_data, &mut dst_map);
 
     let (output, mismatch) = render_verification_report(db_name, &src_map, &dst_map);
 
@@ -92,6 +97,7 @@ pub async fn stat_counts(
     pass: &str,
     user: &str,
     db_name: &str,
+    exclude_table_data: &[String],
 ) -> Result<BTreeMap<String, String>> {
     let pool = pg_pool(host, port, user, pass, db_name).await?;
 
@@ -105,6 +111,10 @@ pub async fn stat_counts(
         let schema: String = row.get(0);
         let table: String = row.get(1);
 
+        if is_excluded_table(db_name, &schema, &table, exclude_table_data) {
+            continue;
+        }
+
         let full_name = format!("\"{schema}\".\"{table}\"");
         let count_query = format!("SELECT count(*) FROM {full_name}");
         let count: i64 = sqlx::query(&count_query).fetch_one(&pool).await?.get(0);
@@ -112,4 +122,59 @@ pub async fn stat_counts(
     }
 
     Ok(counts)
+}
+
+fn filter_excluded_counts(
+    db_name: &str,
+    exclude_table_data: &[String],
+    counts: &mut BTreeMap<String, String>,
+) {
+    counts.retain(|full_table_name, _| {
+        let Some((schema, table)) = full_table_name.split_once('.') else {
+            return true;
+        };
+
+        !is_excluded_table(db_name, schema, table, exclude_table_data)
+    });
+}
+
+fn is_excluded_table(
+    db_name: &str,
+    schema: &str,
+    table: &str,
+    exclude_table_data: &[String],
+) -> bool {
+    let db_prefix = format!("{db_name}.");
+
+    exclude_table_data.iter().any(|exclude| {
+        let Some(table_pattern) = exclude.strip_prefix(&db_prefix) else {
+            return false;
+        };
+
+        wildcard_matches(table_pattern, table)
+            || wildcard_matches(table_pattern, &format!("{schema}.{table}"))
+    })
+}
+
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    wildcard_matches_inner(pattern.as_bytes(), value.as_bytes())
+}
+
+fn wildcard_matches_inner(pattern: &[u8], value: &[u8]) -> bool {
+    match (pattern, value) {
+        ([], []) => true,
+        ([], _) => false,
+        ([b'*', remaining_pattern @ ..], []) => wildcard_matches_inner(remaining_pattern, value),
+        ([_, ..], []) => false,
+        ([b'*', remaining_pattern @ ..], [_, remaining_value @ ..]) => {
+            wildcard_matches_inner(remaining_pattern, value)
+                || wildcard_matches_inner(pattern, remaining_value)
+        }
+        ([b'?', remaining_pattern @ ..], [_, remaining_value @ ..]) => {
+            wildcard_matches_inner(remaining_pattern, remaining_value)
+        }
+        ([pattern_byte, remaining_pattern @ ..], [value_byte, remaining_value @ ..]) => {
+            pattern_byte == value_byte && wildcard_matches_inner(remaining_pattern, remaining_value)
+        }
+    }
 }

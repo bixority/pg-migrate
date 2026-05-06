@@ -30,9 +30,9 @@ pg-migrate \
   --to-host "target-db.example.com" \
   --to-user "postgres" \
   --to-pass "newsecret456" \
-  --jobs 4 \
-  --max-parallel 2
-```
+  --exclude-table-data db1.table5 \
+  --exclude-table-data db2.table_* \
+  --exclude-table-data analytics.public.events_2024_*
 
 Launch the compiled binary directly. It will discover databases, dump them to a local directory, and restore them to the target. Use the command line arguments to specify connection details for both source and target servers.
 

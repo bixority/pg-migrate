@@ -154,24 +154,32 @@ pub async fn dump_db(
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
-        let mut child = Command::new("pg_dump")
-            .env("PGPASSWORD", &config.from_pass)
-            .args([
-                "-h",
-                &config.from_host,
-                "-p",
-                &config.from_port,
-                "-U",
-                &config.from_user,
-                "-Fd",
-                "-j",
-                &config.dump_jobs.to_string(),
-                "-Z",
-                "zstd:5",
-                "-f",
-                dump_path.to_str().expect("invalid dump path"),
-                db,
-            ])
+        let mut command = Command::new("pg_dump");
+        command.env("PGPASSWORD", &config.from_pass).args([
+            "-h",
+            &config.from_host,
+            "-p",
+            &config.from_port,
+            "-U",
+            &config.from_user,
+            "-Fd",
+            "-j",
+            &config.dump_jobs.to_string(),
+            "-Z",
+            "zstd:5",
+            "-f",
+            dump_path.to_str().expect("invalid dump path"),
+        ]);
+
+        let db_prefix = format!("{db}.");
+        for exclude in &config.exclude_table_data {
+            if let Some(table_pattern) = exclude.strip_prefix(&db_prefix) {
+                command.arg(format!("--exclude-table-data={table_pattern}"));
+            }
+        }
+
+        let mut child = command
+            .arg(db)
             .stderr(Stdio::piped())
             .spawn()
             .context("pg_dump failed to start")?;

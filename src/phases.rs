@@ -149,6 +149,7 @@ async fn compute_source_counts(config: &Config, db_name: &str) -> anyhow::Result
             &config.from_pass,
             &config.from_user,
             db_name,
+            &config.exclude_table_data,
         )
         .await?;
 
@@ -169,6 +170,7 @@ async fn compute_destination_counts(config: &Config, db_name: &str) -> anyhow::R
             &config.to_pass,
             &config.to_user,
             db_name,
+            &config.exclude_table_data,
         )
         .await?;
 
