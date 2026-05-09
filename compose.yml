@@ -1,6 +1,8 @@
+name: pg-migrate
+
 services:
   db-old:
-    image: postgres:9.5
+    image: docker.io/library/postgres:9.5
     ports:
       - "5432:5432"
     environment:
@@ -13,15 +15,12 @@ services:
       timeout: 15s
       retries: 10
     volumes:
-      - db-old:/var/lib/postgresql/9.5
       - ./.docker/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,Z
     networks:
       common:
-        aliases:
-          - db-old
 
   db-new:
-    image: postgres:18.3
+    image: docker.io/library/postgres:18.3
     ports:
       - "5433:5432"
     environment:
@@ -33,12 +32,8 @@ services:
       interval: 3s
       timeout: 15s
       retries: 10
-    volumes:
-      - db-new:/var/lib/postgresql/18
     networks:
       common:
-        aliases:
-          - db-new
 
   pg-migrate:
     build:
@@ -64,13 +59,6 @@ services:
         condition: service_healthy
     networks:
       common:
-        aliases:
-          - pg-migrate
-
-volumes:
-  db-old:
-  db-new:
-
 
 networks:
   common:

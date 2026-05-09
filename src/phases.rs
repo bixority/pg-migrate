@@ -26,7 +26,10 @@ pub async fn phase_migrate_all(
         let size_val = *size;
 
         pipeline_tasks.spawn(async move {
-            let _permit = sem_clone.acquire_owned().await?;
+            let _permit = tokio::select! {
+                res = sem_clone.acquire_owned() => res?,
+                () = cancel_clone.cancelled() => anyhow::bail!("cancelled while waiting for semaphore"),
+            };
 
             let result = phase_migrate_one(
                 &config_clone,
@@ -48,23 +51,32 @@ pub async fn phase_migrate_all(
         });
     }
 
-    while let Some(pipeline_result) = pipeline_tasks.join_next().await {
-        match pipeline_result? {
-            Ok(()) => {}
-            Err(e) => {
-                let was_cancelled = cancel.is_cancelled();
-
-                if !was_cancelled {
-                    cancel.cancel();
+    loop {
+        tokio::select! {
+            pipeline_result = pipeline_tasks.join_next() => {
+                match pipeline_result {
+                    Some(res) => {
+                        match res? {
+                            Ok(()) => {}
+                            Err(e) => {
+                                let was_cancelled = cancel.is_cancelled();
+                                if !was_cancelled {
+                                    cancel.cancel();
+                                }
+                                pipeline_tasks.abort_all();
+                                if was_cancelled {
+                                    anyhow::bail!("Migration cancelled by user");
+                                }
+                                return Err(e);
+                            }
+                        }
+                    }
+                    None => break,
                 }
-
+            }
+            () = cancel.cancelled() => {
                 pipeline_tasks.abort_all();
-
-                if was_cancelled {
-                    anyhow::bail!("Migration cancelled by user");
-                }
-
-                return Err(e);
+                anyhow::bail!("Migration cancelled by user");
             }
         }
     }
@@ -93,7 +105,7 @@ async fn phase_migrate_one(
         "computing source row counts",
     );
 
-    compute_source_counts(config, db_name).await?;
+    compute_source_counts(config, db_name, cancel.clone()).await?;
 
     if db::done_marker(db_name).exists() {
         info!("Skipping restore for {db_name}");
@@ -120,7 +132,7 @@ async fn phase_migrate_one(
         "computing destination row counts",
     );
 
-    compute_destination_counts(config, db_name).await?;
+    compute_destination_counts(config, db_name, cancel.clone()).await?;
 
     states.write().await.update(
         db_name,
@@ -129,7 +141,7 @@ async fn phase_migrate_one(
         "verifying row counts",
     );
 
-    verification::verify_db(config, db_name).await?;
+    verification::verify_db(config, db_name, cancel.clone()).await?;
 
     states
         .write()
@@ -139,7 +151,11 @@ async fn phase_migrate_one(
     Ok(())
 }
 
-async fn compute_source_counts(config: &Config, db_name: &str) -> anyhow::Result<()> {
+async fn compute_source_counts(
+    config: &Config,
+    db_name: &str,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let src_path = verification::src_counts_path(db_name);
 
     if !src_path.exists() {
@@ -150,6 +166,7 @@ async fn compute_source_counts(config: &Config, db_name: &str) -> anyhow::Result
             &config.from_user,
             db_name,
             &config.exclude_table_data,
+            cancel,
         )
         .await?;
 
@@ -160,7 +177,11 @@ async fn compute_source_counts(config: &Config, db_name: &str) -> anyhow::Result
     Ok(())
 }
 
-async fn compute_destination_counts(config: &Config, db_name: &str) -> anyhow::Result<()> {
+async fn compute_destination_counts(
+    config: &Config,
+    db_name: &str,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let dst_path = verification::dst_counts_path(db_name);
 
     if !dst_path.exists() {
@@ -171,6 +192,7 @@ async fn compute_destination_counts(config: &Config, db_name: &str) -> anyhow::R
             &config.to_user,
             db_name,
             &config.exclude_table_data,
+            cancel,
         )
         .await?;
 

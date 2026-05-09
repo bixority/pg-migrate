@@ -109,25 +109,32 @@ pub async fn pg_pool(host: &str, port: &str, user: &str, pass: &str, db: &str) -
     Ok(pool)
 }
 
-pub async fn discover_databases(config: &Config) -> Result<Vec<(String, u64)>> {
-    let pool = pg_pool(
-        &config.from_host,
-        &config.from_port,
-        &config.from_user,
-        &config.from_pass,
-        &config.from_db,
-    )
-    .await?;
+pub async fn discover_databases(
+    config: &Config,
+    cancel: CancellationToken,
+) -> Result<Vec<(String, u64)>> {
+    let pool = select! {
+        res = pg_pool(
+            &config.from_host,
+            &config.from_port,
+            &config.from_user,
+            &config.from_pass,
+            &config.from_db,
+        ) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+    };
 
-    let rows = sqlx::query(
-        "SELECT datname, pg_database_size(datname) AS size \
-         FROM pg_database \
-         WHERE datname NOT IN ('postgres','template0','template1') \
-         AND datallowconn IS TRUE \
-         ORDER BY pg_database_size(datname) ASC;",
-    )
-    .fetch_all(&pool)
-    .await?;
+    let rows = select! {
+        res = sqlx::query(
+            "SELECT datname, pg_database_size(datname) AS size \
+             FROM pg_database \
+             WHERE datname NOT IN ('postgres','template0','template1') \
+             AND datallowconn IS TRUE \
+             ORDER BY pg_database_size(datname) ASC;",
+        )
+        .fetch_all(&pool) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during database discovery"),
+    };
 
     let mut dbs = Vec::with_capacity(rows.len());
     for row in rows {
@@ -279,7 +286,7 @@ pub async fn restore_db(
     Ok(())
 }
 
-pub async fn enable_fast_restore(config: &Config) -> Result<()> {
+pub async fn enable_fast_restore(config: &Config, cancel: CancellationToken) -> Result<()> {
     let settings = [
         ("fsync", "off"),
         ("synchronous_commit", "off"),
@@ -288,62 +295,81 @@ pub async fn enable_fast_restore(config: &Config) -> Result<()> {
         ("checkpoint_completion_target", "0.9"),
     ];
 
-    let pool = pg_pool(
-        &config.to_host,
-        &config.to_port,
-        &config.to_user,
-        &config.to_pass,
-        &config.to_db,
-    )
-    .await?;
+    let pool = select! {
+        res = pg_pool(
+            &config.to_host,
+            &config.to_port,
+            &config.to_user,
+            &config.to_pass,
+            &config.to_db,
+        ) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+    };
 
     for (k, v) in settings {
         let sql = format!("ALTER SYSTEM SET {k} TO {v};");
-        sqlx::query(&sql).execute(&pool).await?;
+        select! {
+            res = sqlx::query(&sql).execute(&pool) => res?,
+            () = cancel.cancelled() => anyhow::bail!("cancelled during fast restore enablement"),
+        };
     }
 
-    sqlx::query("SELECT pg_reload_conf();")
-        .execute(&pool)
-        .await?;
+    select! {
+        res = sqlx::query("SELECT pg_reload_conf();").execute(&pool) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during fast restore enablement (reload)"),
+    };
     Ok(())
 }
 
-pub async fn restore_safe_settings(config: &Config) -> Result<()> {
+pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -> Result<()> {
     let settings = ["fsync", "synchronous_commit", "full_page_writes"];
 
-    let pool = pg_pool(
-        &config.to_host,
-        &config.to_port,
-        &config.to_user,
-        &config.to_pass,
-        &config.to_db,
-    )
-    .await?;
+    let pool = select! {
+        res = pg_pool(
+            &config.to_host,
+            &config.to_port,
+            &config.to_user,
+            &config.to_pass,
+            &config.to_db,
+        ) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+    };
 
     for s in settings {
         let sql = format!("ALTER SYSTEM RESET {s};");
-        sqlx::query(&sql).execute(&pool).await?;
+        select! {
+            res = sqlx::query(&sql).execute(&pool) => res?,
+            () = cancel.cancelled() => anyhow::bail!("cancelled during safe settings restoration"),
+        };
     }
-    sqlx::query("SELECT pg_reload_conf();")
-        .execute(&pool)
-        .await?;
+    select! {
+        res = sqlx::query("SELECT pg_reload_conf();").execute(&pool) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during safe settings restoration (reload)"),
+    };
     Ok(())
 }
 
-pub async fn create_dbs(config: &Config, dbs: &[String]) -> Result<()> {
-    let pool = pg_pool(
-        &config.to_host,
-        &config.to_port,
-        &config.to_user,
-        &config.to_pass,
-        &config.to_db,
-    )
-    .await?;
+pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationToken) -> Result<()> {
+    let pool = select! {
+        res = pg_pool(
+            &config.to_host,
+            &config.to_port,
+            &config.to_user,
+            &config.to_pass,
+            &config.to_db,
+        ) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+    };
 
     for db in dbs {
         let sql = format!("CREATE DATABASE \"{db}\"");
-        if let Err(e) = sqlx::query(&sql).execute(&pool).await {
-            warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
+        select! {
+            res = sqlx::query(&sql).execute(&pool) => {
+                if let Err(e) = res {
+                    warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
+                }
+            }
+            () = cancel.cancelled() => anyhow::bail!("cancelled during database creation of {db}"),
         }
     }
     Ok(())
@@ -357,7 +383,7 @@ pub fn globals_marker() -> PathBuf {
     state_dir().join("globals.done")
 }
 
-pub async fn migrate_globals(config: &Config) -> Result<()> {
+pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Result<()> {
     if globals_marker().exists() {
         return Ok(());
     }
@@ -367,7 +393,7 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
     let globals_path = config.dump_root.join("globals.sql");
     fs::create_dir_all(&config.dump_root)?;
 
-    let status = Command::new("pg_dumpall")
+    let mut child = Command::new("pg_dumpall")
         .env("PGPASSWORD", &config.from_pass)
         .args([
             "-h",
@@ -380,9 +406,16 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
             "-f",
             globals_path.to_str().expect("invalid globals path"),
         ])
-        .status()
-        .await
-        .context("pg_dumpall --globals-only failed")?;
+        .spawn()
+        .context("pg_dumpall --globals-only failed to start")?;
+
+    let status = select! {
+        res = child.wait() => res.context("pg_dumpall wait failed")?,
+        () = cancel.cancelled() => {
+            let _ = child.kill().await;
+            anyhow::bail!("cancelled during pg_dumpall --globals-only");
+        }
+    };
 
     if !status.success() {
         anyhow::bail!("pg_dumpall failed");
@@ -414,14 +447,16 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
     }
     fs::write(&globals_path, filtered_content.join("\n"))?;
 
-    let pool = pg_pool(
-        &config.to_host,
-        &config.to_port,
-        &config.to_user,
-        &config.to_pass,
-        &config.to_db,
-    )
-    .await?;
+    let pool = select! {
+        res = pg_pool(
+            &config.to_host,
+            &config.to_port,
+            &config.to_user,
+            &config.to_pass,
+            &config.to_db,
+        ) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+    };
 
     let sql = fs::read_to_string(&globals_path)?;
     for stmt in sql.split(";\n") {
@@ -430,7 +465,13 @@ pub async fn migrate_globals(config: &Config) -> Result<()> {
             continue;
         }
         let exec_sql = format!("{s};");
-        if let Err(e) = sqlx::query(&exec_sql).execute(&pool).await {
+
+        let res = select! {
+            res = sqlx::query(&exec_sql).execute(&pool) => res,
+            () = cancel.cancelled() => anyhow::bail!("cancelled during globals migration execution"),
+        };
+
+        if let Err(e) = res {
             let msg = format!("{e}");
             if msg.contains("already exists")
                 || msg.contains("MD5-encrypted password")

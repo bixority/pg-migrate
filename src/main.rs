@@ -169,7 +169,7 @@ async fn main() -> Result<()> {
         cancel_signal.cancel();
     });
 
-    let dbs_with_sizes = db::discover_databases(&config).await?;
+    let dbs_with_sizes = db::discover_databases(&config, cancel.clone()).await?;
     let db_names_owned: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
 
     info!("Databases: {db_names_owned:?}");
@@ -194,14 +194,14 @@ async fn main() -> Result<()> {
     });
 
     if !config.disable_dst_optimizations {
-        db::enable_fast_restore(&config).await?;
+        db::enable_fast_restore(&config, cancel.clone()).await?;
     }
 
     if config.migrate_globals {
-        db::migrate_globals(&config).await?;
+        db::migrate_globals(&config, cancel.clone()).await?;
     }
 
-    db::create_dbs(&config, &db_names_owned).await?;
+    db::create_dbs(&config, &db_names_owned, cancel.clone()).await?;
 
     let sem = Arc::new(Semaphore::new(config.max_parallel));
 
@@ -220,7 +220,7 @@ async fn main() -> Result<()> {
     migrate_result?;
 
     if !config.disable_dst_optimizations {
-        db::restore_safe_settings(&config).await?;
+        db::restore_safe_settings(&config, CancellationToken::new()).await?;
     }
 
     table_pb.finish_with_message(states.read().await.render_table());

@@ -8,6 +8,7 @@ use sqlx::Row;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::PathBuf;
+use tokio_util::sync::CancellationToken;
 
 pub fn verify_marker(db_name: &str) -> PathBuf {
     verify_dir().join(format!("{db_name}.verify"))
@@ -22,17 +23,21 @@ pub fn dst_counts_path(db: &str) -> PathBuf {
 }
 
 #[allow(dead_code)]
-pub async fn verify_all(config: &Config, db_names: &[String]) -> Result<()> {
+pub async fn verify_all(
+    config: &Config,
+    db_names: &[String],
+    cancel: CancellationToken,
+) -> Result<()> {
     for db_name in db_names {
         if verify_marker(db_name).exists() {
             continue;
         }
-        verify_db(config, db_name).await?;
+        verify_db(config, db_name, cancel.clone()).await?;
     }
     Ok(())
 }
 
-pub async fn verify_db(config: &Config, db_name: &str) -> Result<()> {
+pub async fn verify_db(config: &Config, db_name: &str, cancel: CancellationToken) -> Result<()> {
     let src_counts_path = src_counts_path(db_name);
     let dst_counts_path = dst_counts_path(db_name);
 
@@ -47,6 +52,7 @@ pub async fn verify_db(config: &Config, db_name: &str) -> Result<()> {
             &config.from_user,
             db_name,
             &config.exclude_table_data,
+            cancel.clone(),
         )
         .await?;
         let content = serde_json::to_string(&counts)?;
@@ -65,6 +71,7 @@ pub async fn verify_db(config: &Config, db_name: &str) -> Result<()> {
             &config.to_user,
             db_name,
             &config.exclude_table_data,
+            cancel.clone(),
         )
         .await?;
         let content = serde_json::to_string(&counts)?;
@@ -98,12 +105,14 @@ pub async fn stat_counts(
     user: &str,
     db_name: &str,
     exclude_table_data: &[String],
+    cancel: CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
     let pool = pg_pool(host, port, user, pass, db_name).await?;
 
-    let tables = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2")
-        .fetch_all(&pool)
-        .await?;
+    let tables = tokio::select! {
+        res = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2").fetch_all(&pool) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during table discovery for {db_name}"),
+    };
 
     let mut counts = BTreeMap::new();
 
@@ -117,7 +126,10 @@ pub async fn stat_counts(
 
         let full_name = format!("\"{schema}\".\"{table}\"");
         let count_query = format!("SELECT count(*) FROM {full_name}");
-        let count: i64 = sqlx::query(&count_query).fetch_one(&pool).await?.get(0);
+        let count: i64 = tokio::select! {
+            res = sqlx::query(&count_query).fetch_one(&pool) => res?.get(0),
+            () = cancel.cancelled() => anyhow::bail!("cancelled during row count of {db_name}.{schema}.{table}"),
+        };
         counts.insert(format!("{schema}.{table}"), count.to_string());
     }
 
@@ -163,7 +175,7 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 fn wildcard_matches_inner(pattern: &[u8], value: &[u8]) -> bool {
     match (pattern, value) {
         ([], []) => true,
-        ([], _) | ([_, ..], []) => false,
+        ([b'*', remaining_pattern @ ..], []) => wildcard_matches_inner(remaining_pattern, &[]),
         ([b'*', remaining_pattern @ ..], [_, remaining_value @ ..]) => {
             wildcard_matches_inner(remaining_pattern, value)
                 || wildcard_matches_inner(pattern, remaining_value)
@@ -174,5 +186,6 @@ fn wildcard_matches_inner(pattern: &[u8], value: &[u8]) -> bool {
         ([pattern_byte, remaining_pattern @ ..], [value_byte, remaining_value @ ..]) => {
             pattern_byte == value_byte && wildcard_matches_inner(remaining_pattern, remaining_value)
         }
+        _ => false,
     }
 }
