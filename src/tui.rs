@@ -1,5 +1,5 @@
-use crate::db::{MigrationPhase, MigrationState};
 use crate::Config;
+use crate::db::{MigrationPhase, MigrationState};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fmt::Write;

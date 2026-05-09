@@ -300,11 +300,7 @@ pub async fn restore_db(
     Ok(())
 }
 
-pub async fn dump_data(
-    config: &Config,
-    db: &str,
-    cancel: CancellationToken,
-) -> Result<()> {
+pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> Result<()> {
     let dump_path = dump_dir(&config.dump_root, db).join("delayed");
     fs::create_dir_all(&dump_path)?;
 

@@ -96,7 +96,7 @@ pub async fn phase_migrate_all(
         cancel,
         sem,
     )
-        .await
+    .await
 }
 
 async fn phase_migrate_one(
@@ -177,7 +177,10 @@ pub async fn phase_delay_migrate_all(
 
     for (db_name, size) in db_names_with_sizes {
         let db_prefix = format!("{db_name}.");
-        let has_delayed = config.delay_table_data.iter().any(|d| d.starts_with(&db_prefix));
+        let has_delayed = config
+            .delay_table_data
+            .iter()
+            .any(|d| d.starts_with(&db_prefix));
 
         if !has_delayed {
             continue;
