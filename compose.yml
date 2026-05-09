@@ -49,8 +49,8 @@ services:
       "--to-user", "dev",
       "--to-pass", "dev",
       "--max-parallel", "4",
-      "--exclude-table-data", "pdb1.table3",
-      "--exclude-table-data", "pdb2.table*",
+      "--delay-table-data", "pdb1.table3",
+      "--delay-table-data", "pdb2.table*",
     ]
     depends_on:
       db-old:
