@@ -121,7 +121,7 @@ async fn main() -> Result<()> {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
 
     let mp = Arc::new(MultiProgress::with_draw_target(
-        ProgressDrawTarget::stderr_with_hz(10),
+        ProgressDrawTarget::stderr_with_hz(1),
     ));
 
     indicatif_log_bridge::LogWrapper::new((*mp).clone(), logger)

@@ -104,7 +104,7 @@ pub async fn redraw_loop(
     pb: ProgressBar,
     cancel: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_millis(250));
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
 
     loop {
         tokio::select! {
