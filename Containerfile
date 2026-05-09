@@ -27,7 +27,7 @@ RUN echo "Target architecture is: ${TARGETARCH}" && \
         echo "Unsupported architecture: ${TARGETARCH}"; exit 1; \
     fi
 
-FROM --platform=$TARGETOS/$TARGETARCH postgres:18.2-bookworm AS runtime
+FROM --platform=$TARGETOS/$TARGETARCH postgres:18.3-bookworm AS runtime
 LABEL org.opencontainers.image.description="PostgreSQL migration tool"
 LABEL authors="Olegs Korsaks"
 
