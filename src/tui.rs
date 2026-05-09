@@ -1,4 +1,5 @@
 use crate::db::{MigrationPhase, MigrationState};
+use crate::Config;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -24,10 +25,21 @@ pub struct MigrationStates {
 
 impl MigrationStates {
     #[must_use]
-    pub fn new(dbs_with_sizes: &[(String, u64)]) -> Self {
+    pub fn new(dbs_with_sizes: &[(String, u64)], config: &Config) -> Self {
         let states = dbs_with_sizes
             .iter()
-            .map(|(db, size)| (db.clone(), MigrationState::new(db.clone(), *size)))
+            .map(|(db, size)| {
+                let mut state = MigrationState::new(db.clone(), *size);
+                let db_prefix = format!("{db}.");
+                if config
+                    .delay_table_data
+                    .iter()
+                    .any(|d| d.starts_with(&db_prefix))
+                {
+                    state.total_steps = 9;
+                }
+                (db.clone(), state)
+            })
             .collect();
 
         Self { states }
@@ -95,8 +107,11 @@ fn colored_phase(phase: &MigrationPhase) -> String {
 pub type SharedMigrationStates = Arc<RwLock<MigrationStates>>;
 
 #[must_use]
-pub fn shared_migration_states(dbs_with_sizes: &[(String, u64)]) -> SharedMigrationStates {
-    Arc::new(RwLock::new(MigrationStates::new(dbs_with_sizes)))
+pub fn shared_migration_states(
+    dbs_with_sizes: &[(String, u64)],
+    config: &Config,
+) -> SharedMigrationStates {
+    Arc::new(RwLock::new(MigrationStates::new(dbs_with_sizes, config)))
 }
 
 pub async fn redraw_loop(

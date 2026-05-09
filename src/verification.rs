@@ -14,6 +14,10 @@ pub fn verify_marker(db_name: &str) -> PathBuf {
     verify_dir().join(format!("{db_name}.verify"))
 }
 
+pub fn delayed_verify_marker(db_name: &str) -> PathBuf {
+    verify_dir().join(format!("{db_name}.delayed_verify"))
+}
+
 pub fn src_counts_path(db_name: &str) -> PathBuf {
     verify_dir().join(format!("{db_name}.src_counts.json"))
 }
@@ -32,14 +36,27 @@ pub async fn verify_all(
         if verify_marker(db_name).exists() {
             continue;
         }
-        verify_db(config, db_name, cancel.clone()).await?;
+        verify_db(config, db_name, false, cancel.clone()).await?;
     }
     Ok(())
 }
 
-pub async fn verify_db(config: &Config, db_name: &str, cancel: CancellationToken) -> Result<()> {
-    let src_counts_path = src_counts_path(db_name);
-    let dst_counts_path = dst_counts_path(db_name);
+pub async fn verify_db(
+    config: &Config,
+    db_name: &str,
+    include_delayed: bool,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let src_counts_path = if include_delayed {
+        verify_dir().join(format!("{db_name}.src_counts.delayed.json"))
+    } else {
+        src_counts_path(db_name)
+    };
+    let dst_counts_path = if include_delayed {
+        verify_dir().join(format!("{db_name}.dst_counts.delayed.json"))
+    } else {
+        dst_counts_path(db_name)
+    };
 
     let mut src_map: BTreeMap<String, String> = if src_counts_path.exists() {
         let content = fs::read_to_string(&src_counts_path)?;
@@ -51,7 +68,8 @@ pub async fn verify_db(config: &Config, db_name: &str, cancel: CancellationToken
             &config.from_pass,
             &config.from_user,
             db_name,
-            &config.exclude_table_data,
+            &config.delay_table_data,
+            include_delayed,
             cancel.clone(),
         )
         .await?;
@@ -70,7 +88,8 @@ pub async fn verify_db(config: &Config, db_name: &str, cancel: CancellationToken
             &config.to_pass,
             &config.to_user,
             db_name,
-            &config.exclude_table_data,
+            &config.delay_table_data,
+            include_delayed,
             cancel.clone(),
         )
         .await?;
@@ -79,8 +98,10 @@ pub async fn verify_db(config: &Config, db_name: &str, cancel: CancellationToken
         counts
     };
 
-    filter_excluded_counts(db_name, &config.exclude_table_data, &mut src_map);
-    filter_excluded_counts(db_name, &config.exclude_table_data, &mut dst_map);
+    if !include_delayed {
+        filter_delayed_counts(db_name, &config.delay_table_data, &mut src_map);
+        filter_delayed_counts(db_name, &config.delay_table_data, &mut dst_map);
+    }
 
     let (output, mismatch) = render_verification_report(db_name, &src_map, &dst_map);
 
@@ -91,10 +112,14 @@ pub async fn verify_db(config: &Config, db_name: &str, cancel: CancellationToken
 
     info!("{output}");
     info!(
-        "Verified {db_name}: {} tables, all rows match",
+        "Verified {db_name} (include_delayed={include_delayed}): {} tables, all rows match",
         src_map.len()
     );
-    fs::write(verify_marker(db_name), "")?;
+    if include_delayed {
+        fs::write(delayed_verify_marker(db_name), "")?;
+    } else {
+        fs::write(verify_marker(db_name), "")?;
+    }
     Ok(())
 }
 
@@ -104,7 +129,8 @@ pub async fn stat_counts(
     pass: &str,
     user: &str,
     db_name: &str,
-    exclude_table_data: &[String],
+    delay_table_data: &[String],
+    include_delayed: bool,
     cancel: CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
     let pool = pg_pool(host, port, user, pass, db_name).await?;
@@ -120,7 +146,7 @@ pub async fn stat_counts(
         let schema: String = row.get(0);
         let table: String = row.get(1);
 
-        if is_excluded_table(db_name, &schema, &table, exclude_table_data) {
+        if !include_delayed && is_delayed_table(db_name, &schema, &table, delay_table_data) {
             continue;
         }
 
@@ -136,9 +162,9 @@ pub async fn stat_counts(
     Ok(counts)
 }
 
-fn filter_excluded_counts(
+fn filter_delayed_counts(
     db_name: &str,
-    exclude_table_data: &[String],
+    delay_table_data: &[String],
     counts: &mut BTreeMap<String, String>,
 ) {
     counts.retain(|full_table_name, _| {
@@ -146,20 +172,20 @@ fn filter_excluded_counts(
             return true;
         };
 
-        !is_excluded_table(db_name, schema, table, exclude_table_data)
+        !is_delayed_table(db_name, schema, table, delay_table_data)
     });
 }
 
-fn is_excluded_table(
+fn is_delayed_table(
     db_name: &str,
     schema: &str,
     table: &str,
-    exclude_table_data: &[String],
+    delay_table_data: &[String],
 ) -> bool {
     let db_prefix = format!("{db_name}.");
 
-    exclude_table_data.iter().any(|exclude| {
-        let Some(table_pattern) = exclude.strip_prefix(&db_prefix) else {
+    delay_table_data.iter().any(|delay| {
+        let Some(table_pattern) = delay.strip_prefix(&db_prefix) else {
             return false;
         };
 

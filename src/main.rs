@@ -38,7 +38,7 @@ pub struct Config {
     pub dump_root: PathBuf,
     pub migrate_globals: bool,
     pub disable_dst_optimizations: bool,
-    pub exclude_table_data: Vec<String>,
+    pub delay_table_data: Vec<String>,
 }
 
 /// Returns the user's home directory.
@@ -109,7 +109,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     disable_dst_optimizations: bool,
     #[arg(long, value_name = "DATABASE.TABLE_PATTERN")]
-    exclude_table_data: Vec<String>,
+    delay_table_data: Vec<String>,
 }
 
 #[tokio::main]
@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
         dump_root: args.dump_root.into(),
         migrate_globals: args.migrate_globals,
         disable_dst_optimizations: args.disable_dst_optimizations,
-        exclude_table_data: args.exclude_table_data,
+        delay_table_data: args.delay_table_data,
     });
 
     fs::create_dir_all(state_dir())?;
@@ -179,7 +179,7 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let states = shared_migration_states(&dbs_with_sizes);
+    let states = shared_migration_states(&dbs_with_sizes, &config);
 
     let table_pb = mp.add(ProgressBar::new_spinner());
     table_pb.set_style(migration_style()?);
@@ -210,7 +210,7 @@ async fn main() -> Result<()> {
         &dbs_with_sizes,
         states.clone(),
         &cancel,
-        sem,
+        sem.clone(),
     )
     .await;
 

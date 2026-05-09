@@ -22,6 +22,9 @@ pub enum MigrationPhase {
     Restoring,
     DestinationCounts,
     Verifying,
+    DelayedDumping,
+    DelayedRestoring,
+    DelayedVerifying,
     Complete,
     Skipped,
     Failed,
@@ -37,6 +40,9 @@ impl MigrationPhase {
             Self::Restoring => "restoring",
             Self::DestinationCounts => "dest counts",
             Self::Verifying => "verifying",
+            Self::DelayedDumping => "delayed dumping",
+            Self::DelayedRestoring => "delayed restoring",
+            Self::DelayedVerifying => "delayed verifying",
             Self::Complete => "complete",
             Self::Skipped => "skipped",
             Self::Failed => "failed",
@@ -149,6 +155,14 @@ pub fn dump_done_marker(db: &str) -> PathBuf {
     state_dir().join(format!("{db}.dumped"))
 }
 
+pub fn delayed_dump_done_marker(db: &str) -> PathBuf {
+    state_dir().join(format!("{db}.delayed_dumped"))
+}
+
+pub fn delayed_done_marker(db: &str) -> PathBuf {
+    state_dir().join(format!("{db}.delayed_done"))
+}
+
 pub async fn dump_db(
     config: &Config,
     db: &str,
@@ -179,8 +193,8 @@ pub async fn dump_db(
         ]);
 
         let db_prefix = format!("{db}.");
-        for exclude in &config.exclude_table_data {
-            if let Some(table_pattern) = exclude.strip_prefix(&db_prefix) {
+        for delay in &config.delay_table_data {
+            if let Some(table_pattern) = delay.strip_prefix(&db_prefix) {
                 command.arg(format!("--exclude-table-data={table_pattern}"));
             }
         }
@@ -283,6 +297,144 @@ pub async fn restore_db(
 
     info!("Restored {db} ({human_size})");
     fs::write(done_marker(db), "")?;
+    Ok(())
+}
+
+pub async fn dump_data(
+    config: &Config,
+    db: &str,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let dump_path = dump_dir(&config.dump_root, db).join("delayed");
+    fs::create_dir_all(&dump_path)?;
+
+    if !dump_path.join("toc.dat").exists() {
+        let mut command = Command::new("pg_dump");
+        command.env("PGPASSWORD", &config.from_pass).args([
+            "-h",
+            &config.from_host,
+            "-p",
+            &config.from_port,
+            "-U",
+            &config.from_user,
+            "-Fd",
+            "-j",
+            &config.dump_jobs.to_string(),
+            "-Z",
+            "zstd:5",
+            "--data-only",
+            "-f",
+            dump_path.to_str().expect("invalid dump path"),
+        ]);
+
+        let db_prefix = format!("{db}.");
+        let mut has_delayed = false;
+        for delay in &config.delay_table_data {
+            if let Some(table_pattern) = delay.strip_prefix(&db_prefix) {
+                command.arg(format!("--table={table_pattern}"));
+                has_delayed = true;
+            }
+        }
+
+        if !has_delayed {
+            return Ok(());
+        }
+
+        let mut child = command
+            .arg(db)
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("pg_dump (delayed) failed to start")?;
+
+        let stderr = child.stderr.take();
+
+        let status = select! {
+            res = child.wait() => res.context("pg_dump (delayed) wait failed")?,
+            () = cancel.cancelled() => {
+                let _ = child.kill().await;
+                anyhow::bail!("cancelled during pg_dump (delayed) of {db}");
+            }
+        };
+
+        let mut err_output = String::new();
+        if let Some(mut stderr) = stderr {
+            let _ = stderr.read_to_string(&mut err_output).await;
+        }
+
+        if !status.success() {
+            anyhow::bail!("pg_dump (delayed) failed for {db}: {}", err_output.trim());
+        }
+    }
+
+    info!("Dumped delayed data for {db}");
+    fs::write(delayed_dump_done_marker(db), "")?;
+    Ok(())
+}
+
+pub async fn restore_delayed_data(
+    config: &Config,
+    db: &str,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let dump_path = dump_dir(&config.dump_root, db).join("delayed");
+
+    if !dump_path.join("toc.dat").exists() {
+        return Ok(());
+    }
+
+    let mut child = Command::new("pg_restore")
+        .env("PGPASSWORD", &config.to_pass)
+        .args([
+            "-h",
+            &config.to_host,
+            "-p",
+            &config.to_port,
+            "-U",
+            &config.to_user,
+            "-j",
+            &config.restore_jobs.to_string(),
+            "--disable-triggers",
+            "--data-only",
+            "-d",
+            db,
+            dump_path.to_str().expect("invalid dump path"),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("pg_restore (delayed) failed to start")?;
+
+    let mut stdout = child.stdout.take();
+    let mut stderr = child.stderr.take();
+
+    let status = select! {
+        res = child.wait() => res.context("pg_restore (delayed) wait failed")?,
+        () = cancel.cancelled() => {
+            let _ = child.kill().await;
+            anyhow::bail!("cancelled during pg_restore (delayed) of {db}");
+        }
+    };
+
+    let mut stdout_output = String::new();
+    if let Some(mut stdout) = stdout.take() {
+        let _ = stdout.read_to_string(&mut stdout_output).await;
+    }
+
+    let mut stderr_output = String::new();
+    if let Some(mut stderr) = stderr.take() {
+        let _ = stderr.read_to_string(&mut stderr_output).await;
+    }
+
+    if !status.success() {
+        anyhow::bail!(
+            "pg_restore (delayed) failed for {db} with status {status}\nstdout:\n{}\nstderr:\n{}",
+            stdout_output.trim(),
+            stderr_output.trim(),
+        );
+    }
+
+    info!("Restored delayed data for {db}");
+    fs::write(delayed_done_marker(db), "")?;
     Ok(())
 }
 

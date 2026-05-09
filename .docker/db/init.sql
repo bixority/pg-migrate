@@ -55,7 +55,7 @@ SELECT populate_db_func();
 SELECT populate_db_func();
 
 
--- For --exclude-table-data testing
+-- For --delay-table-data testing
 
 CREATE DATABASE pdb1;
 CREATE DATABASE pdb2;

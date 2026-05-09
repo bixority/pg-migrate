@@ -60,13 +60,17 @@ pub async fn phase_migrate_all(
                             Ok(()) => {}
                             Err(e) => {
                                 let was_cancelled = cancel.is_cancelled();
+
                                 if !was_cancelled {
                                     cancel.cancel();
                                 }
+
                                 pipeline_tasks.abort_all();
+
                                 if was_cancelled {
                                     anyhow::bail!("Migration cancelled by user");
                                 }
+
                                 return Err(e);
                             }
                         }
@@ -81,7 +85,18 @@ pub async fn phase_migrate_all(
         }
     }
 
-    Ok(())
+    if cancel.is_cancelled() {
+        anyhow::bail!("Migration cancelled by user");
+    }
+
+    phase_delay_migrate_all(
+        config.clone(),
+        db_names_with_sizes,
+        states.clone(),
+        cancel,
+        sem,
+    )
+        .await
 }
 
 async fn phase_migrate_one(
@@ -141,12 +156,131 @@ async fn phase_migrate_one(
         "verifying row counts",
     );
 
-    verification::verify_db(config, db_name, cancel.clone()).await?;
+    verification::verify_db(config, db_name, false, cancel.clone()).await?;
 
     states
         .write()
         .await
         .update(db_name, MigrationPhase::Complete, 6, "migration complete");
+
+    Ok(())
+}
+
+pub async fn phase_delay_migrate_all(
+    config: Arc<Config>,
+    db_names_with_sizes: &[(String, u64)],
+    states: SharedMigrationStates,
+    cancel: &CancellationToken,
+    sem: Arc<Semaphore>,
+) -> anyhow::Result<()> {
+    let mut delayed_tasks = JoinSet::new();
+
+    for (db_name, size) in db_names_with_sizes {
+        let db_prefix = format!("{db_name}.");
+        let has_delayed = config.delay_table_data.iter().any(|d| d.starts_with(&db_prefix));
+
+        if !has_delayed {
+            continue;
+        }
+
+        let config_clone = config.clone();
+        let cancel_clone = cancel.clone();
+        let sem_clone = sem.clone();
+        let states_clone = states.clone();
+        let db_clone = db_name.clone();
+        let size_val = *size;
+
+        delayed_tasks.spawn(async move {
+            let _permit = tokio::select! {
+                res = sem_clone.acquire_owned() => res?,
+                () = cancel_clone.cancelled() => anyhow::bail!("cancelled while waiting for semaphore"),
+            };
+
+            let result = phase_delay_migrate_one(
+                &config_clone,
+                &db_clone,
+                size_val,
+                states_clone.clone(),
+                &cancel_clone,
+            )
+            .await;
+
+            if let Err(error) = &result {
+                states_clone
+                    .write()
+                    .await
+                    .fail(&db_clone, error.to_string());
+            }
+
+            result
+        });
+    }
+
+    while let Some(res) = delayed_tasks.join_next().await {
+        match res? {
+            Ok(()) => {}
+            Err(e) => {
+                let was_cancelled = cancel.is_cancelled();
+                if !was_cancelled {
+                    cancel.cancel();
+                }
+                delayed_tasks.abort_all();
+                if was_cancelled {
+                    anyhow::bail!("Delayed migration cancelled by user");
+                }
+                return Err(e);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn phase_delay_migrate_one(
+    config: &Config,
+    db_name: &str,
+    _size: u64,
+    states: SharedMigrationStates,
+    cancel: &CancellationToken,
+) -> anyhow::Result<()> {
+    if db::delayed_done_marker(db_name).exists() {
+        info!("Skipping delayed migration for {db_name}");
+        return Ok(());
+    }
+
+    states.write().await.update(
+        db_name,
+        MigrationPhase::DelayedDumping,
+        7,
+        "dumping delayed table data",
+    );
+
+    db::dump_data(config, db_name, cancel.clone()).await?;
+
+    states.write().await.update(
+        db_name,
+        MigrationPhase::DelayedRestoring,
+        8,
+        "restoring delayed table data",
+    );
+
+    db::restore_delayed_data(config, db_name, cancel.clone()).await?;
+
+    states.write().await.update(
+        db_name,
+        MigrationPhase::DelayedVerifying,
+        9,
+        "verifying all row counts (including delayed)",
+    );
+
+    verification::verify_db(config, db_name, true, cancel.clone()).await?;
+
+    states.write().await.update(
+        db_name,
+        MigrationPhase::Complete,
+        9,
+        "migration complete (with delayed data)",
+    );
 
     Ok(())
 }
@@ -165,7 +299,8 @@ async fn compute_source_counts(
             &config.from_pass,
             &config.from_user,
             db_name,
-            &config.exclude_table_data,
+            &config.delay_table_data,
+            false,
             cancel,
         )
         .await?;
@@ -191,7 +326,8 @@ async fn compute_destination_counts(
             &config.to_pass,
             &config.to_user,
             db_name,
-            &config.exclude_table_data,
+            &config.delay_table_data,
+            false,
             cancel,
         )
         .await?;
