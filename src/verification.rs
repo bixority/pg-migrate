@@ -1,5 +1,5 @@
 use crate::Config;
-use crate::db::pg_pool;
+use crate::db::{DbArgs, pg_pool};
 use crate::tui::render_verification_report;
 use crate::verify_dir;
 use anyhow::Result;
@@ -63,10 +63,7 @@ pub async fn verify_db(
         serde_json::from_str(&content)?
     } else {
         let counts = stat_counts(
-            &config.from_host,
-            &config.from_port,
-            &config.from_pass,
-            &config.from_user,
+            &config.source,
             db_name,
             &config.delay_table_data,
             include_delayed,
@@ -83,10 +80,7 @@ pub async fn verify_db(
         serde_json::from_str(&content)?
     } else {
         let counts = stat_counts(
-            &config.to_host,
-            &config.to_port,
-            &config.to_pass,
-            &config.to_user,
+            &config.destination,
             db_name,
             &config.delay_table_data,
             include_delayed,
@@ -124,16 +118,13 @@ pub async fn verify_db(
 }
 
 pub async fn stat_counts(
-    host: &str,
-    port: &str,
-    pass: &str,
-    user: &str,
+    args: &DbArgs,
     db_name: &str,
     delay_table_data: &[String],
     include_delayed: bool,
     cancel: CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
-    let pool = pg_pool(host, port, user, pass, db_name).await?;
+    let pool = pg_pool(args, db_name).await?;
 
     let tables = tokio::select! {
         res = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2").fetch_all(&pool) => res?,

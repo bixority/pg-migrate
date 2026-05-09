@@ -297,10 +297,7 @@ async fn compute_source_counts(
 
     if !src_path.exists() {
         let counts = verification::stat_counts(
-            &config.from_host,
-            &config.from_port,
-            &config.from_pass,
-            &config.from_user,
+            &config.source,
             db_name,
             &config.delay_table_data,
             false,
@@ -324,10 +321,7 @@ async fn compute_destination_counts(
 
     if !dst_path.exists() {
         let counts = verification::stat_counts(
-            &config.to_host,
-            &config.to_port,
-            &config.to_pass,
-            &config.to_user,
+            &config.destination,
             db_name,
             &config.delay_table_data,
             false,

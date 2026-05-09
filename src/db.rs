@@ -15,6 +15,14 @@ use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
+pub struct DbArgs {
+    pub host: String,
+    pub port: String,
+    pub user: String,
+    pub pass: String,
+}
+
+#[derive(Clone, Debug)]
 pub enum MigrationPhase {
     Pending,
     Dumping,
@@ -106,8 +114,11 @@ pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
     root.join(db)
 }
 
-pub async fn pg_pool(host: &str, port: &str, user: &str, pass: &str, db: &str) -> Result<PgPool> {
-    let url = format!("postgres://{user}:{pass}@{host}:{port}/{db}");
+pub async fn pg_pool(args: &DbArgs, db: &str) -> Result<PgPool> {
+    let url = format!(
+        "postgres://{}:{}@{}:{}/{}",
+        args.user, args.pass, args.host, args.port, db
+    );
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&url)
@@ -121,11 +132,8 @@ pub async fn discover_databases(
 ) -> Result<Vec<(String, u64)>> {
     let pool = select! {
         res = pg_pool(
-            &config.from_host,
-            &config.from_port,
-            &config.from_user,
-            &config.from_pass,
-            &config.from_db,
+            &config.source,
+            &config.source_db,
         ) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
@@ -176,13 +184,13 @@ pub async fn dump_db(
 
     if !dump_path.join("toc.dat").exists() {
         let mut command = Command::new("pg_dump");
-        command.env("PGPASSWORD", &config.from_pass).args([
+        command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
-            &config.from_host,
+            &config.source.host,
             "-p",
-            &config.from_port,
+            &config.source.port,
             "-U",
-            &config.from_user,
+            &config.source.user,
             "-Fd",
             "-j",
             &config.dump_jobs.to_string(),
@@ -246,14 +254,14 @@ pub async fn restore_db(
     }
 
     let mut child = Command::new("pg_restore")
-        .env("PGPASSWORD", &config.to_pass)
+        .env("PGPASSWORD", &config.destination.pass)
         .args([
             "-h",
-            &config.to_host,
+            &config.destination.host,
             "-p",
-            &config.to_port,
+            &config.destination.port,
             "-U",
-            &config.to_user,
+            &config.destination.user,
             "-j",
             &config.restore_jobs.to_string(),
             "--disable-triggers",
@@ -306,13 +314,13 @@ pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> 
 
     if !dump_path.join("toc.dat").exists() {
         let mut command = Command::new("pg_dump");
-        command.env("PGPASSWORD", &config.from_pass).args([
+        command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
-            &config.from_host,
+            &config.source.host,
             "-p",
-            &config.from_port,
+            &config.source.port,
             "-U",
-            &config.from_user,
+            &config.source.user,
             "-Fd",
             "-j",
             &config.dump_jobs.to_string(),
@@ -379,14 +387,14 @@ pub async fn restore_delayed_data(
     }
 
     let mut child = Command::new("pg_restore")
-        .env("PGPASSWORD", &config.to_pass)
+        .env("PGPASSWORD", &config.destination.pass)
         .args([
             "-h",
-            &config.to_host,
+            &config.destination.host,
             "-p",
-            &config.to_port,
+            &config.destination.port,
             "-U",
-            &config.to_user,
+            &config.destination.user,
             "-j",
             &config.restore_jobs.to_string(),
             "--disable-triggers",
@@ -445,11 +453,8 @@ pub async fn enable_fast_restore(config: &Config, cancel: CancellationToken) -> 
 
     let pool = select! {
         res = pg_pool(
-            &config.to_host,
-            &config.to_port,
-            &config.to_user,
-            &config.to_pass,
-            &config.to_db,
+            &config.destination,
+            &config.destination_db,
         ) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
@@ -474,11 +479,8 @@ pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -
 
     let pool = select! {
         res = pg_pool(
-            &config.to_host,
-            &config.to_port,
-            &config.to_user,
-            &config.to_pass,
-            &config.to_db,
+            &config.destination,
+            &config.destination_db,
         ) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
@@ -500,11 +502,8 @@ pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -
 pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationToken) -> Result<()> {
     let pool = select! {
         res = pg_pool(
-            &config.to_host,
-            &config.to_port,
-            &config.to_user,
-            &config.to_pass,
-            &config.to_db,
+            &config.destination,
+            &config.destination_db,
         ) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
@@ -542,14 +541,14 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
     fs::create_dir_all(&config.dump_root)?;
 
     let mut child = Command::new("pg_dumpall")
-        .env("PGPASSWORD", &config.from_pass)
+        .env("PGPASSWORD", &config.source.pass)
         .args([
             "-h",
-            &config.from_host,
+            &config.source.host,
             "-p",
-            &config.from_port,
+            &config.source.port,
             "-U",
-            &config.from_user,
+            &config.source.user,
             "--globals-only",
             "-f",
             globals_path.to_str().expect("invalid globals path"),
@@ -573,20 +572,20 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
     let mut filtered_content = Vec::new();
     for line in globals_content.lines() {
         if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
-            && line.contains(&format!(" {} ", config.to_user))
+            && line.contains(&format!(" {} ", config.destination.user))
         {
             info!(
                 "Skipping migration of role '{}' to avoid password overwrite.",
-                config.to_user
+                config.destination.user
             );
             continue;
         }
         if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
-            && line.ends_with(&format!(" {};", config.to_user))
+            && line.ends_with(&format!(" {};", config.destination.user))
         {
             info!(
                 "Skipping migration of role '{}' to avoid password overwrite.",
-                config.to_user
+                config.destination.user
             );
             continue;
         }
@@ -597,11 +596,8 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
 
     let pool = select! {
         res = pg_pool(
-            &config.to_host,
-            &config.to_port,
-            &config.to_user,
-            &config.to_pass,
-            &config.to_db,
+            &config.destination,
+            &config.destination_db,
         ) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };

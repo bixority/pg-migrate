@@ -19,17 +19,11 @@ use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
 pub struct Config {
-    pub from_host: String,
-    pub from_port: String,
-    pub from_user: String,
-    pub from_pass: String,
-    pub from_db: String,
+    pub source: db::DbArgs,
+    pub source_db: String,
 
-    pub to_host: String,
-    pub to_port: String,
-    pub to_user: String,
-    pub to_pass: String,
-    pub to_db: String,
+    pub destination: db::DbArgs,
+    pub destination_db: String,
 
     pub dump_jobs: usize,
     pub restore_jobs: usize,
@@ -136,16 +130,20 @@ async fn main() -> Result<()> {
     total_time_pb.enable_steady_tick(Duration::from_millis(100));
 
     let config = Arc::new(Config {
-        from_host: args.from_host,
-        from_port: args.from_port,
-        from_user: args.from_user,
-        from_pass: args.from_pass,
-        from_db: args.from_db,
-        to_host: args.to_host,
-        to_port: args.to_port,
-        to_user: args.to_user,
-        to_pass: args.to_pass,
-        to_db: args.to_db,
+        source: db::DbArgs {
+            host: args.from_host,
+            port: args.from_port,
+            user: args.from_user,
+            pass: args.from_pass,
+        },
+        source_db: args.from_db,
+        destination: db::DbArgs {
+            host: args.to_host,
+            port: args.to_port,
+            user: args.to_user,
+            pass: args.to_pass,
+        },
+        destination_db: args.to_db,
         dump_jobs: args.dump_jobs,
         restore_jobs: args.restore_jobs,
         max_parallel: args.max_parallel,
