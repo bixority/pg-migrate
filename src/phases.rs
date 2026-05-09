@@ -4,6 +4,7 @@ use crate::{Config, db, verification};
 use log::info;
 use std::fs;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
@@ -14,8 +15,10 @@ pub async fn phase_migrate_all(
     states: SharedMigrationStates,
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<(Duration, Duration)> {
     let mut pipeline_tasks = JoinSet::new();
+
+    let regular_start = Instant::now();
 
     for (db_name, size) in db_names_with_sizes {
         let config_clone = config.clone();
@@ -89,6 +92,9 @@ pub async fn phase_migrate_all(
         anyhow::bail!("Migration cancelled by user");
     }
 
+    let regular_duration = regular_start.elapsed();
+
+    let delayed_start = Instant::now();
     phase_delay_migrate_all(
         config.clone(),
         db_names_with_sizes,
@@ -96,7 +102,10 @@ pub async fn phase_migrate_all(
         cancel,
         sem,
     )
-    .await
+    .await?;
+    let delayed_duration = delayed_start.elapsed();
+
+    Ok((regular_duration, delayed_duration))
 }
 
 async fn phase_migrate_one(
