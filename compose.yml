@@ -14,7 +14,7 @@ services:
       retries: 10
     volumes:
       - db-old:/var/lib/postgresql/9.5
-      - ./.docker/db/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./.docker/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,Z
     networks:
       common:
         aliases:
@@ -44,7 +44,6 @@ services:
     build:
       context: ./
       dockerfile: Containerfile
-    image: localhost/pg-migrate
     command: [
       "--from-host", "db-old",
       "--from-port", "5432",
@@ -54,6 +53,9 @@ services:
       "--to-port", "5432",
       "--to-user", "dev",
       "--to-pass", "dev",
+      "--max-parallel", "4",
+      "--exclude-table-data", "pdb1.table3",
+      "--exclude-table-data", "pdb2.table*",
     ]
     depends_on:
       db-old:
