@@ -4,7 +4,7 @@ use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
@@ -61,6 +61,20 @@ impl MigrationStates {
         if let Some(state) = self.states.get_mut(db) {
             state.fail(error);
         }
+    }
+
+    pub fn mark_regular_done(&mut self, db: &str) {
+        if let Some(state) = self.states.get_mut(db) {
+            state.mark_regular_done();
+        }
+    }
+
+    #[must_use]
+    pub fn latest_regular_completion(&self) -> Option<Instant> {
+        self.states
+            .values()
+            .filter_map(|s| s.regular_completed_at)
+            .max()
     }
 
     #[must_use]

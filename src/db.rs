@@ -10,6 +10,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::select;
@@ -70,6 +71,7 @@ pub struct MigrationState {
     pub total_steps: u8,
     pub display: String,
     pub error: Option<String>,
+    pub regular_completed_at: Option<Instant>,
 }
 
 impl MigrationState {
@@ -85,6 +87,7 @@ impl MigrationState {
             step: 0,
             total_steps: 6,
             error: None,
+            regular_completed_at: None,
         }
     }
 
@@ -92,6 +95,10 @@ impl MigrationState {
         self.phase = phase;
         self.step = step;
         self.display = display.into();
+    }
+
+    pub fn mark_regular_done(&mut self) {
+        self.regular_completed_at = Some(Instant::now());
     }
 
     pub fn fail(&mut self, error: impl Into<String>) {

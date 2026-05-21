@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
     cancel.cancel();
     let _ = redraw_task.await;
 
-    let (regular_duration, delayed_duration) = migrate_result?;
+    let (regular_duration, migration_duration) = migrate_result?;
 
     if !config.disable_dst_optimizations {
         db::restore_safe_settings(&config, CancellationToken::new()).await?;
@@ -227,10 +227,10 @@ async fn main() -> Result<()> {
     let elapsed = start_time.elapsed();
 
     info!(
-        "Migration complete.\nSummary:\n  Regular phase: {}\n  Delayed data:  {}\n  \
+        "Migration complete.\nSummary:\n  Regular phase: {}\n  Migration:     {}\n  \
          Total time:    {}",
         indicatif::HumanDuration(regular_duration),
-        indicatif::HumanDuration(delayed_duration),
+        indicatif::HumanDuration(migration_duration),
         indicatif::HumanDuration(elapsed)
     );
 
