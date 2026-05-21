@@ -5,7 +5,7 @@ use crate::verify_dir;
 use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use log::{info, warn};
-use sqlx::Row;
+use sqlx::{AssertSqlSafe, Row};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -227,7 +227,7 @@ pub async fn stat_counts(
                 let full_name = format!("\"{schema}\".\"{table}\"");
                 let count_query = format!("SELECT count(*) FROM {full_name}");
                 let count: i64 = tokio::select! {
-                    res = sqlx::query(&count_query).fetch_one(&pool) => res?.get(0),
+                    res = sqlx::query(AssertSqlSafe(count_query)).fetch_one(&pool) => res?.get(0),
                     () = cancel.cancelled() => anyhow::bail!("cancelled during row count of {schema}.{table}"),
                 };
                 Ok((format!("{schema}.{table}"), count.to_string()))
@@ -292,7 +292,7 @@ async fn fast_stat_counts(
             let full_name = format!("\"{schema}\".\"{table}\"");
             let count_query = format!("SELECT count(*) FROM {full_name}");
             let count: i64 = tokio::select! {
-                res = sqlx::query(&count_query).fetch_one(pool) => res?.get(0),
+                res = sqlx::query(AssertSqlSafe(count_query)).fetch_one(pool) => res?.get(0),
                 () = cancel.cancelled() => anyhow::bail!("cancelled during exact count of {schema}.{table}"),
             };
             counts.insert(format!("{schema}.{table}"), count.to_string());

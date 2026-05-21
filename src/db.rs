@@ -5,7 +5,7 @@ use anyhow::{Context, Result};
 use indicatif::HumanBytes;
 use log::{info, warn};
 use sqlx::{
-    PgPool, Row,
+    AssertSqlSafe, PgPool, Row,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 use std::collections::HashMap;
@@ -624,7 +624,7 @@ pub async fn drop_delayed_indexes(
         );
         info!("Dropping index {}.{} on {db_name}", idx.schema, idx.name);
         select! {
-            res = sqlx::query(&sql).execute(&dst_pool) => res?,
+            res = sqlx::query(AssertSqlSafe(sql)).execute(&dst_pool) => res?,
             () = cancel.cancelled() => anyhow::bail!("cancelled during DROP INDEX of {}.{}", idx.schema, idx.name),
         };
     }
@@ -699,7 +699,7 @@ pub async fn recreate_delayed_indexes(
                 idx.schema, idx.name
             );
             select! {
-                res = sqlx::query(&idx.ddl).execute(&pool) => { res?; }
+                res = sqlx::query(AssertSqlSafe(idx.ddl.as_str())).execute(&pool) => { res?; }
                 () = cancel.cancelled() => anyhow::bail!("cancelled during CREATE INDEX of {}.{}", idx.schema, idx.name),
             };
             Ok(())
@@ -731,7 +731,7 @@ pub async fn enable_fast_restore(config: &Config, cancel: CancellationToken) -> 
     for (k, v) in settings {
         let sql = format!("ALTER SYSTEM SET {k} TO {v};");
         select! {
-            res = sqlx::query(&sql).execute(&pool) => res?,
+            res = sqlx::query(AssertSqlSafe(sql)).execute(&pool) => res?,
             () = cancel.cancelled() => anyhow::bail!("cancelled during fast restore enablement"),
         };
     }
@@ -754,7 +754,7 @@ pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -
     for s in settings {
         let sql = format!("ALTER SYSTEM RESET {s};");
         select! {
-            res = sqlx::query(&sql).execute(&pool) => res?,
+            res = sqlx::query(AssertSqlSafe(sql)).execute(&pool) => res?,
             () = cancel.cancelled() => anyhow::bail!("cancelled during safe settings restoration"),
         };
     }
@@ -774,7 +774,7 @@ pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationTok
     for db in dbs {
         let sql = format!("CREATE DATABASE \"{db}\"");
         select! {
-            res = sqlx::query(&sql).execute(&pool) => {
+            res = sqlx::query(AssertSqlSafe(sql)).execute(&pool) => {
                 if let Err(e) = res {
                     warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
                 }
@@ -880,7 +880,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         let exec_sql = format!("{s};");
 
         let res = select! {
-            res = sqlx::query(&exec_sql).execute(&pool) => res,
+            res = sqlx::query(AssertSqlSafe(exec_sql)).execute(&pool) => res,
             () = cancel.cancelled() => anyhow::bail!("cancelled during globals migration execution"),
         };
 
