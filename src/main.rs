@@ -70,8 +70,8 @@ pub fn verify_dir() -> PathBuf {
 struct Args {
     #[arg(long, default_value = "localhost")]
     from_host: String,
-    #[arg(long, default_value = "5432")]
-    from_port: String,
+    #[arg(long, default_value_t = 5432)]
+    from_port: u16,
     #[arg(long, default_value = "postgres")]
     from_user: String,
     #[arg(long, default_value = "oldpass")]
@@ -81,8 +81,8 @@ struct Args {
 
     #[arg(long, default_value = "localhost")]
     to_host: String,
-    #[arg(long, default_value = "5432")]
-    to_port: String,
+    #[arg(long, default_value_t = 5432)]
+    to_port: u16,
     #[arg(long, default_value = "postgres")]
     to_user: String,
     #[arg(long, default_value = "newpass")]

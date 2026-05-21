@@ -4,13 +4,16 @@ use crate::verification::is_delayed_table;
 use anyhow::{Context, Result};
 use indicatif::HumanBytes;
 use log::{info, warn};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{
+    PgPool, Row,
+    postgres::{PgConnectOptions, PgPoolOptions},
+};
 use std::process::Stdio;
+use std::time::Instant;
 use std::{
     fs,
     path::{Path, PathBuf},
 };
-use std::time::Instant;
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::select;
@@ -19,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone, Debug)]
 pub struct DbArgs {
     pub host: String,
-    pub port: String,
+    pub port: u16,
     pub user: String,
     pub pass: String,
 }
@@ -125,13 +128,15 @@ pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
 }
 
 pub async fn pg_pool(args: &DbArgs, db: &str) -> Result<PgPool> {
-    let url = format!(
-        "postgres://{}:{}@{}:{}/{}",
-        args.user, args.pass, args.host, args.port, db
-    );
+    let opts = PgConnectOptions::new()
+        .host(&args.host)
+        .port(args.port)
+        .username(&args.user)
+        .password(&args.pass)
+        .database(db);
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&url)
+        .connect_with(opts)
         .await?;
     Ok(pool)
 }
@@ -193,12 +198,13 @@ pub async fn dump_db(
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
+        let port = config.source.port.to_string();
         let mut command = Command::new("pg_dump");
         command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
             &config.source.host,
             "-p",
-            &config.source.port,
+            &port,
             "-U",
             &config.source.user,
             "-Fd",
@@ -269,13 +275,14 @@ pub async fn restore_db(
         anyhow::bail!("Dump not found for {db} at {}", dump_path.display());
     }
 
+    let port = config.destination.port.to_string();
     let mut child = Command::new("pg_restore")
         .env("PGPASSWORD", &config.destination.pass)
         .args([
             "-h",
             &config.destination.host,
             "-p",
-            &config.destination.port,
+            &port,
             "-U",
             &config.destination.user,
             "-j",
@@ -290,26 +297,38 @@ pub async fn restore_db(
         .spawn()
         .context("pg_restore failed to start")?;
 
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
 
-    let status = select! {
-        res = child.wait() => res.context("pg_restore wait failed")?,
-        () = cancel.cancelled() => {
-            let _ = child.kill().await;
-            anyhow::bail!("cancelled during pg_restore of {db}");
+    let wait_fut = async {
+        select! {
+            res = child.wait() => res.context("pg_restore wait failed"),
+            () = cancel.cancelled() => {
+                let _ = child.kill().await;
+                anyhow::bail!("cancelled during pg_restore of {db}")
+            }
         }
     };
 
-    let mut stdout_output = String::new();
-    if let Some(mut stdout) = stdout.take() {
-        let _ = stdout.read_to_string(&mut stdout_output).await;
-    }
+    let read_stdout = async {
+        let mut buf = String::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_string(&mut buf).await;
+        }
+        buf
+    };
 
-    let mut stderr_output = String::new();
-    if let Some(mut stderr) = stderr.take() {
-        let _ = stderr.read_to_string(&mut stderr_output).await;
-    }
+    let read_stderr = async {
+        let mut buf = String::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_string(&mut buf).await;
+        }
+        buf
+    };
+
+    let (status_res, stdout_output, stderr_output) =
+        tokio::join!(wait_fut, read_stdout, read_stderr);
+    let status = status_res?;
 
     if !status.success() {
         anyhow::bail!(
@@ -329,12 +348,13 @@ pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> 
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
+        let port = config.source.port.to_string();
         let mut command = Command::new("pg_dump");
         command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
             &config.source.host,
             "-p",
-            &config.source.port,
+            &port,
             "-U",
             &config.source.user,
             "-Fd",
@@ -402,13 +422,14 @@ pub async fn restore_delayed_data(
         return Ok(());
     }
 
+    let port = config.destination.port.to_string();
     let mut child = Command::new("pg_restore")
         .env("PGPASSWORD", &config.destination.pass)
         .args([
             "-h",
             &config.destination.host,
             "-p",
-            &config.destination.port,
+            &port,
             "-U",
             &config.destination.user,
             "-j",
@@ -424,26 +445,38 @@ pub async fn restore_delayed_data(
         .spawn()
         .context("pg_restore (delayed) failed to start")?;
 
-    let mut stdout = child.stdout.take();
-    let mut stderr = child.stderr.take();
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
 
-    let status = select! {
-        res = child.wait() => res.context("pg_restore (delayed) wait failed")?,
-        () = cancel.cancelled() => {
-            let _ = child.kill().await;
-            anyhow::bail!("cancelled during pg_restore (delayed) of {db}");
+    let wait_fut = async {
+        select! {
+            res = child.wait() => res.context("pg_restore (delayed) wait failed"),
+            () = cancel.cancelled() => {
+                let _ = child.kill().await;
+                anyhow::bail!("cancelled during pg_restore (delayed) of {db}")
+            }
         }
     };
 
-    let mut stdout_output = String::new();
-    if let Some(mut stdout) = stdout.take() {
-        let _ = stdout.read_to_string(&mut stdout_output).await;
-    }
+    let read_stdout = async {
+        let mut buf = String::new();
+        if let Some(mut s) = stdout {
+            let _ = s.read_to_string(&mut buf).await;
+        }
+        buf
+    };
 
-    let mut stderr_output = String::new();
-    if let Some(mut stderr) = stderr.take() {
-        let _ = stderr.read_to_string(&mut stderr_output).await;
-    }
+    let read_stderr = async {
+        let mut buf = String::new();
+        if let Some(mut s) = stderr {
+            let _ = s.read_to_string(&mut buf).await;
+        }
+        buf
+    };
+
+    let (status_res, stdout_output, stderr_output) =
+        tokio::join!(wait_fut, read_stdout, read_stderr);
+    let status = status_res?;
 
     if !status.success() {
         anyhow::bail!(
@@ -729,13 +762,14 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
     let globals_path = config.dump_root.join("globals.sql");
     fs::create_dir_all(&config.dump_root)?;
 
+    let port = config.source.port.to_string();
     let mut child = Command::new("pg_dumpall")
         .env("PGPASSWORD", &config.source.pass)
         .args([
             "-h",
             &config.source.host,
             "-p",
-            &config.source.port,
+            &port,
             "-U",
             &config.source.user,
             "--globals-only",
