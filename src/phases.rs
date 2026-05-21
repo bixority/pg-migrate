@@ -1,7 +1,6 @@
 use crate::db::MigrationPhase;
 use crate::tui::SharedMigrationStates;
 use crate::{Config, db, verification};
-use log::info;
 use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -131,28 +130,17 @@ async fn phase_migrate_one(
 
     compute_source_counts(config, db_name, cancel.clone()).await?;
 
-    if db::done_marker(db_name).exists() {
-        info!("Skipping restore for {db_name}");
+    states
+        .write()
+        .await
+        .update(db_name, MigrationPhase::Restoring, 3, "restoring database");
 
-        states.write().await.update(
-            db_name,
-            MigrationPhase::Skipped,
-            4,
-            "restore skipped; already done",
-        );
-    } else {
-        states
-            .write()
-            .await
-            .update(db_name, MigrationPhase::Restoring, 3, "restoring database");
-
-        db::restore_db(config, db_name, size, cancel.clone()).await?;
-    }
+    db::restore_db(config, db_name, size, cancel.clone()).await?;
 
     states.write().await.update(
         db_name,
         MigrationPhase::DestinationCounts,
-        5,
+        4,
         "computing destination row counts",
     );
 
@@ -161,16 +149,11 @@ async fn phase_migrate_one(
     states.write().await.update(
         db_name,
         MigrationPhase::Verifying,
-        6,
+        5,
         "verifying row counts",
     );
 
     verification::verify_db(config, db_name, false, cancel.clone()).await?;
-
-    states
-        .write()
-        .await
-        .update(db_name, MigrationPhase::Complete, 6, "migration complete");
 
     Ok(())
 }
@@ -182,19 +165,9 @@ pub async fn phase_delay_migrate_all(
     cancel: &CancellationToken,
     sem: Arc<Semaphore>,
 ) -> anyhow::Result<()> {
-    let mut delayed_tasks = JoinSet::new();
+    let mut finalize_tasks = JoinSet::new();
 
     for (db_name, size) in db_names_with_sizes {
-        let db_prefix = format!("{db_name}.");
-        let has_delayed = config
-            .delay_table_data
-            .iter()
-            .any(|d| d.starts_with(&db_prefix));
-
-        if !has_delayed {
-            continue;
-        }
-
         let config_clone = config.clone();
         let cancel_clone = cancel.clone();
         let sem_clone = sem.clone();
@@ -202,13 +175,13 @@ pub async fn phase_delay_migrate_all(
         let db_clone = db_name.clone();
         let size_val = *size;
 
-        delayed_tasks.spawn(async move {
+        finalize_tasks.spawn(async move {
             let _permit = tokio::select! {
                 res = sem_clone.acquire_owned() => res?,
                 () = cancel_clone.cancelled() => anyhow::bail!("cancelled while waiting for semaphore"),
             };
 
-            let result = phase_delay_migrate_one(
+            let result = phase_finalize_one(
                 &config_clone,
                 &db_clone,
                 size_val,
@@ -228,7 +201,7 @@ pub async fn phase_delay_migrate_all(
         });
     }
 
-    while let Some(res) = delayed_tasks.join_next().await {
+    while let Some(res) = finalize_tasks.join_next().await {
         match res? {
             Ok(()) => {}
             Err(e) => {
@@ -236,9 +209,9 @@ pub async fn phase_delay_migrate_all(
                 if !was_cancelled {
                     cancel.cancel();
                 }
-                delayed_tasks.abort_all();
+                finalize_tasks.abort_all();
                 if was_cancelled {
-                    anyhow::bail!("Delayed migration cancelled by user");
+                    anyhow::bail!("Finalize phase cancelled by user");
                 }
                 return Err(e);
             }
@@ -248,15 +221,24 @@ pub async fn phase_delay_migrate_all(
     Ok(())
 }
 
-async fn phase_delay_migrate_one(
+async fn phase_finalize_one(
     config: &Config,
     db_name: &str,
     _size: u64,
     states: SharedMigrationStates,
     cancel: &CancellationToken,
 ) -> anyhow::Result<()> {
-    if db::delayed_done_marker(db_name).exists() {
-        info!("Skipping delayed migration for {db_name}");
+    let db_prefix = format!("{db_name}.");
+    let has_delayed = config
+        .delay_table_data
+        .iter()
+        .any(|d| d.starts_with(&db_prefix));
+
+    if !has_delayed {
+        states
+            .write()
+            .await
+            .update(db_name, MigrationPhase::Complete, 6, "migration complete");
         return Ok(());
     }
 
@@ -271,8 +253,17 @@ async fn phase_delay_migrate_one(
 
     states.write().await.update(
         db_name,
-        MigrationPhase::DelayedRestoring,
+        MigrationPhase::DelayedDroppingIndexes,
         8,
+        "dropping secondary indexes on delayed tables",
+    );
+
+    db::drop_delayed_indexes(config, db_name, cancel.clone()).await?;
+
+    states.write().await.update(
+        db_name,
+        MigrationPhase::DelayedRestoring,
+        9,
         "restoring delayed table data",
     );
 
@@ -280,8 +271,17 @@ async fn phase_delay_migrate_one(
 
     states.write().await.update(
         db_name,
+        MigrationPhase::DelayedRecreatingIndexes,
+        10,
+        "recreating secondary indexes on delayed tables",
+    );
+
+    db::recreate_delayed_indexes(config, db_name, cancel.clone()).await?;
+
+    states.write().await.update(
+        db_name,
         MigrationPhase::DelayedVerifying,
-        9,
+        11,
         "verifying all row counts (including delayed)",
     );
 
@@ -290,7 +290,7 @@ async fn phase_delay_migrate_one(
     states.write().await.update(
         db_name,
         MigrationPhase::Complete,
-        9,
+        11,
         "migration complete (with delayed data)",
     );
 

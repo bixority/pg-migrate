@@ -36,7 +36,7 @@ impl MigrationStates {
                     .iter()
                     .any(|d| d.starts_with(&db_prefix))
                 {
-                    state.total_steps = 9;
+                    state.total_steps = 11;
                 }
                 (db.clone(), state)
             })
@@ -98,7 +98,6 @@ fn colored_phase(phase: &MigrationPhase) -> String {
     match phase {
         MigrationPhase::Complete => format!("\x1b[32m{}\x1b[0m", phase.as_str()),
         MigrationPhase::Failed => format!("\x1b[31m{}\x1b[0m", phase.as_str()),
-        MigrationPhase::Skipped => format!("\x1b[33m{}\x1b[0m", phase.as_str()),
         MigrationPhase::Pending => phase.as_str().to_string(),
         _ => format!("\x1b[36m{}\x1b[0m", phase.as_str()),
     }

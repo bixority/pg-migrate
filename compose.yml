@@ -20,7 +20,7 @@ services:
       common:
 
   db-new:
-    image: docker.io/library/postgres:18.3
+    image: docker.io/library/postgres:18.4
     ports:
       - "5433:5432"
     environment:

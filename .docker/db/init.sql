@@ -2,12 +2,33 @@
 -- We define it in template1 so it is available in all databases created AFTER it.
 \c template1
 CREATE OR REPLACE FUNCTION populate_db_func() RETURNS void LANGUAGE plpgsql AS $$ 
-DECLARE t_name TEXT; 
-BEGIN 
-    FOR i IN 1..10 LOOP 
-        t_name := 'table' || i; 
-        EXECUTE format('CREATE TABLE %I (id SERIAL PRIMARY KEY, val TEXT, created_at TIMESTAMP DEFAULT now())', t_name); 
-        EXECUTE format('INSERT INTO %I (val) SELECT ''value '' || g FROM generate_series(1, 1000000) g', t_name);
+DECLARE
+    t_name TEXT;
+    idx_name TEXT;
+BEGIN
+    FOR i IN 1..10 LOOP
+        t_name := 'table' || i;
+        idx_name := t_name || '_created_at_idx';
+
+        EXECUTE format(
+            'CREATE TABLE %I (
+                id SERIAL PRIMARY KEY,
+                val TEXT,
+                created_at TIMESTAMP DEFAULT now()
+            )',
+            t_name
+        );
+
+        EXECUTE format(
+            'INSERT INTO %I (val)
+             SELECT ''value '' || g FROM generate_series(1, 1000000) g',
+            t_name
+        );
+
+        EXECUTE format(
+            'CREATE INDEX %I ON %I (created_at)',
+            idx_name, t_name
+        );
     END LOOP; 
 END; $$;
 

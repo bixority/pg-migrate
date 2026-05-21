@@ -167,7 +167,12 @@ fn filter_delayed_counts(
     });
 }
 
-fn is_delayed_table(db_name: &str, schema: &str, table: &str, delay_table_data: &[String]) -> bool {
+pub fn is_delayed_table(
+    db_name: &str,
+    schema: &str,
+    table: &str,
+    delay_table_data: &[String],
+) -> bool {
     let db_prefix = format!("{db_name}.");
 
     delay_table_data.iter().any(|delay| {
