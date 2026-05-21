@@ -3,6 +3,7 @@ name: pg-migrate
 services:
   db-old:
     image: docker.io/library/postgres:9.5
+    command: ["postgres", "-c", "max_connections=300"]
     ports:
       - "5432:5432"
     environment:
@@ -21,6 +22,7 @@ services:
 
   db-new:
     image: docker.io/library/postgres:18.4
+    command: ["postgres", "-c", "max_connections=300"]
     ports:
       - "5433:5432"
     environment:

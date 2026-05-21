@@ -3,9 +3,8 @@ use crate::db::{MigrationPhase, MigrationState};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 /// Returns the style used for migration progress bars.
@@ -117,14 +116,14 @@ fn colored_phase(phase: &MigrationPhase) -> String {
     }
 }
 
-pub type SharedMigrationStates = Arc<RwLock<MigrationStates>>;
+pub type SharedMigrationStates = Arc<Mutex<MigrationStates>>;
 
 #[must_use]
 pub fn shared_migration_states(
     dbs_with_sizes: &[(String, u64)],
     config: &Config,
 ) -> SharedMigrationStates {
-    Arc::new(RwLock::new(MigrationStates::new(dbs_with_sizes, config)))
+    Arc::new(Mutex::new(MigrationStates::new(dbs_with_sizes, config)))
 }
 
 pub async fn redraw_loop(
@@ -137,11 +136,11 @@ pub async fn redraw_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let rendered = states.read().await.render_table();
+                let rendered = states.lock().expect("states lock poisoned").render_table();
                 pb.set_message(rendered);
             }
             () = cancel.cancelled() => {
-                let rendered = states.read().await.render_table();
+                let rendered = states.lock().expect("states lock poisoned").render_table();
                 pb.set_message(rendered);
                 break;
             }

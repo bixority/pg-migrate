@@ -8,8 +8,10 @@ use sqlx::{
     PgPool, Row,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use std::collections::HashMap;
 use std::process::Stdio;
-use std::time::Instant;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -17,6 +19,8 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::select;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -127,18 +131,51 @@ pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
     root.join(db)
 }
 
-pub async fn pg_pool(args: &DbArgs, db: &str) -> Result<PgPool> {
-    let opts = PgConnectOptions::new()
-        .host(&args.host)
-        .port(args.port)
-        .username(&args.user)
-        .password(&args.pass)
-        .database(db);
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect_with(opts)
-        .await?;
-    Ok(pool)
+type PoolKey = (String, u16, String, String);
+
+#[derive(Clone)]
+pub struct PoolCache {
+    inner: Arc<AsyncMutex<HashMap<PoolKey, PgPool>>>,
+    max_connections: u32,
+}
+
+impl PoolCache {
+    #[must_use]
+    pub fn new(max_connections: u32) -> Self {
+        Self {
+            inner: Arc::new(AsyncMutex::new(HashMap::new())),
+            max_connections,
+        }
+    }
+
+    #[allow(clippy::significant_drop_tightening)]
+    pub async fn get(&self, args: &DbArgs, db: &str) -> Result<PgPool> {
+        let key = (
+            args.host.clone(),
+            args.port,
+            args.user.clone(),
+            db.to_string(),
+        );
+        let mut guard = self.inner.lock().await;
+        if let Some(p) = guard.get(&key) {
+            return Ok(p.clone());
+        }
+        let opts = PgConnectOptions::new()
+            .host(&args.host)
+            .port(args.port)
+            .username(&args.user)
+            .password(&args.pass)
+            .database(db);
+        let pool = PgPoolOptions::new()
+            .max_connections(self.max_connections)
+            .min_connections(0)
+            .idle_timeout(Some(Duration::from_secs(2)))
+            .acquire_timeout(Duration::from_mins(1))
+            .connect_with(opts)
+            .await?;
+        guard.insert(key, pool.clone());
+        Ok(pool)
+    }
 }
 
 pub async fn discover_databases(
@@ -146,10 +183,7 @@ pub async fn discover_databases(
     cancel: CancellationToken,
 ) -> Result<Vec<(String, u64)>> {
     let pool = select! {
-        res = pg_pool(
-            &config.source,
-            &config.source_db,
-        ) => res?,
+        res = config.pool_cache.get(&config.source, &config.source_db) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
 
@@ -504,7 +538,7 @@ async fn collect_delayed_indexes(
     cancel: &CancellationToken,
 ) -> Result<Vec<DelayedIndex>> {
     let src_pool = select! {
-        res = pg_pool(&config.source, db_name) => res?,
+        res = config.pool_cache.get(&config.source, db_name) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during source connection for {db_name}"),
     };
 
@@ -578,7 +612,7 @@ pub async fn drop_delayed_indexes(
     }
 
     let dst_pool = select! {
-        res = pg_pool(&config.destination, db_name) => res?,
+        res = config.pool_cache.get(&config.destination, db_name) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
     };
 
@@ -618,38 +652,62 @@ pub async fn recreate_delayed_indexes(
     }
 
     let dst_pool = select! {
-        res = pg_pool(&config.destination, db_name) => res?,
+        res = config.pool_cache.get(&config.destination, db_name) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
     };
 
-    for idx in &indexes {
-        let exists: bool = select! {
-            res = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS ( \
-                   SELECT 1 FROM pg_class c \
-                   JOIN pg_namespace n ON n.oid = c.relnamespace \
-                   WHERE c.relkind = 'i' AND c.relname = $1 AND n.nspname = $2 \
-                 )"
-            )
-            .bind(&idx.name)
-            .bind(&idx.schema)
-            .fetch_one(&dst_pool) => res?,
-            () = cancel.cancelled() => anyhow::bail!("cancelled during index existence check for {}.{}", idx.schema, idx.name),
-        };
+    let parallel = config.restore_jobs.max(1);
+    let sem = Arc::new(Semaphore::new(parallel));
+    let mut set: JoinSet<Result<()>> = JoinSet::new();
 
-        if exists {
+    for idx in indexes {
+        let pool = dst_pool.clone();
+        let sem = sem.clone();
+        let cancel = cancel.clone();
+        let db_name_owned = db_name.to_string();
+
+        set.spawn(async move {
+            let _permit = select! {
+                res = sem.acquire_owned() => res?,
+                () = cancel.cancelled() => anyhow::bail!("cancelled while waiting for index slot"),
+            };
+
+            let exists: bool = select! {
+                res = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                       SELECT 1 FROM pg_class c \
+                       JOIN pg_namespace n ON n.oid = c.relnamespace \
+                       WHERE c.relkind = 'i' AND c.relname = $1 AND n.nspname = $2 \
+                     )"
+                )
+                .bind(&idx.name)
+                .bind(&idx.schema)
+                .fetch_one(&pool) => res?,
+                () = cancel.cancelled() => anyhow::bail!("cancelled during index existence check for {}.{}", idx.schema, idx.name),
+            };
+
+            if exists {
+                info!(
+                    "Index {}.{} already exists on {db_name_owned}; skipping",
+                    idx.schema, idx.name
+                );
+                return Ok(());
+            }
+
             info!(
-                "Index {}.{} already exists on {db_name}; skipping",
+                "Recreating index {}.{} on {db_name_owned}",
                 idx.schema, idx.name
             );
-            continue;
-        }
+            select! {
+                res = sqlx::query(&idx.ddl).execute(&pool) => { res?; }
+                () = cancel.cancelled() => anyhow::bail!("cancelled during CREATE INDEX of {}.{}", idx.schema, idx.name),
+            };
+            Ok(())
+        });
+    }
 
-        info!("Recreating index {}.{} on {db_name}", idx.schema, idx.name);
-        select! {
-            res = sqlx::query(&idx.ddl).execute(&dst_pool) => res?,
-            () = cancel.cancelled() => anyhow::bail!("cancelled during CREATE INDEX of {}.{}", idx.schema, idx.name),
-        };
+    while let Some(res) = set.join_next().await {
+        res??;
     }
 
     fs::write(&marker, "")?;
@@ -666,10 +724,7 @@ pub async fn enable_fast_restore(config: &Config, cancel: CancellationToken) -> 
     ];
 
     let pool = select! {
-        res = pg_pool(
-            &config.destination,
-            &config.destination_db,
-        ) => res?,
+        res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
 
@@ -692,10 +747,7 @@ pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -
     let settings = ["fsync", "synchronous_commit", "full_page_writes"];
 
     let pool = select! {
-        res = pg_pool(
-            &config.destination,
-            &config.destination_db,
-        ) => res?,
+        res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
 
@@ -715,10 +767,7 @@ pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -
 
 pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationToken) -> Result<()> {
     let pool = select! {
-        res = pg_pool(
-            &config.destination,
-            &config.destination_db,
-        ) => res?,
+        res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
 
@@ -818,10 +867,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
     fs::write(&globals_path, filtered_content.join("\n"))?;
 
     let pool = select! {
-        res = pg_pool(
-            &config.destination,
-            &config.destination_db,
-        ) => res?,
+        res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
         () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
     };
 

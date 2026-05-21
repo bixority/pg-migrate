@@ -28,11 +28,19 @@ pub struct Config {
     pub dump_jobs: usize,
     pub restore_jobs: usize,
     pub max_parallel: usize,
+    pub dump_parallel: usize,
+    pub restore_parallel: usize,
 
     pub dump_root: PathBuf,
     pub migrate_globals: bool,
     pub disable_dst_optimizations: bool,
     pub delay_table_data: Vec<String>,
+
+    pub fast_verify: bool,
+    pub verify_concurrency: usize,
+
+    pub pool_cache: db::PoolCache,
+    pub verify_sem: Arc<Semaphore>,
 }
 
 /// Returns the user's home directory.
@@ -96,6 +104,10 @@ struct Args {
     restore_jobs: usize,
     #[arg(short = 'p', long, default_value_t = 6)]
     max_parallel: usize,
+    #[arg(long)]
+    dump_parallel: Option<usize>,
+    #[arg(long)]
+    restore_parallel: Option<usize>,
     #[arg(long, default_value = "pg_dumps")]
     dump_root: String,
     #[arg(long, default_value_t = true)]
@@ -104,9 +116,14 @@ struct Args {
     disable_dst_optimizations: bool,
     #[arg(long, value_name = "DATABASE.TABLE_PATTERN")]
     delay_table_data: Vec<String>,
+    #[arg(long, default_value_t = false)]
+    fast_verify: bool,
+    #[arg(long, default_value_t = 16)]
+    verify_concurrency: usize,
 }
 
 #[tokio::main]
+#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
@@ -129,6 +146,11 @@ async fn main() -> Result<()> {
     );
     total_time_pb.enable_steady_tick(Duration::from_millis(100));
 
+    let verify_concurrency = args.verify_concurrency.max(1);
+    let dump_parallel = args.dump_parallel.unwrap_or(args.max_parallel).max(1);
+    let restore_parallel = args.restore_parallel.unwrap_or(args.max_parallel).max(1);
+    let pool_cap = u32::try_from(args.restore_jobs.max(verify_concurrency).max(4)).unwrap_or(16);
+
     let config = Arc::new(Config {
         source: db::DbArgs {
             host: args.from_host,
@@ -147,10 +169,16 @@ async fn main() -> Result<()> {
         dump_jobs: args.dump_jobs,
         restore_jobs: args.restore_jobs,
         max_parallel: args.max_parallel,
+        dump_parallel,
+        restore_parallel,
         dump_root: args.dump_root.into(),
         migrate_globals: args.migrate_globals,
         disable_dst_optimizations: args.disable_dst_optimizations,
         delay_table_data: args.delay_table_data,
+        fast_verify: args.fast_verify,
+        verify_concurrency,
+        pool_cache: db::PoolCache::new(pool_cap),
+        verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
     });
 
     fs::create_dir_all(state_dir())?;
@@ -201,14 +229,16 @@ async fn main() -> Result<()> {
 
     db::create_dbs(&config, &db_names_owned, cancel.clone()).await?;
 
-    let sem = Arc::new(Semaphore::new(config.max_parallel));
+    let dump_sem = Arc::new(Semaphore::new(config.dump_parallel));
+    let restore_sem = Arc::new(Semaphore::new(config.restore_parallel));
 
     let migrate_result = phase_migrate_all(
         config.clone(),
         &dbs_with_sizes,
         states.clone(),
         &cancel,
-        sem.clone(),
+        dump_sem,
+        restore_sem,
     )
     .await;
 
@@ -221,7 +251,11 @@ async fn main() -> Result<()> {
         db::restore_safe_settings(&config, CancellationToken::new()).await?;
     }
 
-    table_pb.finish_with_message(states.read().await.render_table());
+    let final_table = states
+        .lock()
+        .expect("states lock poisoned")
+        .render_table();
+    table_pb.finish_with_message(final_table);
     total_time_pb.finish_and_clear();
 
     let elapsed = start_time.elapsed();

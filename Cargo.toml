@@ -18,6 +18,7 @@ cli = ["dep:clap"]
 anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"], optional = true }
 env_logger = "0.11.10"
+futures = { version = "0.3.31", default-features = false, features = ["std", "async-await"] }
 indicatif = "0.18.4"
 indicatif-log-bridge = "0.2.3"
 log = "0.4.29"
