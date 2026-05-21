@@ -21,13 +21,21 @@ pub fn delayed_verify_marker(db_name: &str) -> PathBuf {
 
 #[must_use]
 pub fn src_counts_path(db_name: &str, fast: bool) -> PathBuf {
-    let suffix = if fast { "src_counts.fast" } else { "src_counts" };
+    let suffix = if fast {
+        "src_counts.fast"
+    } else {
+        "src_counts"
+    };
     verify_dir().join(format!("{db_name}.{suffix}.json"))
 }
 
 #[must_use]
 pub fn dst_counts_path(db_name: &str, fast: bool) -> PathBuf {
-    let suffix = if fast { "dst_counts.fast" } else { "dst_counts" };
+    let suffix = if fast {
+        "dst_counts.fast"
+    } else {
+        "dst_counts"
+    };
     verify_dir().join(format!("{db_name}.{suffix}.json"))
 }
 

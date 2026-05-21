@@ -251,10 +251,7 @@ async fn main() -> Result<()> {
         db::restore_safe_settings(&config, CancellationToken::new()).await?;
     }
 
-    let final_table = states
-        .lock()
-        .expect("states lock poisoned")
-        .render_table();
+    let final_table = states.lock().expect("states lock poisoned").render_table();
     table_pb.finish_with_message(final_table);
     total_time_pb.finish_and_clear();
 
