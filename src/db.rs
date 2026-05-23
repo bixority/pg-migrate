@@ -18,7 +18,7 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::select;
-use tokio::sync::{Mutex as AsyncMutex};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
