@@ -239,14 +239,14 @@ async fn phase_finalize_one(
 
     let _restore_permit = acquire(restore_sem, cancel).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::DelayedDroppingIndexes,
-        8,
-        "dropping secondary indexes on delayed tables",
-    );
-
-    db::drop_delayed_indexes(config, db_name, cancel.clone()).await?;
+    // states.lock().expect("states lock poisoned").update(
+    //     db_name,
+    //     MigrationPhase::DelayedDroppingIndexes,
+    //     8,
+    //     "dropping secondary indexes on delayed tables",
+    // );
+    //
+    // db::drop_delayed_indexes(config, db_name, cancel.clone()).await?;
 
     states.lock().expect("states lock poisoned").update(
         db_name,
@@ -257,14 +257,14 @@ async fn phase_finalize_one(
 
     db::restore_delayed_data(config, db_name, cancel.clone()).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::DelayedRecreatingIndexes,
-        10,
-        "recreating secondary indexes on delayed tables",
-    );
-
-    db::recreate_delayed_indexes(config, db_name, cancel.clone()).await?;
+    // states.lock().expect("states lock poisoned").update(
+    //     db_name,
+    //     MigrationPhase::DelayedRecreatingIndexes,
+    //     10,
+    //     "recreating secondary indexes on delayed tables",
+    // );
+    //
+    // db::recreate_delayed_indexes(config, db_name, cancel.clone()).await?;
 
     states.lock().expect("states lock poisoned").update(
         db_name,
