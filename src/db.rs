@@ -719,7 +719,7 @@ pub async fn enable_fast_restore(config: &Config, cancel: CancellationToken) -> 
         ("fsync", "off"),
         ("synchronous_commit", "off"),
         ("full_page_writes", "off"),
-        ("maintenance_work_mem", "'2GB'"),
+        ("maintenance_work_mem", "'1GB'"),
         ("checkpoint_completion_target", "0.9"),
     ];
 
