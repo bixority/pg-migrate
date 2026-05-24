@@ -1,7 +1,6 @@
 use crate::error::{Error, MigrationPhase, Result};
 use crate::tui::SharedMigrationStates;
 use crate::{Config, db, verification};
-use std::fs;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -192,7 +191,15 @@ async fn phase_migrate_one(
             "computing source row counts",
         );
 
-    compute_source_counts(config, db_name, cancel.clone()).await?;
+    verification::get_or_compute_counts(
+        config,
+        &config.source,
+        db_name,
+        false,
+        true,
+        cancel.clone(),
+    )
+    .await?;
 
     states
         .lock()
@@ -204,7 +211,15 @@ async fn phase_migrate_one(
             "computing destination row counts",
         );
 
-    compute_destination_counts(config, db_name, cancel.clone()).await?;
+    verification::get_or_compute_counts(
+        config,
+        &config.destination,
+        db_name,
+        false,
+        false,
+        cancel.clone(),
+    )
+    .await?;
 
     states
         .lock()
@@ -319,56 +334,6 @@ async fn phase_finalize_one(
             11,
             "migration complete (with delayed data)",
         );
-
-    Ok(())
-}
-
-async fn compute_source_counts(
-    config: &Config,
-    db_name: &str,
-    cancel: CancellationToken,
-) -> Result<()> {
-    let src_path = verification::src_counts_path(db_name, config.fast_verify)?;
-
-    if !src_path.exists() {
-        let counts = verification::stat_counts(
-            config,
-            &config.source,
-            db_name,
-            &config.delay_table_data,
-            false,
-            cancel,
-        )
-        .await?;
-
-        let content = serde_json::to_string(&counts)?;
-        fs::write(&src_path, content)?;
-    }
-
-    Ok(())
-}
-
-async fn compute_destination_counts(
-    config: &Config,
-    db_name: &str,
-    cancel: CancellationToken,
-) -> Result<()> {
-    let dst_path = verification::dst_counts_path(db_name, config.fast_verify)?;
-
-    if !dst_path.exists() {
-        let counts = verification::stat_counts(
-            config,
-            &config.destination,
-            db_name,
-            &config.delay_table_data,
-            false,
-            cancel,
-        )
-        .await?;
-
-        let content = serde_json::to_string(&counts)?;
-        fs::write(&dst_path, content)?;
-    }
 
     Ok(())
 }

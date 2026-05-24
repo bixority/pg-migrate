@@ -19,20 +19,22 @@ pub fn delayed_verify_marker(db_name: &str) -> Result<PathBuf> {
     Ok(verify_dir()?.join(format!("{db_name}.delayed_verify")))
 }
 
-pub fn src_counts_path(db_name: &str, fast: bool) -> Result<PathBuf> {
-    let suffix = if fast {
-        "src_counts.fast"
-    } else {
-        "src_counts"
+pub fn src_counts_path(db_name: &str, fast: bool, include_delayed: bool) -> Result<PathBuf> {
+    let suffix = match (fast, include_delayed) {
+        (true, true) => "src_counts.delayed.fast",
+        (false, true) => "src_counts.delayed",
+        (true, false) => "src_counts.fast",
+        (false, false) => "src_counts",
     };
     Ok(verify_dir()?.join(format!("{db_name}.{suffix}.json")))
 }
 
-pub fn dst_counts_path(db_name: &str, fast: bool) -> Result<PathBuf> {
-    let suffix = if fast {
-        "dst_counts.fast"
-    } else {
-        "dst_counts"
+pub fn dst_counts_path(db_name: &str, fast: bool, include_delayed: bool) -> Result<PathBuf> {
+    let suffix = match (fast, include_delayed) {
+        (true, true) => "dst_counts.delayed.fast",
+        (false, true) => "dst_counts.delayed",
+        (true, false) => "dst_counts.fast",
+        (false, false) => "dst_counts",
     };
     Ok(verify_dir()?.join(format!("{db_name}.{suffix}.json")))
 }
@@ -58,62 +60,24 @@ pub async fn verify_db(
     include_delayed: bool,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let src_counts_path = if include_delayed {
-        let suffix = if config.fast_verify {
-            "src_counts.delayed.fast"
-        } else {
-            "src_counts.delayed"
-        };
-        verify_dir()?.join(format!("{db_name}.{suffix}.json"))
-    } else {
-        src_counts_path(db_name, config.fast_verify)?
-    };
-    let dst_counts_path = if include_delayed {
-        let suffix = if config.fast_verify {
-            "dst_counts.delayed.fast"
-        } else {
-            "dst_counts.delayed"
-        };
-        verify_dir()?.join(format!("{db_name}.{suffix}.json"))
-    } else {
-        dst_counts_path(db_name, config.fast_verify)?
-    };
-
-    let mut src_map: BTreeMap<String, String> = if src_counts_path.exists() {
-        let content = fs::read_to_string(&src_counts_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        let counts = stat_counts(
+    let (mut src_map, mut dst_map) = tokio::try_join!(
+        get_or_compute_counts(
             config,
             &config.source,
             db_name,
-            &config.delay_table_data,
             include_delayed,
+            true,
             cancel.clone(),
-        )
-        .await?;
-        let content = serde_json::to_string(&counts)?;
-        fs::write(&src_counts_path, content)?;
-        counts
-    };
-
-    let mut dst_map: BTreeMap<String, String> = if dst_counts_path.exists() {
-        let content = fs::read_to_string(&dst_counts_path)?;
-        serde_json::from_str(&content)?
-    } else {
-        let counts = stat_counts(
+        ),
+        get_or_compute_counts(
             config,
             &config.destination,
             db_name,
-            &config.delay_table_data,
             include_delayed,
+            false,
             cancel.clone(),
         )
-        .await?;
-        let content = serde_json::to_string(&counts)?;
-        fs::write(&dst_counts_path, content)?;
-        counts
-    };
+    )?;
 
     if !include_delayed {
         filter_delayed_counts(db_name, &config.delay_table_data, &mut src_map);
@@ -178,6 +142,39 @@ fn delayed_count_mismatch(
         }
         src_map.get(*k) != dst_map.get(*k)
     })
+}
+
+pub async fn get_or_compute_counts(
+    config: &Config,
+    args: &DbArgs,
+    db_name: &str,
+    include_delayed: bool,
+    is_source: bool,
+    cancel: CancellationToken,
+) -> Result<BTreeMap<String, String>> {
+    let path = if is_source {
+        src_counts_path(db_name, config.fast_verify, include_delayed)?
+    } else {
+        dst_counts_path(db_name, config.fast_verify, include_delayed)?
+    };
+
+    if path.exists() {
+        let content = fs::read_to_string(&path)?;
+        Ok(serde_json::from_str(&content)?)
+    } else {
+        let counts = stat_counts(
+            config,
+            args,
+            db_name,
+            &config.delay_table_data,
+            include_delayed,
+            cancel,
+        )
+        .await?;
+        let content = serde_json::to_string(&counts)?;
+        fs::write(&path, content)?;
+        Ok(counts)
+    }
 }
 
 pub async fn stat_counts(
