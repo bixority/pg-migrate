@@ -245,7 +245,7 @@ async fn phase_finalize_one(
         8,
         "dropping secondary indexes on delayed tables",
     );
-    
+
     db::drop_delayed_indexes(config, db_name, cancel.clone()).await?;
 
     states.lock().expect("states lock poisoned").update(
@@ -263,7 +263,7 @@ async fn phase_finalize_one(
         10,
         "recreating secondary indexes on delayed tables",
     );
-    
+
     db::recreate_delayed_indexes(config, db_name, cancel.clone()).await?;
 
     states.lock().expect("states lock poisoned").update(

@@ -1,5 +1,6 @@
 use crate::Config;
 use crate::state_dir;
+use crate::verification::is_delayed_table;
 use anyhow::{Context, Result};
 use indicatif::HumanBytes;
 use log::{info, warn};
@@ -21,7 +22,6 @@ use tokio::select;
 use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
-use crate::verification::is_delayed_table;
 
 #[derive(Clone, Debug)]
 pub struct DbArgs {
