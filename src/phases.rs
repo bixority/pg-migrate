@@ -171,18 +171,6 @@ async fn phase_migrate_one(
             .update(db_name, MigrationPhase::Dumping, 1, "dumping database");
 
         db::dump_db(config, db_name, size, cancel.clone()).await?;
-
-        states
-            .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(
-                db_name,
-                MigrationPhase::SourceCounts,
-                2,
-                "computing source row counts",
-            );
-
-        compute_source_counts(config, db_name, cancel.clone()).await?;
     }
 
     let _restore_permit = acquire(restore_sem, cancel).await?;
@@ -193,6 +181,18 @@ async fn phase_migrate_one(
         .update(db_name, MigrationPhase::Restoring, 3, "restoring database");
 
     db::restore_db(config, db_name, size, cancel.clone()).await?;
+
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::SourceCounts,
+            2,
+            "computing source row counts",
+        );
+
+    compute_source_counts(config, db_name, cancel.clone()).await?;
 
     states
         .lock()

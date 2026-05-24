@@ -196,6 +196,7 @@ pub async fn dump_db(
     if !dump_path.join("toc.dat").exists() {
         let port = config.source.port.to_string();
         let mut command = Command::new("pg_dump");
+        command.kill_on_drop(true);
         command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
             &config.source.host,
@@ -284,6 +285,7 @@ pub async fn restore_db(
 
     let port = config.destination.port.to_string();
     let mut child = Command::new("pg_restore")
+        .kill_on_drop(true)
         .env("PGPASSWORD", &config.destination.pass)
         .args([
             "-h",
@@ -365,6 +367,7 @@ pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> 
     if !dump_path.join("toc.dat").exists() {
         let port = config.source.port.to_string();
         let mut command = Command::new("pg_dump");
+        command.kill_on_drop(true);
         command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
             &config.source.host,
@@ -447,6 +450,7 @@ pub async fn restore_delayed_data(
 
     let port = config.destination.port.to_string();
     let mut child = Command::new("pg_restore")
+        .kill_on_drop(true)
         .env("PGPASSWORD", &config.destination.pass)
         .args([
             "-h",
@@ -810,6 +814,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
 
     let port = config.source.port.to_string();
     let mut child = Command::new("pg_dumpall")
+        .kill_on_drop(true)
         .env("PGPASSWORD", &config.source.pass)
         .args([
             "-h",
