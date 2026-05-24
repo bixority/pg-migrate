@@ -1,8 +1,8 @@
 use crate::Config;
 use crate::db::DbArgs;
+use crate::error::{Error, Result};
 use crate::tui::render_verification_report;
 use crate::verify_dir;
-use anyhow::Result;
 use futures::stream::{self, StreamExt};
 use log::{info, warn};
 use sqlx::{AssertSqlSafe, Row};
@@ -11,32 +11,30 @@ use std::fs;
 use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 
-pub fn verify_marker(db_name: &str) -> PathBuf {
-    verify_dir().join(format!("{db_name}.verify"))
+pub fn verify_marker(db_name: &str) -> Result<PathBuf> {
+    Ok(verify_dir()?.join(format!("{db_name}.verify")))
 }
 
-pub fn delayed_verify_marker(db_name: &str) -> PathBuf {
-    verify_dir().join(format!("{db_name}.delayed_verify"))
+pub fn delayed_verify_marker(db_name: &str) -> Result<PathBuf> {
+    Ok(verify_dir()?.join(format!("{db_name}.delayed_verify")))
 }
 
-#[must_use]
-pub fn src_counts_path(db_name: &str, fast: bool) -> PathBuf {
+pub fn src_counts_path(db_name: &str, fast: bool) -> Result<PathBuf> {
     let suffix = if fast {
         "src_counts.fast"
     } else {
         "src_counts"
     };
-    verify_dir().join(format!("{db_name}.{suffix}.json"))
+    Ok(verify_dir()?.join(format!("{db_name}.{suffix}.json")))
 }
 
-#[must_use]
-pub fn dst_counts_path(db_name: &str, fast: bool) -> PathBuf {
+pub fn dst_counts_path(db_name: &str, fast: bool) -> Result<PathBuf> {
     let suffix = if fast {
         "dst_counts.fast"
     } else {
         "dst_counts"
     };
-    verify_dir().join(format!("{db_name}.{suffix}.json"))
+    Ok(verify_dir()?.join(format!("{db_name}.{suffix}.json")))
 }
 
 #[allow(dead_code)]
@@ -46,7 +44,7 @@ pub async fn verify_all(
     cancel: CancellationToken,
 ) -> Result<()> {
     for db_name in db_names {
-        if verify_marker(db_name).exists() {
+        if verify_marker(db_name)?.exists() {
             continue;
         }
         verify_db(config, db_name, false, cancel.clone()).await?;
@@ -66,9 +64,9 @@ pub async fn verify_db(
         } else {
             "src_counts.delayed"
         };
-        verify_dir().join(format!("{db_name}.{suffix}.json"))
+        verify_dir()?.join(format!("{db_name}.{suffix}.json"))
     } else {
-        src_counts_path(db_name, config.fast_verify)
+        src_counts_path(db_name, config.fast_verify)?
     };
     let dst_counts_path = if include_delayed {
         let suffix = if config.fast_verify {
@@ -76,9 +74,9 @@ pub async fn verify_db(
         } else {
             "dst_counts.delayed"
         };
-        verify_dir().join(format!("{db_name}.{suffix}.json"))
+        verify_dir()?.join(format!("{db_name}.{suffix}.json"))
     } else {
-        dst_counts_path(db_name, config.fast_verify)
+        dst_counts_path(db_name, config.fast_verify)?
     };
 
     let mut src_map: BTreeMap<String, String> = if src_counts_path.exists() {
@@ -130,9 +128,10 @@ pub async fn verify_db(
                 && delayed_count_mismatch(db_name, &config.delay_table_data, &src_map, &dst_map);
             info!("{output}");
             if delayed_mismatch {
-                anyhow::bail!(
-                    "Verification failed for {db_name}: delayed-table row counts mismatch"
-                );
+                return Err(Error::VerificationFailed {
+                    database: db_name.to_string(),
+                    details: "delayed-table row counts mismatch".to_string(),
+                });
             }
             warn!(
                 "Fast verification mismatch for {db_name} (non-delayed estimates may differ; \
@@ -140,7 +139,10 @@ pub async fn verify_db(
             );
         } else {
             info!("{output}");
-            anyhow::bail!("Verification failed for {db_name}: tables or row counts mismatch");
+            return Err(Error::VerificationFailed {
+                database: db_name.to_string(),
+                details: "tables or row counts mismatch".to_string(),
+            });
         }
     } else {
         info!("{output}");
@@ -152,9 +154,9 @@ pub async fn verify_db(
         src_map.len()
     );
     if include_delayed {
-        fs::write(delayed_verify_marker(db_name), "")?;
+        fs::write(delayed_verify_marker(db_name)?, "")?;
     } else {
-        fs::write(verify_marker(db_name), "")?;
+        fs::write(verify_marker(db_name)?, "")?;
     }
     Ok(())
 }
@@ -190,7 +192,7 @@ pub async fn stat_counts(
 
     let tables = tokio::select! {
         res = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2").fetch_all(&pool) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during table discovery for {db_name}"),
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("table discovery for {db_name}"))),
     };
 
     let entries: Vec<(String, String, bool)> = tables
@@ -221,14 +223,14 @@ pub async fn stat_counts(
             let verify_sem = verify_sem.clone();
             async move {
                 let _permit = tokio::select! {
-                    res = verify_sem.acquire_owned() => res?,
-                    () = cancel.cancelled() => anyhow::bail!("cancelled while waiting for verify slot"),
+                    res = verify_sem.clone().acquire_owned() => res?,
+                    () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".to_string())),
                 };
                 let full_name = format!("\"{schema}\".\"{table}\"");
                 let count_query = format!("SELECT count(*) FROM {full_name}");
                 let count: i64 = tokio::select! {
                     res = sqlx::query(AssertSqlSafe(count_query)).fetch_one(&pool) => res?.get(0),
-                    () = cancel.cancelled() => anyhow::bail!("cancelled during row count of {schema}.{table}"),
+                    () = cancel.cancelled() => return Err(Error::Cancelled(format!("row count of {schema}.{table}"))),
                 };
                 Ok((format!("{schema}.{table}"), count.to_string()))
             }
@@ -254,7 +256,7 @@ async fn fast_stat_counts(
 ) -> Result<BTreeMap<String, String>> {
     let _permit = tokio::select! {
         res = config.verify_sem.clone().acquire_owned() => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled while waiting for verify slot"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".to_string())),
     };
     let allowed: HashSet<(String, String)> = entries
         .iter()
@@ -270,7 +272,7 @@ async fn fast_stat_counts(
                AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')"
         )
         .fetch_all(pool) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during reltuples query"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("reltuples query".to_string())),
     };
 
     let mut estimates: BTreeMap<(String, String), i64> = BTreeMap::new();
@@ -293,7 +295,7 @@ async fn fast_stat_counts(
             let count_query = format!("SELECT count(*) FROM {full_name}");
             let count: i64 = tokio::select! {
                 res = sqlx::query(AssertSqlSafe(count_query)).fetch_one(pool) => res?.get(0),
-                () = cancel.cancelled() => anyhow::bail!("cancelled during exact count of {schema}.{table}"),
+                () = cancel.cancelled() => return Err(Error::Cancelled(format!("exact count of {schema}.{table}"))),
             };
             counts.insert(format!("{schema}.{table}"), count.to_string());
         } else {

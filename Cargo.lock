@@ -985,9 +985,8 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "pg-migrate"
-version = "0.4.5"
+version = "0.5.0"
 dependencies = [
- "anyhow",
  "clap",
  "env_logger",
  "futures",
@@ -996,6 +995,7 @@ dependencies = [
  "log",
  "serde_json",
  "sqlx",
+ "thiserror",
  "tokio",
  "tokio-util",
 ]

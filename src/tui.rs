@@ -1,5 +1,6 @@
 use crate::Config;
-use crate::db::{MigrationPhase, MigrationState};
+use crate::db::MigrationState;
+use crate::error::{Error, MigrationPhase, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -13,8 +14,9 @@ use tokio_util::sync::CancellationToken;
 /// # Errors
 ///
 /// Returns an error if the template is invalid.
-pub fn migration_style() -> Result<ProgressStyle, indicatif::style::TemplateError> {
+pub fn migration_style() -> Result<ProgressStyle> {
     ProgressStyle::with_template("{msg}")
+        .map_err(|e| Error::Other(format!("Invalid template: {e}")))
 }
 
 #[derive(Clone, Debug)]
@@ -66,6 +68,11 @@ impl MigrationStates {
         if let Some(state) = self.states.get_mut(db) {
             state.mark_regular_done();
         }
+    }
+
+    #[must_use]
+    pub fn get_state(&self, db: &str) -> Option<(MigrationPhase, u8)> {
+        self.states.get(db).map(|s| (s.phase.clone(), s.step))
     }
 
     #[must_use]
@@ -136,12 +143,16 @@ pub async fn redraw_loop(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                let rendered = states.lock().expect("states lock poisoned").render_table();
-                pb.set_message(rendered);
+                if let Ok(lock) = states.lock() {
+                    let rendered = lock.render_table();
+                    pb.set_message(rendered);
+                }
             }
             () = cancel.cancelled() => {
-                let rendered = states.lock().expect("states lock poisoned").render_table();
-                pb.set_message(rendered);
+                if let Ok(lock) = states.lock() {
+                    let rendered = lock.render_table();
+                    pb.set_message(rendered);
+                }
                 break;
             }
         }

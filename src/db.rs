@@ -1,7 +1,7 @@
 use crate::Config;
+use crate::error::{Error, MigrationPhase, Result};
 use crate::state_dir;
 use crate::verification::is_delayed_table;
-use anyhow::{Context, Result};
 use indicatif::HumanBytes;
 use log::{info, warn};
 use sqlx::{
@@ -29,44 +29,6 @@ pub struct DbArgs {
     pub port: u16,
     pub user: String,
     pub pass: String,
-}
-
-#[derive(Clone, Debug)]
-pub enum MigrationPhase {
-    Pending,
-    Dumping,
-    SourceCounts,
-    Restoring,
-    DestinationCounts,
-    Verifying,
-    DelayedDumping,
-    DelayedDroppingIndexes,
-    DelayedRestoring,
-    DelayedRecreatingIndexes,
-    DelayedVerifying,
-    Complete,
-    Failed,
-}
-
-impl MigrationPhase {
-    #[must_use]
-    pub const fn as_str(&self) -> &'static str {
-        match self {
-            Self::Pending => "pending",
-            Self::Dumping => "dumping",
-            Self::SourceCounts => "source counts",
-            Self::Restoring => "restoring",
-            Self::DestinationCounts => "dest counts",
-            Self::Verifying => "verifying",
-            Self::DelayedDumping => "delayed dumping",
-            Self::DelayedDroppingIndexes => "dropping indexes",
-            Self::DelayedRestoring => "delayed restoring",
-            Self::DelayedRecreatingIndexes => "recreating indexes",
-            Self::DelayedVerifying => "delayed verifying",
-            Self::Complete => "complete",
-            Self::Failed => "failed",
-        }
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -184,7 +146,7 @@ pub async fn discover_databases(
 ) -> Result<Vec<(String, u64)>> {
     let pool = select! {
         res = config.pool_cache.get(&config.source, &config.source_db) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
     };
 
     let rows = select! {
@@ -196,7 +158,7 @@ pub async fn discover_databases(
              ORDER BY pg_database_size(datname) ASC;",
         )
         .fetch_all(&pool) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during database discovery"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database discovery".to_string())),
     };
 
     let mut dbs = Vec::with_capacity(rows.len());
@@ -208,16 +170,16 @@ pub async fn discover_databases(
     Ok(dbs)
 }
 
-pub fn dump_done_marker(db: &str) -> PathBuf {
-    state_dir().join(format!("{db}.dumped"))
+pub fn dump_done_marker(db: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("{db}.dumped")))
 }
 
-pub fn delayed_dump_done_marker(db: &str) -> PathBuf {
-    state_dir().join(format!("{db}.delayed_dumped"))
+pub fn delayed_dump_done_marker(db: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("{db}.delayed_dumped")))
 }
 
-pub fn delayed_done_marker(db: &str) -> PathBuf {
-    state_dir().join(format!("{db}.delayed_done"))
+pub fn delayed_done_marker(db: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("{db}.delayed_done")))
 }
 
 pub async fn dump_db(
@@ -247,7 +209,9 @@ pub async fn dump_db(
             "-Z",
             "zstd:5",
             "-f",
-            dump_path.to_str().expect("invalid dump path"),
+            dump_path
+                .to_str()
+                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
         ]);
 
         let db_prefix = format!("{db}.");
@@ -261,15 +225,18 @@ pub async fn dump_db(
             .arg(db)
             .stderr(Stdio::piped())
             .spawn()
-            .context("pg_dump failed to start")?;
+            .map_err(|e| Error::SpawnFailed {
+                command: "pg_dump".to_string(),
+                source: e,
+            })?;
 
         let stderr = child.stderr.take();
 
         let status = select! {
-            res = child.wait() => res.context("pg_dump wait failed")?,
+            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_dump wait failed: {e}")))?,
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                anyhow::bail!("cancelled during pg_dump of {db}");
+                return Err(Error::Cancelled(format!("pg_dump of {db}")));
             }
         };
 
@@ -279,12 +246,15 @@ pub async fn dump_db(
         }
 
         if !status.success() {
-            anyhow::bail!("pg_dump failed for {db}: {}", err_output.trim());
+            return Err(Error::ProcessFailed {
+                command: format!("pg_dump {db}"),
+                stderr: err_output.trim().to_string(),
+            });
         }
     }
 
     info!("Dumped {db} ({human_size})");
-    fs::write(dump_done_marker(db), "")?;
+    fs::write(dump_done_marker(db)?, "")?;
     Ok(())
 }
 
@@ -294,7 +264,7 @@ pub async fn restore_db(
     size: u64,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let marker = done_marker(db);
+    let marker = done_marker(db)?;
     if marker.exists() {
         info!("Skipping restore for {db} (already done)");
         return Ok(());
@@ -306,7 +276,10 @@ pub async fn restore_db(
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
-        anyhow::bail!("Dump not found for {db} at {}", dump_path.display());
+        return Err(Error::Other(format!(
+            "Dump not found for {db} at {}",
+            dump_path.display()
+        )));
     }
 
     let port = config.destination.port.to_string();
@@ -324,22 +297,27 @@ pub async fn restore_db(
             "--disable-triggers",
             "-d",
             db,
-            dump_path.to_str().expect("invalid dump path"),
+            dump_path
+                .to_str()
+                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("pg_restore failed to start")?;
+        .map_err(|e| Error::SpawnFailed {
+            command: "pg_restore".to_string(),
+            source: e,
+        })?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
     let wait_fut = async {
         select! {
-            res = child.wait() => res.context("pg_restore wait failed"),
+            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_restore wait failed: {e}"))),
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                anyhow::bail!("cancelled during pg_restore of {db}")
+                Err(Error::Cancelled(format!("pg_restore of {db}")))
             }
         }
     };
@@ -365,11 +343,14 @@ pub async fn restore_db(
     let status = status_res?;
 
     if !status.success() {
-        anyhow::bail!(
-            "pg_restore failed for {db} with status {status}\nstdout:\n{}\nstderr:\n{}",
-            stdout_output.trim(),
-            stderr_output.trim(),
-        );
+        return Err(Error::ProcessFailed {
+            command: format!("pg_restore {db}"),
+            stderr: format!(
+                "status {status}\nstdout:\n{}\nstderr:\n{}",
+                stdout_output.trim(),
+                stderr_output.trim()
+            ),
+        });
     }
 
     info!("Restored {db} ({human_size})");
@@ -398,7 +379,9 @@ pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> 
             "zstd:5",
             "--data-only",
             "-f",
-            dump_path.to_str().expect("invalid dump path"),
+            dump_path
+                .to_str()
+                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
         ]);
 
         let db_prefix = format!("{db}.");
@@ -418,15 +401,18 @@ pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> 
             .arg(db)
             .stderr(Stdio::piped())
             .spawn()
-            .context("pg_dump (delayed) failed to start")?;
+            .map_err(|e| Error::SpawnFailed {
+                command: "pg_dump (delayed)".to_string(),
+                source: e,
+            })?;
 
         let stderr = child.stderr.take();
 
         let status = select! {
-            res = child.wait() => res.context("pg_dump (delayed) wait failed")?,
+            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_dump (delayed) wait failed: {e}")))?,
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                anyhow::bail!("cancelled during pg_dump (delayed) of {db}");
+                return Err(Error::Cancelled(format!("pg_dump (delayed) of {db}")));
             }
         };
 
@@ -436,12 +422,15 @@ pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> 
         }
 
         if !status.success() {
-            anyhow::bail!("pg_dump (delayed) failed for {db}: {}", err_output.trim());
+            return Err(Error::ProcessFailed {
+                command: format!("pg_dump (delayed) {db}"),
+                stderr: err_output.trim().to_string(),
+            });
         }
     }
 
     info!("Dumped delayed data for {db}");
-    fs::write(delayed_dump_done_marker(db), "")?;
+    fs::write(delayed_dump_done_marker(db)?, "")?;
     Ok(())
 }
 
@@ -472,22 +461,27 @@ pub async fn restore_delayed_data(
             "--data-only",
             "-d",
             db,
-            dump_path.to_str().expect("invalid dump path"),
+            dump_path
+                .to_str()
+                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("pg_restore (delayed) failed to start")?;
+        .map_err(|e| Error::SpawnFailed {
+            command: "pg_restore (delayed)".to_string(),
+            source: e,
+        })?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
 
     let wait_fut = async {
         select! {
-            res = child.wait() => res.context("pg_restore (delayed) wait failed"),
+            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_restore (delayed) wait failed: {e}"))),
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                anyhow::bail!("cancelled during pg_restore (delayed) of {db}")
+                Err(Error::Cancelled(format!("pg_restore (delayed) of {db}")))
             }
         }
     };
@@ -513,15 +507,18 @@ pub async fn restore_delayed_data(
     let status = status_res?;
 
     if !status.success() {
-        anyhow::bail!(
-            "pg_restore (delayed) failed for {db} with status {status}\nstdout:\n{}\nstderr:\n{}",
-            stdout_output.trim(),
-            stderr_output.trim(),
-        );
+        return Err(Error::ProcessFailed {
+            command: format!("pg_restore (delayed) {db}"),
+            stderr: format!(
+                "status {status}\nstdout:\n{}\nstderr:\n{}",
+                stdout_output.trim(),
+                stderr_output.trim()
+            ),
+        });
     }
 
     info!("Restored delayed data for {db}");
-    fs::write(delayed_done_marker(db), "")?;
+    fs::write(delayed_done_marker(db)?, "")?;
     Ok(())
 }
 
@@ -539,12 +536,12 @@ async fn collect_delayed_indexes(
 ) -> Result<Vec<DelayedIndex>> {
     let src_pool = select! {
         res = config.pool_cache.get(&config.source, db_name) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during source connection for {db_name}"),
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("source connection for {db_name}"))),
     };
 
     let table_rows = select! {
         res = sqlx::query("SELECT schemaname, tablename FROM pg_tables").fetch_all(&src_pool) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during delayed table discovery for {db_name}"),
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("delayed table discovery for {db_name}"))),
     };
 
     let mut indexes = Vec::new();
@@ -571,7 +568,7 @@ async fn collect_delayed_indexes(
             .bind(&schema)
             .bind(&table)
             .fetch_all(&src_pool) => res?,
-            () = cancel.cancelled() => anyhow::bail!("cancelled during index discovery for {schema}.{table}"),
+            () = cancel.cancelled() => return Err(Error::Cancelled(format!("index discovery for {schema}.{table}"))),
         };
 
         for row in idx_rows {
@@ -597,7 +594,7 @@ pub async fn drop_delayed_indexes(
     db_name: &str,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let marker = delayed_indexes_dropped_marker(db_name);
+    let marker = delayed_indexes_dropped_marker(db_name)?;
     if marker.exists() {
         info!("Skipping delayed-index drop for {db_name} (already done)");
         return Ok(());
@@ -613,7 +610,7 @@ pub async fn drop_delayed_indexes(
 
     let dst_pool = select! {
         res = config.pool_cache.get(&config.destination, db_name) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("destination connection for {db_name}"))),
     };
 
     for idx in &indexes {
@@ -625,7 +622,7 @@ pub async fn drop_delayed_indexes(
         info!("Dropping index {}.{} on {db_name}", idx.schema, idx.name);
         select! {
             res = sqlx::query(AssertSqlSafe(sql)).execute(&dst_pool) => res?,
-            () = cancel.cancelled() => anyhow::bail!("cancelled during DROP INDEX of {}.{}", idx.schema, idx.name),
+            () = cancel.cancelled() => return Err(Error::Cancelled(format!("DROP INDEX of {}.{}", idx.schema, idx.name))),
         };
     }
 
@@ -638,7 +635,7 @@ pub async fn recreate_delayed_indexes(
     db_name: &str,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let marker = delayed_indexes_recreated_marker(db_name);
+    let marker = delayed_indexes_recreated_marker(db_name)?;
     if marker.exists() {
         info!("Skipping delayed-index recreate for {db_name} (already done)");
         return Ok(());
@@ -653,7 +650,7 @@ pub async fn recreate_delayed_indexes(
 
     let dst_pool = select! {
         res = config.pool_cache.get(&config.destination, db_name) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("destination connection for {db_name}"))),
     };
 
     let parallel = config.restore_jobs.max(1);
@@ -669,7 +666,7 @@ pub async fn recreate_delayed_indexes(
         set.spawn(async move {
             let _permit = select! {
                 res = sem.acquire_owned() => res?,
-                () = cancel.cancelled() => anyhow::bail!("cancelled while waiting for index slot"),
+                () = cancel.cancelled() => return Err(Error::Cancelled("waiting for index slot".to_string())),
             };
 
             let exists: bool = select! {
@@ -683,7 +680,7 @@ pub async fn recreate_delayed_indexes(
                 .bind(&idx.name)
                 .bind(&idx.schema)
                 .fetch_one(&pool) => res?,
-                () = cancel.cancelled() => anyhow::bail!("cancelled during index existence check for {}.{}", idx.schema, idx.name),
+                () = cancel.cancelled() => return Err(Error::Cancelled(format!("index existence check for {}.{}", idx.schema, idx.name))),
             };
 
             if exists {
@@ -700,7 +697,7 @@ pub async fn recreate_delayed_indexes(
             );
             select! {
                 res = sqlx::query(AssertSqlSafe(idx.ddl.as_str())).execute(&pool) => { res?; }
-                () = cancel.cancelled() => anyhow::bail!("cancelled during CREATE INDEX of {}.{}", idx.schema, idx.name),
+                () = cancel.cancelled() => return Err(Error::Cancelled(format!("CREATE INDEX of {}.{}", idx.schema, idx.name))),
             };
             Ok(())
         });
@@ -725,20 +722,20 @@ pub async fn enable_fast_restore(config: &Config, cancel: CancellationToken) -> 
 
     let pool = select! {
         res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
     };
 
     for (k, v) in settings {
         let sql = format!("ALTER SYSTEM SET {k} TO {v};");
         select! {
             res = sqlx::query(AssertSqlSafe(sql)).execute(&pool) => res?,
-            () = cancel.cancelled() => anyhow::bail!("cancelled during fast restore enablement"),
+            () = cancel.cancelled() => return Err(Error::Cancelled("fast restore enablement".to_string())),
         };
     }
 
     select! {
         res = sqlx::query("SELECT pg_reload_conf();").execute(&pool) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during fast restore enablement (reload)"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("fast restore enablement (reload)".to_string())),
     };
     Ok(())
 }
@@ -748,19 +745,19 @@ pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -
 
     let pool = select! {
         res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
     };
 
     for s in settings {
         let sql = format!("ALTER SYSTEM RESET {s};");
         select! {
             res = sqlx::query(AssertSqlSafe(sql)).execute(&pool) => res?,
-            () = cancel.cancelled() => anyhow::bail!("cancelled during safe settings restoration"),
+            () = cancel.cancelled() => return Err(Error::Cancelled("safe settings restoration".to_string())),
         };
     }
     select! {
         res = sqlx::query("SELECT pg_reload_conf();").execute(&pool) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during safe settings restoration (reload)"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("safe settings restoration (reload)".to_string())),
     };
     Ok(())
 }
@@ -768,7 +765,7 @@ pub async fn restore_safe_settings(config: &Config, cancel: CancellationToken) -
 pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationToken) -> Result<()> {
     let pool = select! {
         res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
     };
 
     for db in dbs {
@@ -779,30 +776,30 @@ pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationTok
                     warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
                 }
             }
-            () = cancel.cancelled() => anyhow::bail!("cancelled during database creation of {db}"),
+            () = cancel.cancelled() => return Err(Error::Cancelled(format!("database creation of {db}"))),
         }
     }
     Ok(())
 }
 
-pub fn done_marker(db: &str) -> PathBuf {
-    state_dir().join(format!("{db}.done"))
+pub fn done_marker(db: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("{db}.done")))
 }
 
-pub fn delayed_indexes_dropped_marker(db: &str) -> PathBuf {
-    state_dir().join(format!("{db}.delayed_indexes_dropped"))
+pub fn delayed_indexes_dropped_marker(db: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("{db}.delayed_indexes_dropped")))
 }
 
-pub fn delayed_indexes_recreated_marker(db: &str) -> PathBuf {
-    state_dir().join(format!("{db}.delayed_indexes_recreated"))
+pub fn delayed_indexes_recreated_marker(db: &str) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("{db}.delayed_indexes_recreated")))
 }
 
-pub fn globals_marker() -> PathBuf {
-    state_dir().join("globals.done")
+pub fn globals_marker() -> Result<PathBuf> {
+    Ok(state_dir()?.join("globals.done"))
 }
 
 pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Result<()> {
-    if globals_marker().exists() {
+    if globals_marker()?.exists() {
         return Ok(());
     }
 
@@ -823,21 +820,29 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
             &config.source.user,
             "--globals-only",
             "-f",
-            globals_path.to_str().expect("invalid globals path"),
+            globals_path
+                .to_str()
+                .ok_or_else(|| Error::Other("invalid globals path".to_string()))?,
         ])
         .spawn()
-        .context("pg_dumpall --globals-only failed to start")?;
+        .map_err(|e| Error::SpawnFailed {
+            command: "pg_dumpall".to_string(),
+            source: e,
+        })?;
 
     let status = select! {
-        res = child.wait() => res.context("pg_dumpall wait failed")?,
+        res = child.wait() => res.map_err(|e| Error::Other(format!("pg_dumpall wait failed: {e}")))?,
         () = cancel.cancelled() => {
             let _ = child.kill().await;
-            anyhow::bail!("cancelled during pg_dumpall --globals-only");
+            return Err(Error::Cancelled("pg_dumpall --globals-only".to_string()));
         }
     };
 
     if !status.success() {
-        anyhow::bail!("pg_dumpall failed");
+        return Err(Error::ProcessFailed {
+            command: "pg_dumpall".to_string(),
+            stderr: "pg_dumpall failed".to_string(),
+        });
     }
 
     let globals_content = fs::read_to_string(&globals_path)?;
@@ -868,7 +873,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
 
     let pool = select! {
         res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
-        () = cancel.cancelled() => anyhow::bail!("cancelled during database connection"),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
     };
 
     let sql = fs::read_to_string(&globals_path)?;
@@ -881,7 +886,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
 
         let res = select! {
             res = sqlx::query(AssertSqlSafe(exec_sql)).execute(&pool) => res,
-            () = cancel.cancelled() => anyhow::bail!("cancelled during globals migration execution"),
+            () = cancel.cancelled() => return Err(Error::Cancelled("globals migration execution".to_string())),
         };
 
         if let Err(e) = res {
@@ -896,6 +901,6 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         }
     }
 
-    fs::write(globals_marker(), "")?;
+    fs::write(globals_marker()?, "")?;
     Ok(())
 }

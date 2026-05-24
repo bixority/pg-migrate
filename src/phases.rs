@@ -1,4 +1,4 @@
-use crate::db::MigrationPhase;
+use crate::error::{Error, MigrationPhase, Result};
 use crate::tui::SharedMigrationStates;
 use crate::{Config, db, verification};
 use std::fs;
@@ -15,7 +15,7 @@ pub async fn phase_migrate_all(
     cancel: &CancellationToken,
     dump_sem: Arc<Semaphore>,
     restore_sem: Arc<Semaphore>,
-) -> anyhow::Result<(Duration, Duration)> {
+) -> Result<(Duration, Duration)> {
     let start = Instant::now();
     let mut pipeline_tasks = JoinSet::new();
 
@@ -40,11 +40,10 @@ pub async fn phase_migrate_all(
             )
             .await;
 
-            if let Err(error) = &result {
-                states_clone
-                    .lock()
-                    .expect("states lock poisoned")
-                    .fail(&db_clone, error.to_string());
+            if let Err(error) = &result
+                && let Ok(mut lock) = states_clone.lock()
+            {
+                lock.fail(&db_clone, error.to_string());
             }
 
             result
@@ -68,7 +67,7 @@ pub async fn phase_migrate_all(
                                 pipeline_tasks.abort_all();
 
                                 if was_cancelled {
-                                    anyhow::bail!("Migration cancelled by user");
+                                    return Err(Error::Cancelled("user".to_string()));
                                 }
 
                                 return Err(e);
@@ -80,32 +79,29 @@ pub async fn phase_migrate_all(
             }
             () = cancel.cancelled() => {
                 pipeline_tasks.abort_all();
-                anyhow::bail!("Migration cancelled by user");
+                return Err(Error::Cancelled("user".to_string()));
             }
         }
     }
 
     if cancel.is_cancelled() {
-        anyhow::bail!("Migration cancelled by user");
+        return Err(Error::Cancelled("user".to_string()));
     }
 
     let total_duration = start.elapsed();
     let regular_duration = states
         .lock()
-        .expect("states lock poisoned")
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
         .latest_regular_completion()
         .map_or(total_duration, |t| t.duration_since(start));
 
     Ok((regular_duration, total_duration))
 }
 
-async fn acquire(
-    sem: &Arc<Semaphore>,
-    cancel: &CancellationToken,
-) -> anyhow::Result<OwnedSemaphorePermit> {
+async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<OwnedSemaphorePermit> {
     tokio::select! {
         res = sem.clone().acquire_owned() => Ok(res?),
-        () = cancel.cancelled() => anyhow::bail!("cancelled while waiting for semaphore"),
+        () = cancel.cancelled() => Err(Error::Cancelled("waiting for semaphore".to_string())),
     }
 }
 
@@ -117,23 +113,44 @@ async fn run_pipeline(
     cancel: &CancellationToken,
     dump_sem: &Arc<Semaphore>,
     restore_sem: &Arc<Semaphore>,
-) -> anyhow::Result<()> {
-    phase_migrate_one(
-        config,
-        db_name,
-        size,
-        states.clone(),
-        cancel,
-        dump_sem,
-        restore_sem,
-    )
-    .await?;
-    states
-        .lock()
-        .expect("states lock poisoned")
-        .mark_regular_done(db_name);
-    phase_finalize_one(config, db_name, size, states, cancel, dump_sem, restore_sem).await?;
-    Ok(())
+) -> Result<()> {
+    let res = async {
+        phase_migrate_one(
+            config,
+            db_name,
+            size,
+            states.clone(),
+            cancel,
+            dump_sem,
+            restore_sem,
+        )
+        .await?;
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .mark_regular_done(db_name);
+        phase_finalize_one(
+            config,
+            db_name,
+            size,
+            states.clone(),
+            cancel,
+            dump_sem,
+            restore_sem,
+        )
+        .await?;
+        Ok(())
+    }
+    .await;
+
+    res.map_err(|e: Error| {
+        let (phase, step) = states
+            .lock()
+            .ok()
+            .and_then(|s| s.get_state(db_name))
+            .unwrap_or((MigrationPhase::Pending, 0));
+        e.with_context(db_name, phase, step)
+    })
 }
 
 async fn phase_migrate_one(
@@ -144,55 +161,60 @@ async fn phase_migrate_one(
     cancel: &CancellationToken,
     dump_sem: &Arc<Semaphore>,
     restore_sem: &Arc<Semaphore>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     {
         let _dump_permit = acquire(dump_sem, cancel).await?;
 
-        states.lock().expect("states lock poisoned").update(
-            db_name,
-            MigrationPhase::Dumping,
-            1,
-            "dumping database",
-        );
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(db_name, MigrationPhase::Dumping, 1, "dumping database");
 
         db::dump_db(config, db_name, size, cancel.clone()).await?;
 
-        states.lock().expect("states lock poisoned").update(
-            db_name,
-            MigrationPhase::SourceCounts,
-            2,
-            "computing source row counts",
-        );
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                db_name,
+                MigrationPhase::SourceCounts,
+                2,
+                "computing source row counts",
+            );
 
         compute_source_counts(config, db_name, cancel.clone()).await?;
     }
 
     let _restore_permit = acquire(restore_sem, cancel).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::Restoring,
-        3,
-        "restoring database",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(db_name, MigrationPhase::Restoring, 3, "restoring database");
 
     db::restore_db(config, db_name, size, cancel.clone()).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::DestinationCounts,
-        4,
-        "computing destination row counts",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::DestinationCounts,
+            4,
+            "computing destination row counts",
+        );
 
     compute_destination_counts(config, db_name, cancel.clone()).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::Verifying,
-        5,
-        "verifying row counts",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::Verifying,
+            5,
+            "verifying row counts",
+        );
 
     verification::verify_db(config, db_name, false, cancel.clone()).await?;
 
@@ -207,7 +229,7 @@ async fn phase_finalize_one(
     cancel: &CancellationToken,
     dump_sem: &Arc<Semaphore>,
     restore_sem: &Arc<Semaphore>,
-) -> anyhow::Result<()> {
+) -> Result<()> {
     let db_prefix = format!("{db_name}.");
     let has_delayed = config
         .delay_table_data
@@ -215,72 +237,88 @@ async fn phase_finalize_one(
         .any(|d| d.starts_with(&db_prefix));
 
     if !has_delayed {
-        states.lock().expect("states lock poisoned").update(
-            db_name,
-            MigrationPhase::Complete,
-            6,
-            "migration complete",
-        );
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(db_name, MigrationPhase::Complete, 6, "migration complete");
         return Ok(());
     }
 
     {
         let _dump_permit = acquire(dump_sem, cancel).await?;
 
-        states.lock().expect("states lock poisoned").update(
-            db_name,
-            MigrationPhase::DelayedDumping,
-            7,
-            "dumping delayed table data",
-        );
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                db_name,
+                MigrationPhase::DelayedDumping,
+                7,
+                "dumping delayed table data",
+            );
 
         db::dump_data(config, db_name, cancel.clone()).await?;
     }
 
     let _restore_permit = acquire(restore_sem, cancel).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::DelayedDroppingIndexes,
-        8,
-        "dropping secondary indexes on delayed tables",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::DelayedDroppingIndexes,
+            8,
+            "dropping secondary indexes on delayed tables",
+        );
 
     db::drop_delayed_indexes(config, db_name, cancel.clone()).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::DelayedRestoring,
-        9,
-        "restoring delayed table data",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::DelayedRestoring,
+            9,
+            "restoring delayed table data",
+        );
 
     db::restore_delayed_data(config, db_name, cancel.clone()).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::DelayedRecreatingIndexes,
-        10,
-        "recreating secondary indexes on delayed tables",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::DelayedRecreatingIndexes,
+            10,
+            "recreating secondary indexes on delayed tables",
+        );
 
     db::recreate_delayed_indexes(config, db_name, cancel.clone()).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::DelayedVerifying,
-        11,
-        "verifying all row counts (including delayed)",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::DelayedVerifying,
+            11,
+            "verifying all row counts (including delayed)",
+        );
 
     verification::verify_db(config, db_name, true, cancel.clone()).await?;
 
-    states.lock().expect("states lock poisoned").update(
-        db_name,
-        MigrationPhase::Complete,
-        11,
-        "migration complete (with delayed data)",
-    );
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            db_name,
+            MigrationPhase::Complete,
+            11,
+            "migration complete (with delayed data)",
+        );
 
     Ok(())
 }
@@ -289,8 +327,8 @@ async fn compute_source_counts(
     config: &Config,
     db_name: &str,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
-    let src_path = verification::src_counts_path(db_name, config.fast_verify);
+) -> Result<()> {
+    let src_path = verification::src_counts_path(db_name, config.fast_verify)?;
 
     if !src_path.exists() {
         let counts = verification::stat_counts(
@@ -314,8 +352,8 @@ async fn compute_destination_counts(
     config: &Config,
     db_name: &str,
     cancel: CancellationToken,
-) -> anyhow::Result<()> {
-    let dst_path = verification::dst_counts_path(db_name, config.fast_verify);
+) -> Result<()> {
+    let dst_path = verification::dst_counts_path(db_name, config.fast_verify)?;
 
     if !dst_path.exists() {
         let counts = verification::stat_counts(

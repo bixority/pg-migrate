@@ -1,11 +1,12 @@
 mod db;
+mod error;
 mod phases;
 mod tui;
 mod verification;
 
+use crate::error::{Error, Result};
 use crate::phases::phase_migrate_all;
 use crate::tui::{migration_style, redraw_loop, shared_migration_states};
-use anyhow::Result;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
@@ -45,32 +46,31 @@ pub struct Config {
 
 /// Returns the user's home directory.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the `HOME` environment variable is not set.
-#[must_use]
-pub fn home() -> PathBuf {
-    PathBuf::from(env::var("HOME").expect("HOME not set"))
+/// Returns an error if the `HOME` environment variable is not set.
+pub fn home() -> Result<PathBuf> {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| Error::Other("HOME environment variable not set".to_string()))
 }
 
 /// Returns the directory used for state markers.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the `HOME` environment variable is not set.
-#[must_use]
-pub fn state_dir() -> PathBuf {
-    home().join("pg_migrate_state")
+/// See [`home`].
+pub fn state_dir() -> Result<PathBuf> {
+    Ok(home()?.join("pg_migrate_state"))
 }
 
 /// Returns the directory used for verification markers.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the `HOME` environment variable is not set.
-#[must_use]
-pub fn verify_dir() -> PathBuf {
-    home().join("pg_verify_state")
+/// See [`home`].
+pub fn verify_dir() -> Result<PathBuf> {
+    Ok(home()?.join("pg_verify_state"))
 }
 
 #[derive(Parser)]
@@ -137,12 +137,12 @@ async fn main() -> Result<()> {
 
     indicatif_log_bridge::LogWrapper::new((*mp).clone(), logger)
         .try_init()
-        .expect("failed to init log wrapper");
+        .map_err(|e| Error::Other(format!("failed to init log wrapper: {e}")))?;
 
     let total_time_pb = mp.add(ProgressBar::new_spinner());
     total_time_pb.set_style(
         ProgressStyle::with_template("{spinner:.green} Total elapsed time: {elapsed_precise}")
-            .expect("Invalid template"),
+            .map_err(|e| Error::Other(format!("Invalid template: {e}")))?,
     );
     total_time_pb.enable_steady_tick(Duration::from_millis(100));
 
@@ -181,16 +181,16 @@ async fn main() -> Result<()> {
         verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
     });
 
-    fs::create_dir_all(state_dir())?;
-    fs::create_dir_all(verify_dir())?;
+    fs::create_dir_all(state_dir()?)?;
+    fs::create_dir_all(verify_dir()?)?;
 
     let cancel = CancellationToken::new();
     let cancel_signal = cancel.clone();
 
     tokio::spawn(async move {
-        tokio::signal::ctrl_c()
-            .await
-            .expect("failed to listen for ctrl-c");
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            eprintln!("failed to listen for ctrl-c: {e}");
+        }
         eprintln!("\nInterrupt received, killing child processes…");
         cancel_signal.cancel();
     });
@@ -245,13 +245,24 @@ async fn main() -> Result<()> {
     cancel.cancel();
     let _ = redraw_task.await;
 
-    let (regular_duration, migration_duration) = migrate_result?;
+    let (regular_duration, migration_duration) = match migrate_result {
+        Ok(res) => res,
+        Err(e) => {
+            if !config.disable_dst_optimizations {
+                let _ = db::restore_safe_settings(&config, CancellationToken::new()).await;
+            }
+            return Err(e);
+        }
+    };
 
     if !config.disable_dst_optimizations {
         db::restore_safe_settings(&config, CancellationToken::new()).await?;
     }
 
-    let final_table = states.lock().expect("states lock poisoned").render_table();
+    let final_table = states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .render_table();
     table_pb.finish_with_message(final_table);
     total_time_pb.finish_and_clear();
 

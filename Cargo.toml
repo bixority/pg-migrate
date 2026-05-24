@@ -1,6 +1,6 @@
 [package]
 name = "pg-migrate"
-version = "0.4.5"
+version = "0.5.0"
 edition = "2024"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
@@ -15,17 +15,17 @@ default = ["cli"]
 cli = ["dep:clap"]
 
 [dependencies]
-anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"], optional = true }
 env_logger = "0.11.10"
 futures = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }
 indicatif = "0.18.4"
 indicatif-log-bridge = "0.2.3"
 log = "0.4.29"
+serde_json = "1.0.150"
 sqlx = { version = "0.9.0", features = ["runtime-tokio", "postgres", "macros", "tls-rustls"] }
+thiserror = "2.0.18"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = "0.7.18"
-serde_json = "1.0.150"
 
 [lints.rust]
 unsafe_code = "forbid"
