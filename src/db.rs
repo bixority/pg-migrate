@@ -18,8 +18,10 @@ use std::{
 use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::select;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+use crate::verification::is_delayed_table;
 
 #[derive(Clone, Debug)]
 pub struct DbArgs {
@@ -38,9 +40,9 @@ pub enum MigrationPhase {
     DestinationCounts,
     Verifying,
     DelayedDumping,
-    // DelayedDroppingIndexes,
+    DelayedDroppingIndexes,
     DelayedRestoring,
-    // DelayedRecreatingIndexes,
+    DelayedRecreatingIndexes,
     DelayedVerifying,
     Complete,
     Failed,
@@ -57,9 +59,9 @@ impl MigrationPhase {
             Self::DestinationCounts => "dest counts",
             Self::Verifying => "verifying",
             Self::DelayedDumping => "delayed dumping",
-            // Self::DelayedDroppingIndexes => "dropping indexes",
+            Self::DelayedDroppingIndexes => "dropping indexes",
             Self::DelayedRestoring => "delayed restoring",
-            // Self::DelayedRecreatingIndexes => "recreating indexes",
+            Self::DelayedRecreatingIndexes => "recreating indexes",
             Self::DelayedVerifying => "delayed verifying",
             Self::Complete => "complete",
             Self::Failed => "failed",
@@ -523,194 +525,194 @@ pub async fn restore_delayed_data(
     Ok(())
 }
 
-// #[derive(Clone, Debug)]
-// struct DelayedIndex {
-//     schema: String,
-//     name: String,
-//     ddl: String,
-// }
-//
-// async fn collect_delayed_indexes(
-//     config: &Config,
-//     db_name: &str,
-//     cancel: &CancellationToken,
-// ) -> Result<Vec<DelayedIndex>> {
-//     let src_pool = select! {
-//         res = config.pool_cache.get(&config.source, db_name) => res?,
-//         () = cancel.cancelled() => anyhow::bail!("cancelled during source connection for {db_name}"),
-//     };
-//
-//     let table_rows = select! {
-//         res = sqlx::query("SELECT schemaname, tablename FROM pg_tables").fetch_all(&src_pool) => res?,
-//         () = cancel.cancelled() => anyhow::bail!("cancelled during delayed table discovery for {db_name}"),
-//     };
-//
-//     let mut indexes = Vec::new();
-//     for row in table_rows {
-//         let schema: String = row.get(0);
-//         let table: String = row.get(1);
-//
-//         if !is_delayed_table(db_name, &schema, &table, &config.delay_table_data) {
-//             continue;
-//         }
-//
-//         let idx_rows = select! {
-//             res = sqlx::query(
-//                 "SELECT i.relname, pg_get_indexdef(i.oid) \
-//                  FROM pg_index x \
-//                  JOIN pg_class i ON i.oid = x.indexrelid \
-//                  JOIN pg_class t ON t.oid = x.indrelid \
-//                  JOIN pg_namespace n ON n.oid = t.relnamespace \
-//                  WHERE n.nspname = $1 AND t.relname = $2 \
-//                    AND NOT EXISTS ( \
-//                      SELECT 1 FROM pg_constraint c WHERE c.conindid = x.indexrelid \
-//                    )"
-//             )
-//             .bind(&schema)
-//             .bind(&table)
-//             .fetch_all(&src_pool) => res?,
-//             () = cancel.cancelled() => anyhow::bail!("cancelled during index discovery for {schema}.{table}"),
-//         };
-//
-//         for row in idx_rows {
-//             let name: String = row.get(0);
-//             let ddl: String = row.get(1);
-//             indexes.push(DelayedIndex {
-//                 schema: schema.clone(),
-//                 name,
-//                 ddl,
-//             });
-//         }
-//     }
-//
-//     Ok(indexes)
-// }
-//
-// fn quote_ident(name: &str) -> String {
-//     format!("\"{}\"", name.replace('"', "\"\""))
-// }
-//
-// pub async fn drop_delayed_indexes(
-//     config: &Config,
-//     db_name: &str,
-//     cancel: CancellationToken,
-// ) -> Result<()> {
-//     let marker = delayed_indexes_dropped_marker(db_name);
-//     if marker.exists() {
-//         info!("Skipping delayed-index drop for {db_name} (already done)");
-//         return Ok(());
-//     }
-//
-//     let indexes = collect_delayed_indexes(config, db_name, &cancel).await?;
-//
-//     if indexes.is_empty() {
-//         info!("No delayed-table secondary indexes for {db_name}");
-//         fs::write(&marker, "")?;
-//         return Ok(());
-//     }
-//
-//     let dst_pool = select! {
-//         res = config.pool_cache.get(&config.destination, db_name) => res?,
-//         () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
-//     };
-//
-//     for idx in &indexes {
-//         let sql = format!(
-//             "DROP INDEX IF EXISTS {}.{}",
-//             quote_ident(&idx.schema),
-//             quote_ident(&idx.name),
-//         );
-//         info!("Dropping index {}.{} on {db_name}", idx.schema, idx.name);
-//         select! {
-//             res = sqlx::query(AssertSqlSafe(sql)).execute(&dst_pool) => res?,
-//             () = cancel.cancelled() => anyhow::bail!("cancelled during DROP INDEX of {}.{}", idx.schema, idx.name),
-//         };
-//     }
-//
-//     fs::write(&marker, "")?;
-//     Ok(())
-// }
-//
-// pub async fn recreate_delayed_indexes(
-//     config: &Config,
-//     db_name: &str,
-//     cancel: CancellationToken,
-// ) -> Result<()> {
-//     let marker = delayed_indexes_recreated_marker(db_name);
-//     if marker.exists() {
-//         info!("Skipping delayed-index recreate for {db_name} (already done)");
-//         return Ok(());
-//     }
-//
-//     let indexes = collect_delayed_indexes(config, db_name, &cancel).await?;
-//
-//     if indexes.is_empty() {
-//         fs::write(&marker, "")?;
-//         return Ok(());
-//     }
-//
-//     let dst_pool = select! {
-//         res = config.pool_cache.get(&config.destination, db_name) => res?,
-//         () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
-//     };
-//
-//     let parallel = config.restore_jobs.max(1);
-//     let sem = Arc::new(Semaphore::new(parallel));
-//     let mut set: JoinSet<Result<()>> = JoinSet::new();
-//
-//     for idx in indexes {
-//         let pool = dst_pool.clone();
-//         let sem = sem.clone();
-//         let cancel = cancel.clone();
-//         let db_name_owned = db_name.to_string();
-//
-//         set.spawn(async move {
-//             let _permit = select! {
-//                 res = sem.acquire_owned() => res?,
-//                 () = cancel.cancelled() => anyhow::bail!("cancelled while waiting for index slot"),
-//             };
-//
-//             let exists: bool = select! {
-//                 res = sqlx::query_scalar::<_, bool>(
-//                     "SELECT EXISTS ( \
-//                        SELECT 1 FROM pg_class c \
-//                        JOIN pg_namespace n ON n.oid = c.relnamespace \
-//                        WHERE c.relkind = 'i' AND c.relname = $1 AND n.nspname = $2 \
-//                      )"
-//                 )
-//                 .bind(&idx.name)
-//                 .bind(&idx.schema)
-//                 .fetch_one(&pool) => res?,
-//                 () = cancel.cancelled() => anyhow::bail!("cancelled during index existence check for {}.{}", idx.schema, idx.name),
-//             };
-//
-//             if exists {
-//                 info!(
-//                     "Index {}.{} already exists on {db_name_owned}; skipping",
-//                     idx.schema, idx.name
-//                 );
-//                 return Ok(());
-//             }
-//
-//             info!(
-//                 "Recreating index {}.{} on {db_name_owned}",
-//                 idx.schema, idx.name
-//             );
-//             select! {
-//                 res = sqlx::query(AssertSqlSafe(idx.ddl.as_str())).execute(&pool) => { res?; }
-//                 () = cancel.cancelled() => anyhow::bail!("cancelled during CREATE INDEX of {}.{}", idx.schema, idx.name),
-//             };
-//             Ok(())
-//         });
-//     }
-//
-//     while let Some(res) = set.join_next().await {
-//         res??;
-//     }
-//
-//     fs::write(&marker, "")?;
-//     Ok(())
-// }
+#[derive(Clone, Debug)]
+struct DelayedIndex {
+    schema: String,
+    name: String,
+    ddl: String,
+}
+
+async fn collect_delayed_indexes(
+    config: &Config,
+    db_name: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<DelayedIndex>> {
+    let src_pool = select! {
+        res = config.pool_cache.get(&config.source, db_name) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during source connection for {db_name}"),
+    };
+
+    let table_rows = select! {
+        res = sqlx::query("SELECT schemaname, tablename FROM pg_tables").fetch_all(&src_pool) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during delayed table discovery for {db_name}"),
+    };
+
+    let mut indexes = Vec::new();
+    for row in table_rows {
+        let schema: String = row.get(0);
+        let table: String = row.get(1);
+
+        if !is_delayed_table(db_name, &schema, &table, &config.delay_table_data) {
+            continue;
+        }
+
+        let idx_rows = select! {
+            res = sqlx::query(
+                "SELECT i.relname, pg_get_indexdef(i.oid) \
+                 FROM pg_index x \
+                 JOIN pg_class i ON i.oid = x.indexrelid \
+                 JOIN pg_class t ON t.oid = x.indrelid \
+                 JOIN pg_namespace n ON n.oid = t.relnamespace \
+                 WHERE n.nspname = $1 AND t.relname = $2 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM pg_constraint c WHERE c.conindid = x.indexrelid \
+                   )"
+            )
+            .bind(&schema)
+            .bind(&table)
+            .fetch_all(&src_pool) => res?,
+            () = cancel.cancelled() => anyhow::bail!("cancelled during index discovery for {schema}.{table}"),
+        };
+
+        for row in idx_rows {
+            let name: String = row.get(0);
+            let ddl: String = row.get(1);
+            indexes.push(DelayedIndex {
+                schema: schema.clone(),
+                name,
+                ddl,
+            });
+        }
+    }
+
+    Ok(indexes)
+}
+
+fn quote_ident(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+pub async fn drop_delayed_indexes(
+    config: &Config,
+    db_name: &str,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let marker = delayed_indexes_dropped_marker(db_name);
+    if marker.exists() {
+        info!("Skipping delayed-index drop for {db_name} (already done)");
+        return Ok(());
+    }
+
+    let indexes = collect_delayed_indexes(config, db_name, &cancel).await?;
+
+    if indexes.is_empty() {
+        info!("No delayed-table secondary indexes for {db_name}");
+        fs::write(&marker, "")?;
+        return Ok(());
+    }
+
+    let dst_pool = select! {
+        res = config.pool_cache.get(&config.destination, db_name) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
+    };
+
+    for idx in &indexes {
+        let sql = format!(
+            "DROP INDEX IF EXISTS {}.{}",
+            quote_ident(&idx.schema),
+            quote_ident(&idx.name),
+        );
+        info!("Dropping index {}.{} on {db_name}", idx.schema, idx.name);
+        select! {
+            res = sqlx::query(AssertSqlSafe(sql)).execute(&dst_pool) => res?,
+            () = cancel.cancelled() => anyhow::bail!("cancelled during DROP INDEX of {}.{}", idx.schema, idx.name),
+        };
+    }
+
+    fs::write(&marker, "")?;
+    Ok(())
+}
+
+pub async fn recreate_delayed_indexes(
+    config: &Config,
+    db_name: &str,
+    cancel: CancellationToken,
+) -> Result<()> {
+    let marker = delayed_indexes_recreated_marker(db_name);
+    if marker.exists() {
+        info!("Skipping delayed-index recreate for {db_name} (already done)");
+        return Ok(());
+    }
+
+    let indexes = collect_delayed_indexes(config, db_name, &cancel).await?;
+
+    if indexes.is_empty() {
+        fs::write(&marker, "")?;
+        return Ok(());
+    }
+
+    let dst_pool = select! {
+        res = config.pool_cache.get(&config.destination, db_name) => res?,
+        () = cancel.cancelled() => anyhow::bail!("cancelled during destination connection for {db_name}"),
+    };
+
+    let parallel = config.restore_jobs.max(1);
+    let sem = Arc::new(Semaphore::new(parallel));
+    let mut set: JoinSet<Result<()>> = JoinSet::new();
+
+    for idx in indexes {
+        let pool = dst_pool.clone();
+        let sem = sem.clone();
+        let cancel = cancel.clone();
+        let db_name_owned = db_name.to_string();
+
+        set.spawn(async move {
+            let _permit = select! {
+                res = sem.acquire_owned() => res?,
+                () = cancel.cancelled() => anyhow::bail!("cancelled while waiting for index slot"),
+            };
+
+            let exists: bool = select! {
+                res = sqlx::query_scalar::<_, bool>(
+                    "SELECT EXISTS ( \
+                       SELECT 1 FROM pg_class c \
+                       JOIN pg_namespace n ON n.oid = c.relnamespace \
+                       WHERE c.relkind = 'i' AND c.relname = $1 AND n.nspname = $2 \
+                     )"
+                )
+                .bind(&idx.name)
+                .bind(&idx.schema)
+                .fetch_one(&pool) => res?,
+                () = cancel.cancelled() => anyhow::bail!("cancelled during index existence check for {}.{}", idx.schema, idx.name),
+            };
+
+            if exists {
+                info!(
+                    "Index {}.{} already exists on {db_name_owned}; skipping",
+                    idx.schema, idx.name
+                );
+                return Ok(());
+            }
+
+            info!(
+                "Recreating index {}.{} on {db_name_owned}",
+                idx.schema, idx.name
+            );
+            select! {
+                res = sqlx::query(AssertSqlSafe(idx.ddl.as_str())).execute(&pool) => { res?; }
+                () = cancel.cancelled() => anyhow::bail!("cancelled during CREATE INDEX of {}.{}", idx.schema, idx.name),
+            };
+            Ok(())
+        });
+    }
+
+    while let Some(res) = set.join_next().await {
+        res??;
+    }
+
+    fs::write(&marker, "")?;
+    Ok(())
+}
 
 pub async fn enable_fast_restore(config: &Config, cancel: CancellationToken) -> Result<()> {
     let settings = [
@@ -787,13 +789,13 @@ pub fn done_marker(db: &str) -> PathBuf {
     state_dir().join(format!("{db}.done"))
 }
 
-// pub fn delayed_indexes_dropped_marker(db: &str) -> PathBuf {
-//     state_dir().join(format!("{db}.delayed_indexes_dropped"))
-// }
-//
-// pub fn delayed_indexes_recreated_marker(db: &str) -> PathBuf {
-//     state_dir().join(format!("{db}.delayed_indexes_recreated"))
-// }
+pub fn delayed_indexes_dropped_marker(db: &str) -> PathBuf {
+    state_dir().join(format!("{db}.delayed_indexes_dropped"))
+}
+
+pub fn delayed_indexes_recreated_marker(db: &str) -> PathBuf {
+    state_dir().join(format!("{db}.delayed_indexes_recreated"))
+}
 
 pub fn globals_marker() -> PathBuf {
     state_dir().join("globals.done")
