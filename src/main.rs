@@ -123,7 +123,6 @@ struct Args {
 }
 
 #[tokio::main]
-#[allow(clippy::too_many_lines)]
 async fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
@@ -146,40 +145,7 @@ async fn main() -> Result<()> {
     );
     total_time_pb.enable_steady_tick(Duration::from_millis(100));
 
-    let verify_concurrency = args.verify_concurrency.max(1);
-    let dump_parallel = args.dump_parallel.unwrap_or(args.max_parallel).max(1);
-    let restore_parallel = args.restore_parallel.unwrap_or(args.max_parallel).max(1);
-    let pool_cap = u32::try_from(args.restore_jobs.max(verify_concurrency).max(4)).unwrap_or(16);
-
-    let config = Arc::new(Config {
-        source: db::DbArgs {
-            host: args.from_host,
-            port: args.from_port,
-            user: args.from_user,
-            pass: args.from_pass,
-        },
-        source_db: args.from_db,
-        destination: db::DbArgs {
-            host: args.to_host,
-            port: args.to_port,
-            user: args.to_user,
-            pass: args.to_pass,
-        },
-        destination_db: args.to_db,
-        dump_jobs: args.dump_jobs,
-        restore_jobs: args.restore_jobs,
-        max_parallel: args.max_parallel,
-        dump_parallel,
-        restore_parallel,
-        dump_root: args.dump_root.into(),
-        migrate_globals: args.migrate_globals,
-        disable_dst_optimizations: args.disable_dst_optimizations,
-        delay_table_data: args.delay_table_data,
-        fast_verify: args.fast_verify,
-        verify_concurrency,
-        pool_cache: db::PoolCache::new(pool_cap),
-        verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
-    });
+    let config = build_config(args);
 
     fs::create_dir_all(state_dir()?)?;
     fs::create_dir_all(verify_dir()?)?;
@@ -205,29 +171,9 @@ async fn main() -> Result<()> {
         return Ok(());
     }
 
-    let states = shared_migration_states(&dbs_with_sizes, &config);
+    let (states, table_pb, redraw_task) = setup_ui(&mp, &dbs_with_sizes, &config, cancel.clone())?;
 
-    let table_pb = mp.add(ProgressBar::new_spinner());
-    table_pb.set_style(migration_style()?);
-    table_pb.enable_steady_tick(Duration::from_secs(1));
-
-    let redraw_cancel = cancel.clone();
-    let redraw_states = states.clone();
-    let redraw_pb = table_pb.clone();
-
-    let redraw_task = tokio::spawn(async move {
-        redraw_loop(redraw_states, redraw_pb, redraw_cancel).await;
-    });
-
-    if !config.disable_dst_optimizations {
-        db::enable_fast_restore(&config, cancel.clone()).await?;
-    }
-
-    if config.migrate_globals {
-        db::migrate_globals(&config, cancel.clone()).await?;
-    }
-
-    db::create_dbs(&config, &db_names_owned, cancel.clone()).await?;
+    prepare_destination(&config, &db_names_owned, cancel.clone()).await?;
 
     let dump_sem = Arc::new(Semaphore::new(config.dump_parallel));
     let restore_sem = Arc::new(Semaphore::new(config.restore_parallel));
@@ -276,5 +222,86 @@ async fn main() -> Result<()> {
         indicatif::HumanDuration(elapsed)
     );
 
+    Ok(())
+}
+
+fn setup_ui(
+    mp: &Arc<MultiProgress>,
+    dbs_with_sizes: &[(String, u64)],
+    config: &Config,
+    cancel: CancellationToken,
+) -> Result<(
+    crate::tui::SharedMigrationStates,
+    ProgressBar,
+    tokio::task::JoinHandle<()>,
+)> {
+    let states = shared_migration_states(dbs_with_sizes, config);
+
+    let table_pb = mp.add(ProgressBar::new_spinner());
+    table_pb.set_style(migration_style()?);
+    table_pb.enable_steady_tick(Duration::from_secs(1));
+
+    let redraw_cancel = cancel;
+    let redraw_states = states.clone();
+    let redraw_pb = table_pb.clone();
+
+    let redraw_task = tokio::spawn(async move {
+        redraw_loop(redraw_states, redraw_pb, redraw_cancel).await;
+    });
+
+    Ok((states, table_pb, redraw_task))
+}
+
+fn build_config(args: Args) -> Arc<Config> {
+    let verify_concurrency = args.verify_concurrency.max(1);
+    let dump_parallel = args.dump_parallel.unwrap_or(args.max_parallel).max(1);
+    let restore_parallel = args.restore_parallel.unwrap_or(args.max_parallel).max(1);
+    let pool_cap = u32::try_from(args.restore_jobs.max(verify_concurrency).max(4)).unwrap_or(16);
+
+    Arc::new(Config {
+        source: db::DbArgs {
+            host: args.from_host,
+            port: args.from_port,
+            user: args.from_user,
+            pass: args.from_pass,
+        },
+        source_db: args.from_db,
+        destination: db::DbArgs {
+            host: args.to_host,
+            port: args.to_port,
+            user: args.to_user,
+            pass: args.to_pass,
+        },
+        destination_db: args.to_db,
+        dump_jobs: args.dump_jobs,
+        restore_jobs: args.restore_jobs,
+        max_parallel: args.max_parallel,
+        dump_parallel,
+        restore_parallel,
+        dump_root: args.dump_root.into(),
+        migrate_globals: args.migrate_globals,
+        disable_dst_optimizations: args.disable_dst_optimizations,
+        delay_table_data: args.delay_table_data,
+        fast_verify: args.fast_verify,
+        verify_concurrency,
+        pool_cache: db::PoolCache::new(pool_cap),
+        verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
+    })
+}
+
+async fn prepare_destination(
+    config: &Config,
+    db_names: &[String],
+    cancel: CancellationToken,
+) -> Result<()> {
+    if !config.disable_dst_optimizations {
+        db::enable_fast_restore(config, cancel.clone()).await?;
+    }
+
+    if config.migrate_globals {
+        db::migrate_globals(config, cancel.clone()).await?;
+    }
+
+    db::create_dbs(config, db_names, cancel.clone()).await?;
     Ok(())
 }

@@ -1,11 +1,24 @@
+use crate::Config;
+use crate::db;
 use crate::error::{Error, MigrationPhase, Result};
 use crate::tui::SharedMigrationStates;
-use crate::{Config, db, verification};
+use crate::verification;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone)]
+struct PipelineArgs {
+    config: Arc<Config>,
+    db_name: String,
+    size: u64,
+    states: SharedMigrationStates,
+    cancel: CancellationToken,
+    dump_sem: Arc<Semaphore>,
+    restore_sem: Arc<Semaphore>,
+}
 
 pub async fn phase_migrate_all(
     config: Arc<Config>,
@@ -16,61 +29,46 @@ pub async fn phase_migrate_all(
     restore_sem: Arc<Semaphore>,
 ) -> Result<(Duration, Duration)> {
     let start = Instant::now();
-    let mut pipeline_tasks = JoinSet::new();
+    let regular_done = Arc::new(Notify::new());
+
+    let mut regular_tasks = JoinSet::new();
+    let mut delayed_tasks = JoinSet::new();
 
     for (db_name, size) in db_names_with_sizes {
-        let dump_permit = acquire(&dump_sem, cancel).await?;
-        let config_clone = config.clone();
-        let cancel_clone = cancel.clone();
-        let dump_sem_clone = dump_sem.clone();
-        let restore_sem_clone = restore_sem.clone();
-        let states_clone = states.clone();
-        let db_clone = db_name.clone();
+        let db_name_owned = db_name.clone();
         let size_val = *size;
 
-        pipeline_tasks.spawn(async move {
-            let result = run_pipeline(
-                &config_clone,
-                &db_clone,
-                size_val,
-                states_clone.clone(),
-                &cancel_clone,
-                dump_permit,
-                &dump_sem_clone,
-                &restore_sem_clone,
-            )
-            .await;
+        let args = PipelineArgs {
+            config: config.clone(),
+            db_name: db_name_owned.clone(),
+            size: size_val,
+            states: states.clone(),
+            cancel: cancel.clone(),
+            dump_sem: dump_sem.clone(),
+            restore_sem: restore_sem.clone(),
+        };
 
-            if let Err(error) = &result
-                && let Ok(mut lock) = states_clone.lock()
-            {
-                lock.fail(&db_clone, error.to_string());
-            }
+        // Spawn regular pipeline
+        regular_tasks.spawn(run_regular_pipeline(args.clone()));
 
-            result
-        });
+        // Spawn delayed pipeline if matching flags
+        if has_delayed(&config, &db_name_owned) {
+            delayed_tasks.spawn(run_delayed_pipeline(args, regular_done.clone()));
+        }
     }
 
+    // Wait for all regular pipelines to succeed
     loop {
         tokio::select! {
-            pipeline_result = pipeline_tasks.join_next() => {
-                match pipeline_result {
+            res = regular_tasks.join_next() => {
+                match res {
                     Some(res) => {
                         match res? {
                             Ok(()) => {}
                             Err(e) => {
-                                let was_cancelled = cancel.is_cancelled();
-
-                                if !was_cancelled {
-                                    cancel.cancel();
-                                }
-
-                                pipeline_tasks.abort_all();
-
-                                if was_cancelled {
-                                    return Err(Error::Cancelled("user".to_string()));
-                                }
-
+                                cancel.cancel();
+                                regular_tasks.abort_all();
+                                delayed_tasks.abort_all();
                                 return Err(e);
                             }
                         }
@@ -79,7 +77,36 @@ pub async fn phase_migrate_all(
                 }
             }
             () = cancel.cancelled() => {
-                pipeline_tasks.abort_all();
+                regular_tasks.abort_all();
+                delayed_tasks.abort_all();
+                return Err(Error::Cancelled("user".to_string()));
+            }
+        }
+    }
+
+    // Signal all delayed pipelines that they can proceed to restore phase
+    regular_done.notify_waiters();
+
+    // Wait for all delayed pipelines to succeed
+    loop {
+        tokio::select! {
+            res = delayed_tasks.join_next() => {
+                match res {
+                    Some(res) => {
+                        match res? {
+                            Ok(()) => {}
+                            Err(e) => {
+                                cancel.cancel();
+                                delayed_tasks.abort_all();
+                                return Err(e);
+                            }
+                        }
+                    }
+                    None => break,
+                }
+            }
+            () = cancel.cancelled() => {
+                delayed_tasks.abort_all();
                 return Err(Error::Cancelled("user".to_string()));
             }
         }
@@ -99,6 +126,14 @@ pub async fn phase_migrate_all(
     Ok((regular_duration, total_duration))
 }
 
+fn has_delayed(config: &Config, db_name: &str) -> bool {
+    let db_prefix = format!("{db_name}.");
+    config
+        .delay_table_data
+        .iter()
+        .any(|d| d.starts_with(&db_prefix))
+}
+
 async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<OwnedSemaphorePermit> {
     tokio::select! {
         res = sem.clone().acquire_owned() => Ok(res?),
@@ -106,53 +141,175 @@ async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<Own
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_pipeline(
-    config: &Config,
-    db_name: &str,
-    size: u64,
-    states: SharedMigrationStates,
-    cancel: &CancellationToken,
-    dump_permit: OwnedSemaphorePermit,
-    dump_sem: &Arc<Semaphore>,
-    restore_sem: &Arc<Semaphore>,
-) -> Result<()> {
-    let res = async {
+async fn run_regular_pipeline(args: PipelineArgs) -> Result<()> {
+    let PipelineArgs {
+        config,
+        db_name,
+        size,
+        states,
+        cancel,
+        dump_sem,
+        restore_sem,
+    } = args;
+
+    let res: Result<()> = async {
         phase_migrate_one(
-            config,
-            db_name,
+            &config,
+            &db_name,
             size,
             states.clone(),
-            cancel,
-            dump_permit,
-            restore_sem,
+            &cancel,
+            acquire(&dump_sem, &cancel).await?,
+            &restore_sem,
         )
         .await?;
+
         states
             .lock()
             .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .mark_regular_done(db_name);
-        phase_finalize_one(
-            config,
-            db_name,
-            size,
-            states.clone(),
-            cancel,
-            dump_sem,
-            restore_sem,
-        )
-        .await?;
+            .mark_regular_done(&db_name);
+
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(&db_name, MigrationPhase::Complete, 6, "migration complete");
+
         Ok(())
     }
     .await;
+
+    if let Err(error) = &res
+        && let Ok(mut lock) = states.lock()
+    {
+        lock.fail(&db_name, error.to_string());
+    }
 
     res.map_err(|e: Error| {
         let (phase, step) = states
             .lock()
             .ok()
-            .and_then(|s| s.get_state(db_name))
+            .and_then(|s| s.get_state(&db_name))
             .unwrap_or((MigrationPhase::Pending, 0));
         e.with_context(db_name, phase, step)
+    })
+}
+
+async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> Result<()> {
+    let PipelineArgs {
+        config,
+        db_name,
+        size: _,
+        states,
+        cancel,
+        dump_sem,
+        restore_sem,
+    } = args;
+
+    let delayed_name = format!("{db_name} (delayed)");
+    let regular_done_fut = regular_done.notified();
+
+    let res: Result<()> = async {
+        // Phase 1: Delayed Dumping
+        {
+            let _dump_permit = acquire(&dump_sem, &cancel).await?;
+            states
+                .lock()
+                .map_err(|e| Error::LockPoisoned(e.to_string()))?
+                .update(
+                    &delayed_name,
+                    MigrationPhase::DelayedDumping,
+                    1,
+                    "dumping delayed table data",
+                );
+            db::dump_delayed_data(&config, &db_name, cancel.clone()).await?;
+        }
+
+        // Wait for regular pipelines to finish before proceeding to restore phases
+        regular_done_fut.await;
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled(
+                "regular pipelines finished with error".to_string(),
+            ));
+        }
+
+        let _restore_permit = acquire(&restore_sem, &cancel).await?;
+
+        // Phase 2: Dropping indexes on destination
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                &delayed_name,
+                MigrationPhase::DelayedDroppingIndexes,
+                2,
+                "dropping secondary indexes on delayed tables",
+            );
+        db::drop_delayed_indexes(&config, &db_name, cancel.clone()).await?;
+
+        // Phase 3: Delayed Restoring
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                &delayed_name,
+                MigrationPhase::DelayedRestoring,
+                3,
+                "restoring delayed table data",
+            );
+        db::restore_delayed_data(&config, &db_name, cancel.clone()).await?;
+
+        // Phase 4: Recreating indexes on destination
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                &delayed_name,
+                MigrationPhase::DelayedRecreatingIndexes,
+                4,
+                "recreating secondary indexes on delayed tables",
+            );
+        db::recreate_delayed_indexes(&config, &db_name, cancel.clone()).await?;
+
+        // Phase 5: Delayed Verifying
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                &delayed_name,
+                MigrationPhase::DelayedVerifying,
+                5,
+                "verifying all row counts (including delayed)",
+            );
+        verification::verify_db(&config, &db_name, true, cancel.clone()).await?;
+
+        // Phase 6: Complete
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                &delayed_name,
+                MigrationPhase::Complete,
+                6,
+                "migration complete (with delayed data)",
+            );
+
+        Ok(())
+    }
+    .await;
+
+    if let Err(error) = &res
+        && let Ok(mut lock) = states.lock()
+    {
+        lock.fail(&delayed_name, error.to_string());
+    }
+
+    res.map_err(|e: Error| {
+        let (phase, step) = states
+            .lock()
+            .ok()
+            .and_then(|s| s.get_state(&delayed_name))
+            .unwrap_or((MigrationPhase::Pending, 0));
+        e.with_context(delayed_name, phase, step)
     })
 }
 
@@ -181,7 +338,7 @@ async fn phase_migrate_one(
     states
         .lock()
         .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(db_name, MigrationPhase::Restoring, 3, "restoring database");
+        .update(db_name, MigrationPhase::Restoring, 2, "restoring database");
 
     db::restore_db(config, db_name, size, cancel.clone()).await?;
 
@@ -191,7 +348,7 @@ async fn phase_migrate_one(
         .update(
             db_name,
             MigrationPhase::SourceCounts,
-            2,
+            3,
             "computing source row counts",
         );
 
@@ -236,108 +393,6 @@ async fn phase_migrate_one(
         );
 
     verification::verify_db(config, db_name, false, cancel.clone()).await?;
-
-    Ok(())
-}
-
-async fn phase_finalize_one(
-    config: &Config,
-    db_name: &str,
-    _size: u64,
-    states: SharedMigrationStates,
-    cancel: &CancellationToken,
-    dump_sem: &Arc<Semaphore>,
-    restore_sem: &Arc<Semaphore>,
-) -> Result<()> {
-    let db_prefix = format!("{db_name}.");
-    let has_delayed = config
-        .delay_table_data
-        .iter()
-        .any(|d| d.starts_with(&db_prefix));
-
-    if !has_delayed {
-        states
-            .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(db_name, MigrationPhase::Complete, 6, "migration complete");
-        return Ok(());
-    }
-
-    {
-        let _dump_permit = acquire(dump_sem, cancel).await?;
-
-        states
-            .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(
-                db_name,
-                MigrationPhase::DelayedDumping,
-                7,
-                "dumping delayed table data",
-            );
-
-        db::dump_data(config, db_name, cancel.clone()).await?;
-    }
-
-    let _restore_permit = acquire(restore_sem, cancel).await?;
-
-    states
-        .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(
-            db_name,
-            MigrationPhase::DelayedDroppingIndexes,
-            8,
-            "dropping secondary indexes on delayed tables",
-        );
-
-    db::drop_delayed_indexes(config, db_name, cancel.clone()).await?;
-
-    states
-        .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(
-            db_name,
-            MigrationPhase::DelayedRestoring,
-            9,
-            "restoring delayed table data",
-        );
-
-    db::restore_delayed_data(config, db_name, cancel.clone()).await?;
-
-    states
-        .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(
-            db_name,
-            MigrationPhase::DelayedRecreatingIndexes,
-            10,
-            "recreating secondary indexes on delayed tables",
-        );
-
-    db::recreate_delayed_indexes(config, db_name, cancel.clone()).await?;
-
-    states
-        .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(
-            db_name,
-            MigrationPhase::DelayedVerifying,
-            11,
-            "verifying all row counts (including delayed)",
-        );
-
-    verification::verify_db(config, db_name, true, cancel.clone()).await?;
-
-    states
-        .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(
-            db_name,
-            MigrationPhase::Complete,
-            11,
-            "migration complete (with delayed data)",
-        );
 
     Ok(())
 }

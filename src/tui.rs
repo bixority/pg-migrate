@@ -28,23 +28,27 @@ pub struct MigrationStates {
 impl MigrationStates {
     #[must_use]
     pub fn new(dbs_with_sizes: &[(String, u64)], config: &Config) -> Self {
-        let mut order = Vec::with_capacity(dbs_with_sizes.len());
-        let states = dbs_with_sizes
-            .iter()
-            .map(|(db, size)| {
-                order.push(db.clone());
-                let mut state = MigrationState::new(db.clone(), *size);
-                let db_prefix = format!("{db}.");
-                if config
-                    .delay_table_data
-                    .iter()
-                    .any(|d| d.starts_with(&db_prefix))
-                {
-                    state.total_steps = 11;
-                }
-                (db.clone(), state)
-            })
-            .collect();
+        let mut order = Vec::new();
+        let mut states = BTreeMap::new();
+
+        for (db, size) in dbs_with_sizes {
+            order.push(db.clone());
+            let state = MigrationState::new(db.clone(), *size);
+            states.insert(db.clone(), state);
+
+            let db_prefix = format!("{db}.");
+            if config
+                .delay_table_data
+                .iter()
+                .any(|d| d.starts_with(&db_prefix))
+            {
+                let delayed_name = format!("{db} (delayed)");
+                order.push(delayed_name.clone());
+                let mut delayed_state = MigrationState::new(delayed_name.clone(), *size);
+                delayed_state.total_steps = 6;
+                states.insert(delayed_name, delayed_state);
+            }
+        }
 
         order.sort();
         Self { states, order }
@@ -106,14 +110,18 @@ impl MigrationStates {
             let Some(state) = self.states.get(name) else {
                 continue;
             };
-            let size = indicatif::HumanBytes(state.size);
+            let size_str = if name.ends_with(" (delayed)") {
+                String::new()
+            } else {
+                indicatif::HumanBytes(state.size).to_string()
+            };
             let phase = colored_phase(&state.phase);
             let percent = state.percent();
 
             let _ = writeln!(
                 output,
                 "{:<32} | {:>10} | {:>32} | {:>3}% | {}",
-                state.db, size, phase, percent, state.display
+                state.db, size_str, phase, percent, state.display
             );
         }
 

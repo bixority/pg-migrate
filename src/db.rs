@@ -93,6 +93,10 @@ pub fn dump_dir(root: &Path, db: &str) -> PathBuf {
     root.join(db)
 }
 
+pub fn delayed_dump_dir(root: &Path, db: &str) -> PathBuf {
+    root.join(format!("{db}_delayed"))
+}
+
 type PoolKey = (String, u16, String, String);
 
 #[derive(Clone)]
@@ -110,7 +114,6 @@ impl PoolCache {
         }
     }
 
-    #[allow(clippy::significant_drop_tightening)]
     pub async fn get(&self, args: &DbArgs, db: &str) -> Result<PgPool> {
         let key = (
             args.host.clone(),
@@ -118,8 +121,7 @@ impl PoolCache {
             args.user.clone(),
             db.to_string(),
         );
-        let mut guard = self.inner.lock().await;
-        if let Some(p) = guard.get(&key) {
+        if let Some(p) = self.inner.lock().await.get(&key) {
             return Ok(p.clone());
         }
         let opts = PgConnectOptions::new()
@@ -135,7 +137,7 @@ impl PoolCache {
             .acquire_timeout(Duration::from_mins(1))
             .connect_with(opts)
             .await?;
-        guard.insert(key, pool.clone());
+        self.inner.lock().await.insert(key, pool.clone());
         Ok(pool)
     }
 }
@@ -363,8 +365,8 @@ pub async fn restore_db(
     Ok(())
 }
 
-pub async fn dump_data(config: &Config, db: &str, cancel: CancellationToken) -> Result<()> {
-    let dump_path = dump_dir(&config.dump_root, db).join("delayed");
+pub async fn dump_delayed_data(config: &Config, db: &str, cancel: CancellationToken) -> Result<()> {
+    let dump_path = delayed_dump_dir(&config.dump_root, db);
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
@@ -445,7 +447,7 @@ pub async fn restore_delayed_data(
     db: &str,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let dump_path = dump_dir(&config.dump_root, db).join("delayed");
+    let dump_path = delayed_dump_dir(&config.dump_root, db);
 
     if !dump_path.join("toc.dat").exists() {
         return Ok(());
