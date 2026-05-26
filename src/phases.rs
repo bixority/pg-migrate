@@ -19,6 +19,7 @@ pub async fn phase_migrate_all(
     let mut pipeline_tasks = JoinSet::new();
 
     for (db_name, size) in db_names_with_sizes {
+        let dump_permit = acquire(&dump_sem, cancel).await?;
         let config_clone = config.clone();
         let cancel_clone = cancel.clone();
         let dump_sem_clone = dump_sem.clone();
@@ -34,6 +35,7 @@ pub async fn phase_migrate_all(
                 size_val,
                 states_clone.clone(),
                 &cancel_clone,
+                dump_permit,
                 &dump_sem_clone,
                 &restore_sem_clone,
             )
@@ -104,12 +106,14 @@ async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<Own
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_pipeline(
     config: &Config,
     db_name: &str,
     size: u64,
     states: SharedMigrationStates,
     cancel: &CancellationToken,
+    dump_permit: OwnedSemaphorePermit,
     dump_sem: &Arc<Semaphore>,
     restore_sem: &Arc<Semaphore>,
 ) -> Result<()> {
@@ -120,7 +124,7 @@ async fn run_pipeline(
             size,
             states.clone(),
             cancel,
-            dump_sem,
+            dump_permit,
             restore_sem,
         )
         .await?;
@@ -158,11 +162,11 @@ async fn phase_migrate_one(
     size: u64,
     states: SharedMigrationStates,
     cancel: &CancellationToken,
-    dump_sem: &Arc<Semaphore>,
+    dump_permit: OwnedSemaphorePermit,
     restore_sem: &Arc<Semaphore>,
 ) -> Result<()> {
     {
-        let _dump_permit = acquire(dump_sem, cancel).await?;
+        let _dump_permit = dump_permit;
 
         states
             .lock()

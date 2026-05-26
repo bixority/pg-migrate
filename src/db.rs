@@ -167,6 +167,9 @@ pub async fn discover_databases(
         let size: i64 = row.get(1);
         dbs.push((name, size.max(0).try_into().unwrap_or(0)));
     }
+
+    dbs.sort_by_key(|&(_, size)| size);
+
     Ok(dbs)
 }
 

@@ -22,14 +22,17 @@ pub fn migration_style() -> Result<ProgressStyle> {
 #[derive(Clone, Debug)]
 pub struct MigrationStates {
     states: BTreeMap<String, MigrationState>,
+    order: Vec<String>,
 }
 
 impl MigrationStates {
     #[must_use]
     pub fn new(dbs_with_sizes: &[(String, u64)], config: &Config) -> Self {
+        let mut order = Vec::with_capacity(dbs_with_sizes.len());
         let states = dbs_with_sizes
             .iter()
             .map(|(db, size)| {
+                order.push(db.clone());
                 let mut state = MigrationState::new(db.clone(), *size);
                 let db_prefix = format!("{db}.");
                 if config
@@ -43,7 +46,8 @@ impl MigrationStates {
             })
             .collect();
 
-        Self { states }
+        order.sort();
+        Self { states, order }
     }
 
     pub fn update(
@@ -89,23 +93,26 @@ impl MigrationStates {
 
         let _ = writeln!(
             output,
-            "{:<32} | {:>7} | {:<16} | {:>4} | Status",
+            "{:<32} | {:>10} | {:<32} | {:>4} | Status",
             "Database", "Size", "Phase", "%"
         );
         let _ = writeln!(
             output,
-            "{:-<32}-|-{:-<7}-|-{:-<16}-|-{:-<4}-|-{:-<40}",
+            "{:-<32}-|-{:-<10}-|-{:-<32}-|-{:-<4}-|-{:-<40}",
             "", "", "", "", ""
         );
 
-        for state in self.states.values() {
+        for name in &self.order {
+            let Some(state) = self.states.get(name) else {
+                continue;
+            };
             let size = indicatif::HumanBytes(state.size);
             let phase = colored_phase(&state.phase);
             let percent = state.percent();
 
             let _ = writeln!(
                 output,
-                "{:<32} | {:>7} | {:<16} | {:>3}% | {}",
+                "{:<32} | {:>10} | {:>32} | {:>3}% | {}",
                 state.db, size, phase, percent, state.display
             );
         }
