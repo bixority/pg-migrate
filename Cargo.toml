@@ -1,6 +1,6 @@
 [package]
 name = "pg-migrate"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
@@ -44,5 +44,9 @@ incremental = true
 codegen-units = 1
 debug = false
 lto = "fat"
-opt-level = "z"
+opt-level = 3
+panic = "abort"
 strip = true
+
+[profile.release.package."*"]
+opt-level = 3

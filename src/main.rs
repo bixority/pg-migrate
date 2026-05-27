@@ -26,21 +26,23 @@ pub struct Config {
     pub destination: db::DbArgs,
     pub destination_db: String,
 
-    pub dump_jobs: usize,
-    pub restore_jobs: usize,
-    pub max_parallel: usize,
+    pub dump_root: PathBuf,
     pub dump_parallel: usize,
+    pub dump_jobs: usize,
+    pub zstd_level: u8,
+
+    pub restore_jobs: usize,
     pub restore_parallel: usize,
 
-    pub dump_root: PathBuf,
+    pub max_parallel: usize,
     pub migrate_globals: bool,
     pub delay_table_data: Vec<String>,
 
+    pub verify_sem: Arc<Semaphore>,
     pub fast_verify: bool,
     pub verify_concurrency: usize,
 
     pub pool_cache: db::PoolCache,
-    pub verify_sem: Arc<Semaphore>,
 }
 
 /// Returns the user's home directory.
@@ -117,6 +119,13 @@ struct Args {
     fast_verify: bool,
     #[arg(long, default_value_t = 16)]
     verify_concurrency: usize,
+    #[arg(
+        short = 'c',
+        long,
+        value_parser = clap::value_parser!(u8).range(1..=22),
+        default_value_t = 5
+    )]
+    zstd_level: u8,
 }
 
 #[tokio::main]
@@ -275,6 +284,7 @@ fn build_config(args: Args) -> Arc<Config> {
         verify_concurrency,
         pool_cache: db::PoolCache::new(pool_cap),
         verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
+        zstd_level: args.zstd_level,
     })
 }
 

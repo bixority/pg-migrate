@@ -199,6 +199,7 @@ pub async fn dump_db(
     if !dump_path.join("toc.dat").exists() {
         let port = config.source.port.to_string();
         let mut command = Command::new("pg_dump");
+        let zstd_level = config.zstd_level;
         command.kill_on_drop(true);
         command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
@@ -211,7 +212,7 @@ pub async fn dump_db(
             "-j",
             &config.dump_jobs.to_string(),
             "-Z",
-            "zstd:22",
+            &format!("zstd:{zstd_level}"),
             "-f",
             dump_path
                 .to_str()
@@ -370,6 +371,7 @@ pub async fn dump_delayed_data(config: &Config, db: &str, cancel: CancellationTo
     if !dump_path.join("toc.dat").exists() {
         let port = config.source.port.to_string();
         let mut command = Command::new("pg_dump");
+        let zstd_level = config.zstd_level;
         command.kill_on_drop(true);
         command.env("PGPASSWORD", &config.source.pass).args([
             "-h",
@@ -382,7 +384,7 @@ pub async fn dump_delayed_data(config: &Config, db: &str, cancel: CancellationTo
             "-j",
             &config.dump_jobs.to_string(),
             "-Z",
-            "zstd:22",
+            &format!("zstd:{zstd_level}"),
             "--data-only",
             "-f",
             dump_path
