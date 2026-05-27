@@ -234,19 +234,7 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
 
         let _restore_permit = acquire(&restore_sem, &cancel).await?;
 
-        // Phase 2: Dropping indexes on destination
-        states
-            .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(
-                &delayed_name,
-                MigrationPhase::DelayedDroppingIndexes,
-                2,
-                "dropping secondary indexes on delayed tables",
-            );
-        db::drop_delayed_indexes(&config, &db_name, cancel.clone()).await?;
-
-        // Phase 3: Delayed Restoring
+        // Phase 2: Delayed Restoring
         states
             .lock()
             .map_err(|e| Error::LockPoisoned(e.to_string()))?
@@ -258,19 +246,7 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
             );
         db::restore_delayed_data(&config, &db_name, cancel.clone()).await?;
 
-        // Phase 4: Recreating indexes on destination
-        states
-            .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(
-                &delayed_name,
-                MigrationPhase::DelayedRecreatingIndexes,
-                4,
-                "recreating secondary indexes on delayed tables",
-            );
-        db::recreate_delayed_indexes(&config, &db_name, cancel.clone()).await?;
-
-        // Phase 5: Delayed Verifying
+        // Phase 3: Delayed Verifying
         states
             .lock()
             .map_err(|e| Error::LockPoisoned(e.to_string()))?
@@ -282,7 +258,7 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
             );
         verification::verify_db(&config, &db_name, true, cancel.clone()).await?;
 
-        // Phase 6: Complete
+        // Phase 4: Complete
         states
             .lock()
             .map_err(|e| Error::LockPoisoned(e.to_string()))?

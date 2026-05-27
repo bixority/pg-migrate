@@ -34,7 +34,6 @@ pub struct Config {
 
     pub dump_root: PathBuf,
     pub migrate_globals: bool,
-    pub disable_dst_optimizations: bool,
     pub delay_table_data: Vec<String>,
 
     pub fast_verify: bool,
@@ -112,8 +111,6 @@ struct Args {
     dump_root: String,
     #[arg(long, default_value_t = true)]
     migrate_globals: bool,
-    #[arg(long, default_value_t = false)]
-    disable_dst_optimizations: bool,
     #[arg(long, value_name = "DATABASE.TABLE_PATTERN")]
     delay_table_data: Vec<String>,
     #[arg(long, default_value_t = false)]
@@ -194,16 +191,9 @@ async fn main() -> Result<()> {
     let (regular_duration, migration_duration) = match migrate_result {
         Ok(res) => res,
         Err(e) => {
-            if !config.disable_dst_optimizations {
-                let _ = db::restore_safe_settings(&config, CancellationToken::new()).await;
-            }
             return Err(e);
         }
     };
-
-    if !config.disable_dst_optimizations {
-        db::restore_safe_settings(&config, CancellationToken::new()).await?;
-    }
 
     let final_table = states
         .lock()
@@ -231,7 +221,7 @@ fn setup_ui(
     config: &Config,
     cancel: CancellationToken,
 ) -> Result<(
-    crate::tui::SharedMigrationStates,
+    tui::SharedMigrationStates,
     ProgressBar,
     tokio::task::JoinHandle<()>,
 )> {
@@ -280,7 +270,6 @@ fn build_config(args: Args) -> Arc<Config> {
         restore_parallel,
         dump_root: args.dump_root.into(),
         migrate_globals: args.migrate_globals,
-        disable_dst_optimizations: args.disable_dst_optimizations,
         delay_table_data: args.delay_table_data,
         fast_verify: args.fast_verify,
         verify_concurrency,
@@ -294,10 +283,6 @@ async fn prepare_destination(
     db_names: &[String],
     cancel: CancellationToken,
 ) -> Result<()> {
-    if !config.disable_dst_optimizations {
-        db::enable_fast_restore(config, cancel.clone()).await?;
-    }
-
     if config.migrate_globals {
         db::migrate_globals(config, cancel.clone()).await?;
     }
