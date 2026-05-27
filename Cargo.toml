@@ -38,7 +38,9 @@ unwrap_used = "deny"
 needless_for_each = { level = "allow", priority = 1 }
 
 [profile.dev]
+debug = true
 incremental = true
+opt-level = 0
 
 [profile.release]
 codegen-units = 1
@@ -49,4 +51,7 @@ panic = "abort"
 strip = true
 
 [profile.release.package."*"]
+codegen-units = 1
+debug = false
 opt-level = 3
+strip = true
