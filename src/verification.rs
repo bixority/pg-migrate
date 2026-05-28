@@ -86,30 +86,35 @@ pub async fn verify_db(
 
     let (output, mismatch) = render_verification_report(db_name, &src_map, &dst_map);
 
+    info!("{output}");
+
     if mismatch {
+        let delayed_mismatch = include_delayed
+            && delayed_count_mismatch(db_name, &config.delay_table_data, &src_map, &dst_map);
+        let non_delayed_mismatch =
+            non_delayed_count_mismatch(db_name, &config.delay_table_data, &src_map, &dst_map);
+
         if config.fast_verify {
-            let delayed_mismatch = include_delayed
-                && delayed_count_mismatch(db_name, &config.delay_table_data, &src_map, &dst_map);
-            info!("{output}");
             if delayed_mismatch {
+                warn!("Delayed-table row counts mismatch for {db_name}");
+            }
+            if non_delayed_mismatch {
+                warn!(
+                    "Fast verification mismatch for {db_name} (non-delayed estimates may differ; \
+                     ANALYZE both sides for closer values)"
+                );
+            }
+        } else {
+            if non_delayed_mismatch {
                 return Err(Error::VerificationFailed {
                     database: db_name.to_string(),
-                    details: "delayed-table row counts mismatch".to_string(),
+                    details: "tables or row counts mismatch".to_string(),
                 });
             }
-            warn!(
-                "Fast verification mismatch for {db_name} (non-delayed estimates may differ; \
-                 ANALYZE both sides for closer values)"
-            );
-        } else {
-            info!("{output}");
-            return Err(Error::VerificationFailed {
-                database: db_name.to_string(),
-                details: "tables or row counts mismatch".to_string(),
-            });
+            if delayed_mismatch {
+                warn!("Delayed-table row counts mismatch for {db_name}");
+            }
         }
-    } else {
-        info!("{output}");
     }
 
     info!(
@@ -138,6 +143,25 @@ fn delayed_count_mismatch(
             return false;
         };
         if !is_delayed_table(db_name, schema, table, delay_table_data) {
+            return false;
+        }
+        src_map.get(*k) != dst_map.get(*k)
+    })
+}
+
+fn non_delayed_count_mismatch(
+    db_name: &str,
+    delay_table_data: &[String],
+    src_map: &BTreeMap<String, String>,
+    dst_map: &BTreeMap<String, String>,
+) -> bool {
+    let mut keys: HashSet<&String> = src_map.keys().collect();
+    keys.extend(dst_map.keys());
+    keys.iter().any(|k| {
+        let Some((schema, table)) = k.split_once('.') else {
+            return src_map.get(*k) != dst_map.get(*k);
+        };
+        if is_delayed_table(db_name, schema, table, delay_table_data) {
             return false;
         }
         src_map.get(*k) != dst_map.get(*k)
@@ -355,5 +379,110 @@ fn wildcard_matches_inner(pattern: &[u8], value: &[u8]) -> bool {
             pattern_byte == value_byte && wildcard_matches_inner(remaining_pattern, remaining_value)
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn test_is_delayed_table() {
+        let delay_table_data = vec!["db1.public.logs".to_string(), "db1.audit.*".to_string()];
+
+        assert!(is_delayed_table("db1", "public", "logs", &delay_table_data));
+        assert!(is_delayed_table(
+            "db1",
+            "audit",
+            "actions",
+            &delay_table_data
+        ));
+        assert!(!is_delayed_table(
+            "db1",
+            "public",
+            "users",
+            &delay_table_data
+        ));
+        assert!(!is_delayed_table(
+            "db2",
+            "public",
+            "logs",
+            &delay_table_data
+        ));
+    }
+
+    #[test]
+    fn test_mismatch_logic() {
+        let db_name = "db1";
+        let delay_table_data = vec!["db1.public.logs".to_string()];
+
+        let mut src_map = BTreeMap::new();
+        src_map.insert("public.users".to_string(), "100".to_string());
+        src_map.insert("public.logs".to_string(), "500".to_string());
+
+        let mut dst_map = BTreeMap::new();
+        dst_map.insert("public.users".to_string(), "100".to_string());
+        dst_map.insert("public.logs".to_string(), "500".to_string());
+
+        // No mismatch
+        assert!(!delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
+        assert!(!non_delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
+
+        // Delayed mismatch
+        dst_map.insert("public.logs".to_string(), "501".to_string());
+        assert!(delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
+        assert!(!non_delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
+
+        // Non-delayed mismatch
+        dst_map.insert("public.logs".to_string(), "500".to_string()); // reset
+        dst_map.insert("public.users".to_string(), "101".to_string());
+        assert!(!delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
+        assert!(non_delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
+
+        // Both mismatch
+        dst_map.insert("public.logs".to_string(), "501".to_string());
+        assert!(delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
+        assert!(non_delayed_count_mismatch(
+            db_name,
+            &delay_table_data,
+            &src_map,
+            &dst_map
+        ));
     }
 }

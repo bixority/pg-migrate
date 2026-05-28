@@ -97,12 +97,12 @@ impl MigrationStates {
 
         let _ = writeln!(
             output,
-            "{:<32} | {:>10} | {:<32} | {:>4} | Status",
+            "{:<32} | {:>11} | {:>21} | {:>4} | Status",
             "Database", "Size", "Phase", "%"
         );
         let _ = writeln!(
             output,
-            "{:-<32}-|-{:-<10}-|-{:-<32}-|-{:-<4}-|-{:-<40}",
+            "{:-<32}-|-{:-<11}-|-{:-<21}-|-{:-<4}-|-{:-<40}",
             "", "", "", "", ""
         );
 
@@ -120,7 +120,7 @@ impl MigrationStates {
 
             let _ = writeln!(
                 output,
-                "{:<32} | {:>10} | {:>32} | {:>3}% | {}",
+                "{:<32} | {:>11} | {:>30} | {:>3}% | {}",
                 state.db, size_str, phase, percent, state.display
             );
         }
@@ -133,7 +133,6 @@ fn colored_phase(phase: &MigrationPhase) -> String {
     match phase {
         MigrationPhase::Complete => format!("\x1b[32m{}\x1b[0m", phase.as_str()),
         MigrationPhase::Failed => format!("\x1b[31m{}\x1b[0m", phase.as_str()),
-        MigrationPhase::Pending => phase.as_str().to_string(),
         _ => format!("\x1b[36m{}\x1b[0m", phase.as_str()),
     }
 }
@@ -220,9 +219,22 @@ pub fn render_verification_report(
             "\x1b[31mMISMATCH\x1b[0m".to_string()
         };
 
+        let src_len = if src_row == "MISSING" {
+            7
+        } else {
+            src_row.len()
+        };
+        let dst_len = if dst_row == "MISSING" {
+            7
+        } else {
+            dst_row.len()
+        };
+        let src_padding = " ".repeat(15_usize.saturating_sub(src_len));
+        let dst_padding = " ".repeat(15_usize.saturating_sub(dst_len));
+
         let _ = writeln!(
             output,
-            "{t:<40} | {src_disp:<15} | {dst_disp:<15} | {status_colored}"
+            "{t:<40} | {src_disp}{src_padding} | {dst_disp}{dst_padding} | {status_colored}"
         );
     }
 
