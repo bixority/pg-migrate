@@ -14,14 +14,16 @@ BEGIN
             'CREATE TABLE %I (
                 id SERIAL PRIMARY KEY,
                 val TEXT,
-                created_at TIMESTAMP DEFAULT now()
+                created_at TIMESTAMP
             )',
             t_name
         );
 
         EXECUTE format(
-            'INSERT INTO %I (val)
-             SELECT ''value '' || g FROM generate_series(1, 1000000) g',
+            'INSERT INTO %I (val, created_at)
+             SELECT ''value '' || g,
+                    TIMESTAMP ''2021-06-02 00:00:00'' + (g - 1) * (INTERVAL ''5 years'' / 1000000)
+             FROM generate_series(1, 1000000) g',
             t_name
         );
 

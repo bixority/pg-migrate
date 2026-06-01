@@ -1,6 +1,8 @@
+pub mod copy_engine;
 mod db;
 mod error;
 mod phases;
+mod plan;
 mod tui;
 mod verification;
 
@@ -9,15 +11,40 @@ use crate::phases::phase_migrate_all;
 use crate::tui::{migration_style, redraw_loop, shared_migration_states};
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
-use log::info;
+use log::{info, warn};
+use serde::Deserialize;
 use std::{
     env, fs,
+    hash::{DefaultHasher, Hash, Hasher},
     path::PathBuf,
     sync::Arc,
     time::{Duration, Instant},
 };
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
+
+fn default_split_by_column() -> String {
+    "created_at".to_string()
+}
+
+#[derive(Debug, Deserialize, Clone, Hash)]
+pub struct CopyRule {
+    pub table: String,
+    #[serde(default = "default_split_by_column")]
+    pub split_by_column: String,
+    pub from: Option<String>,
+    pub till: Option<String>,
+    pub method: Option<String>,
+}
+
+impl CopyRule {
+    #[must_use]
+    pub fn rule_hash(&self) -> u64 {
+        let mut s = DefaultHasher::new();
+        self.hash(&mut s);
+        s.finish()
+    }
+}
 
 pub struct Config {
     pub source: db::DbArgs,
@@ -43,6 +70,8 @@ pub struct Config {
     pub verify_concurrency: usize,
 
     pub pool_cache: db::PoolCache,
+
+    pub copy_rules: Vec<CopyRule>,
 }
 
 /// Returns the user's home directory.
@@ -53,7 +82,7 @@ pub struct Config {
 pub fn home() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| Error::Other("HOME environment variable not set".to_string()))
+        .ok_or_else(|| Error::Env("HOME environment variable not set".to_string()))
 }
 
 /// Returns the directory used for state markers.
@@ -74,9 +103,48 @@ pub fn verify_dir() -> Result<PathBuf> {
     Ok(home()?.join("pg_verify_state"))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(default)]
+pub struct TomlConfig {
+    pub dump_jobs: usize,
+    pub restore_jobs: usize,
+    pub max_parallel: usize,
+    pub dump_parallel: Option<usize>,
+    pub restore_parallel: Option<usize>,
+    pub dump_root: String,
+    pub migrate_globals: bool,
+    pub delay_table_data: Option<Vec<String>>,
+    pub fast_verify: bool,
+    pub verify_concurrency: usize,
+    pub zstd_level: u8,
+    pub copy_rules: Option<Vec<CopyRule>>,
+}
+
+impl Default for TomlConfig {
+    fn default() -> Self {
+        Self {
+            dump_jobs: 24,
+            restore_jobs: 12,
+            max_parallel: 6,
+            dump_parallel: None,
+            restore_parallel: None,
+            dump_root: "pg_dumps".to_string(),
+            migrate_globals: true,
+            delay_table_data: None,
+            fast_verify: false,
+            verify_concurrency: 16,
+            zstd_level: 5,
+            copy_rules: None,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    #[arg(short, long, default_value = "config.toml")]
+    config: PathBuf,
+
     #[arg(long, default_value = "localhost")]
     from_host: String,
     #[arg(long, default_value_t = 5432)]
@@ -98,34 +166,6 @@ struct Args {
     to_pass: String,
     #[arg(long, default_value = "postgres")]
     to_db: String,
-
-    #[arg(long, default_value_t = 24)]
-    dump_jobs: usize,
-    #[arg(long, default_value_t = 12)]
-    restore_jobs: usize,
-    #[arg(short = 'p', long, default_value_t = 6)]
-    max_parallel: usize,
-    #[arg(long)]
-    dump_parallel: Option<usize>,
-    #[arg(long)]
-    restore_parallel: Option<usize>,
-    #[arg(long, default_value = "pg_dumps")]
-    dump_root: String,
-    #[arg(long, default_value_t = true)]
-    migrate_globals: bool,
-    #[arg(long, value_name = "DATABASE.TABLE_PATTERN")]
-    delay_table_data: Vec<String>,
-    #[arg(long, default_value_t = false)]
-    fast_verify: bool,
-    #[arg(long, default_value_t = 16)]
-    verify_concurrency: usize,
-    #[arg(
-        short = 'c',
-        long,
-        value_parser = clap::value_parser!(u8).range(1..=22),
-        default_value_t = 5
-    )]
-    zstd_level: u8,
 }
 
 #[tokio::main]
@@ -142,17 +182,70 @@ async fn main() -> Result<()> {
 
     indicatif_log_bridge::LogWrapper::new((*mp).clone(), logger)
         .try_init()
-        .map_err(|e| Error::Other(format!("failed to init log wrapper: {e}")))?;
+        .map_err(|e| Error::Env(format!("failed to init log wrapper: {e}")))?;
 
     let total_time_pb = mp.add(ProgressBar::new_spinner());
     total_time_pb.set_style(
         ProgressStyle::with_template("{spinner:.green} Total elapsed time: {elapsed_precise}")
-            .map_err(|e| Error::Other(format!("Invalid template: {e}")))?,
+            .map_err(|e| Error::Config(format!("Invalid progress style template: {e}")))?,
     );
     total_time_pb.enable_steady_tick(Duration::from_millis(100));
 
-    let config = build_config(args);
+    let config = build_config(args)?;
 
+    run_migration_workflow(config, mp, total_time_pb, start_time).await
+}
+
+/// Runs the copy engine for a specific table.
+///
+/// # Errors
+///
+/// Returns an error if:
+/// - Partitioning fails.
+/// - The copy operation fails.
+pub async fn run_copy_engine(
+    config: &Config,
+    db_name: &str,
+    table_name: &str,
+    column: &str,
+    from: Option<&str>,
+    till: Option<&str>,
+    method: Option<&str>,
+) -> Result<()> {
+    let source_conn = format!(
+        "host={} port={} user={} password={} dbname={}",
+        config.source.host, config.source.port, config.source.user, config.source.pass, db_name
+    );
+    let dest_conn = format!(
+        "host={} port={} user={} password={} dbname={}",
+        config.destination.host,
+        config.destination.port,
+        config.destination.user,
+        config.destination.pass,
+        db_name
+    );
+
+    let orchestrator = copy_engine::Orchestrator::new(
+        source_conn,
+        dest_conn,
+        table_name.to_string(),
+        config.max_parallel,
+    );
+
+    let partitions = copy_engine::Splitter::split(column, from, till, method, config.max_parallel)?;
+
+    orchestrator.run(partitions).await?;
+
+    info!("Copy migration for {table_name} finished successfully");
+    Ok(())
+}
+
+async fn run_migration_workflow(
+    config: Arc<Config>,
+    mp: Arc<MultiProgress>,
+    total_time_pb: ProgressBar,
+    start_time: Instant,
+) -> Result<()> {
     fs::create_dir_all(state_dir()?)?;
     fs::create_dir_all(verify_dir()?)?;
 
@@ -181,12 +274,15 @@ async fn main() -> Result<()> {
 
     prepare_destination(&config, &db_names_owned, cancel.clone()).await?;
 
+    let plan = plan::create_plan(config.clone(), &dbs_with_sizes, cancel.clone()).await?;
+    plan.print();
+
     let dump_sem = Arc::new(Semaphore::new(config.dump_parallel));
     let restore_sem = Arc::new(Semaphore::new(config.restore_parallel));
 
     let migrate_result = phase_migrate_all(
         config.clone(),
-        &dbs_with_sizes,
+        plan,
         states.clone(),
         &cancel,
         dump_sem,
@@ -197,12 +293,7 @@ async fn main() -> Result<()> {
     cancel.cancel();
     let _ = redraw_task.await;
 
-    let (regular_duration, migration_duration) = match migrate_result {
-        Ok(res) => res,
-        Err(e) => {
-            return Err(e);
-        }
-    };
+    let (regular_duration, migration_duration) = migrate_result?;
 
     let final_table = states
         .lock()
@@ -251,13 +342,36 @@ fn setup_ui(
     Ok((states, table_pb, redraw_task))
 }
 
-fn build_config(args: Args) -> Arc<Config> {
-    let verify_concurrency = args.verify_concurrency.max(1);
-    let dump_parallel = args.dump_parallel.unwrap_or(args.max_parallel).max(1);
-    let restore_parallel = args.restore_parallel.unwrap_or(args.max_parallel).max(1);
-    let pool_cap = u32::try_from(args.restore_jobs.max(verify_concurrency).max(4)).unwrap_or(16);
+fn build_config(args: Args) -> Result<Arc<Config>> {
+    let toml_config: TomlConfig = if args.config.exists() {
+        let content = fs::read_to_string(&args.config)?;
+        toml::from_str(&content)?
+    } else {
+        info!("Config file not found, using defaults");
+        TomlConfig::default()
+    };
 
-    Arc::new(Config {
+    let verify_concurrency = toml_config.verify_concurrency.max(1);
+    let dump_parallel = toml_config
+        .dump_parallel
+        .unwrap_or(toml_config.max_parallel)
+        .max(1);
+    let restore_parallel = toml_config
+        .restore_parallel
+        .unwrap_or(toml_config.max_parallel)
+        .max(1);
+
+    let zstd_level = if (1..=22).contains(&toml_config.zstd_level) {
+        toml_config.zstd_level
+    } else {
+        warn!(
+            "Invalid zstd_level: {}, must be between 1 and 22. Using default: 5",
+            toml_config.zstd_level
+        );
+        5
+    };
+
+    Ok(Arc::new(Config {
         source: db::DbArgs {
             host: args.from_host,
             port: args.from_port,
@@ -272,20 +386,21 @@ fn build_config(args: Args) -> Arc<Config> {
             pass: args.to_pass,
         },
         destination_db: args.to_db,
-        dump_jobs: args.dump_jobs,
-        restore_jobs: args.restore_jobs,
-        max_parallel: args.max_parallel,
+        dump_jobs: toml_config.dump_jobs,
+        restore_jobs: toml_config.restore_jobs,
+        max_parallel: toml_config.max_parallel,
         dump_parallel,
         restore_parallel,
-        dump_root: args.dump_root.into(),
-        migrate_globals: args.migrate_globals,
-        delay_table_data: args.delay_table_data,
-        fast_verify: args.fast_verify,
+        dump_root: toml_config.dump_root.into(),
+        migrate_globals: toml_config.migrate_globals,
+        delay_table_data: toml_config.delay_table_data.unwrap_or_default(),
+        fast_verify: toml_config.fast_verify,
         verify_concurrency,
-        pool_cache: db::PoolCache::new(pool_cap),
+        pool_cache: db::PoolCache::new(),
         verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
-        zstd_level: args.zstd_level,
-    })
+        zstd_level,
+        copy_rules: toml_config.copy_rules.unwrap_or_default(),
+    }))
 }
 
 async fn prepare_destination(
@@ -299,4 +414,125 @@ async fn prepare_destination(
 
     db::create_dbs(config, db_names, cancel.clone()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_toml_config_parsing_missing_delay_table_data() -> Result<()> {
+        let toml = "
+dump_jobs = 1
+restore_jobs = 1
+max_parallel = 1
+dump_root = \"/tmp\"
+migrate_globals = true
+fast_verify = false
+verify_concurrency = 1
+zstd_level = 1
+";
+        let config: TomlConfig = toml::from_str(toml)?;
+        assert!(config.delay_table_data.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_config_parsing_empty_string() -> Result<()> {
+        let toml = "";
+        let config: TomlConfig = toml::from_str(toml)?;
+        assert!(config.delay_table_data.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_config_parsing_empty_list_delay_table_data() -> Result<()> {
+        let toml = "
+dump_jobs = 1
+restore_jobs = 1
+max_parallel = 1
+dump_root = \"/tmp\"
+migrate_globals = true
+fast_verify = false
+verify_concurrency = 1
+zstd_level = 1
+delay_table_data = []
+";
+        let config: TomlConfig = toml::from_str(toml)?;
+        assert!(
+            config
+                .delay_table_data
+                .as_ref()
+                .ok_or_else(|| Error::Config("delay_table_data should be Some".into()))?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_config_parsing_copy_rules() -> Result<()> {
+        let toml = "
+dump_jobs = 1
+restore_jobs = 1
+max_parallel = 1
+dump_root = \"/tmp\"
+
+[[copy_rules]]
+table = \"mydb.large_table\"
+split_by_column = \"created_at\"
+from = \"2023-01-01\"
+till = \"2024-01-01\"
+";
+        let config: TomlConfig = toml::from_str(toml)?;
+        let rules = config
+            .copy_rules
+            .ok_or_else(|| Error::Config("copy_rules should be Some".into()))?;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].table, "mydb.large_table");
+        assert_eq!(rules[0].split_by_column, "created_at");
+        assert_eq!(rules[0].from.as_deref(), Some("2023-01-01"));
+        assert_eq!(rules[0].till.as_deref(), Some("2024-01-01"));
+        assert!(rules[0].method.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_config_parsing_copy_rules_hash() -> Result<()> {
+        let toml = "
+[[copy_rules]]
+table = \"mydb.skewed_table\"
+method = \"hash\"
+";
+        let config: TomlConfig = toml::from_str(toml)?;
+        let rules = config
+            .copy_rules
+            .ok_or_else(|| Error::Config("copy_rules should be Some".into()))?;
+        assert_eq!(rules.len(), 1);
+        assert_eq!(rules[0].method.as_deref(), Some("hash"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_toml_config_parsing_multiple_copy_rules_same_table() -> Result<()> {
+        let toml = "
+[[copy_rules]]
+table = \"mydb.table1\"
+from = \"2023-01-01\"
+till = \"2023-02-01\"
+
+[[copy_rules]]
+table = \"mydb.table1\"
+from = \"2023-02-01\"
+till = \"2023-03-01\"
+";
+        let config: TomlConfig = toml::from_str(toml)?;
+        let rules = config
+            .copy_rules
+            .ok_or_else(|| Error::Config("copy_rules should be Some".into()))?;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].table, "mydb.table1");
+        assert_eq!(rules[1].table, "mydb.table1");
+        assert_ne!(rules[0].rule_hash(), rules[1].rule_hash());
+        Ok(())
+    }
 }

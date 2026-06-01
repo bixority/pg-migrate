@@ -3,14 +3,10 @@ use crate::error::{Error, MigrationPhase, Result};
 use crate::state_dir;
 use indicatif::HumanBytes;
 use log::{info, warn};
-use sqlx::{
-    AssertSqlSafe, PgPool, Row,
-    postgres::{PgConnectOptions, PgPoolOptions},
-};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -19,6 +15,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::select;
 use tokio::sync::Mutex as AsyncMutex;
+use tokio_postgres::NoTls;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -99,44 +96,50 @@ type PoolKey = (String, u16, String, String);
 
 #[derive(Clone)]
 pub struct PoolCache {
-    inner: Arc<AsyncMutex<HashMap<PoolKey, PgPool>>>,
-    max_connections: u32,
+    inner: Arc<AsyncMutex<HashMap<PoolKey, Arc<tokio_postgres::Client>>>>,
 }
 
 impl PoolCache {
     #[must_use]
-    pub fn new(max_connections: u32) -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(AsyncMutex::new(HashMap::new())),
-            max_connections,
         }
     }
 
-    pub async fn get(&self, args: &DbArgs, db: &str) -> Result<PgPool> {
+    pub async fn get(&self, args: &DbArgs, db: &str) -> Result<Arc<tokio_postgres::Client>> {
         let key = (
             args.host.clone(),
             args.port,
             args.user.clone(),
             db.to_string(),
         );
-        if let Some(p) = self.inner.lock().await.get(&key) {
+        let mut lock = self.inner.lock().await;
+        if let Some(p) = lock.get(&key) {
             return Ok(p.clone());
         }
-        let opts = PgConnectOptions::new()
+
+        let mut config = tokio_postgres::Config::new();
+        config
             .host(&args.host)
             .port(args.port)
-            .username(&args.user)
+            .user(&args.user)
             .password(&args.pass)
-            .database(db);
-        let pool = PgPoolOptions::new()
-            .max_connections(self.max_connections)
-            .min_connections(0)
-            .idle_timeout(Some(Duration::from_secs(2)))
-            .acquire_timeout(Duration::from_mins(1))
-            .connect_with(opts)
-            .await?;
-        self.inner.lock().await.insert(key, pool.clone());
-        Ok(pool)
+            .dbname(db);
+
+        let (client, connection) = config.connect(NoTls).await?;
+
+        let db_name = db.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                log::error!("Database connection error for {db_name}: {e}");
+            }
+        });
+
+        let client = Arc::new(client);
+        lock.insert(key, client.clone());
+        drop(lock);
+        Ok(client)
     }
 }
 
@@ -150,14 +153,14 @@ pub async fn discover_databases(
     };
 
     let rows = select! {
-        res = sqlx::query(
+        res = pool.query(
             "SELECT datname, pg_database_size(datname) AS size \
              FROM pg_database \
              WHERE datname NOT IN ('postgres','template0','template1') \
              AND datallowconn IS TRUE \
              ORDER BY pg_database_size(datname) ASC;",
-        )
-        .fetch_all(&pool) => res?,
+             &[]
+        ) => res?,
         () = cancel.cancelled() => return Err(Error::Cancelled("database discovery".to_string())),
     };
 
@@ -185,10 +188,15 @@ pub fn delayed_done_marker(db: &str) -> Result<PathBuf> {
     Ok(state_dir()?.join(format!("{db}.delayed_done")))
 }
 
+pub fn copy_rule_done_marker(db: &str, table: &str, hash: u64) -> Result<PathBuf> {
+    Ok(state_dir()?.join(format!("{db}.{table}.copy.{hash:x}.done")))
+}
+
 pub async fn dump_db(
     config: &Config,
     db: &str,
     size: u64,
+    excludes: &[String],
     cancel: CancellationToken,
 ) -> Result<()> {
     let human_size = HumanBytes(size);
@@ -216,14 +224,11 @@ pub async fn dump_db(
             "-f",
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
         ]);
 
-        let db_prefix = format!("{db}.");
-        for delay in &config.delay_table_data {
-            if let Some(table_pattern) = delay.strip_prefix(&db_prefix) {
-                command.arg(format!("--exclude-table-data={table_pattern}"));
-            }
+        for table_pattern in excludes {
+            command.arg(format!("--exclude-table-data={table_pattern}"));
         }
 
         let mut child = command
@@ -238,7 +243,7 @@ pub async fn dump_db(
         let stderr = child.stderr.take();
 
         let status = select! {
-            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_dump wait failed: {e}")))?,
+            res = child.wait() => res?,
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
                 return Err(Error::Cancelled(format!("pg_dump of {db}")));
@@ -281,10 +286,10 @@ pub async fn restore_db(
     fs::create_dir_all(&dump_path)?;
 
     if !dump_path.join("toc.dat").exists() {
-        return Err(Error::Other(format!(
-            "Dump not found for {db} at {}",
-            dump_path.display()
-        )));
+        return Err(Error::DumpNotFound {
+            database: db.to_string(),
+            path: dump_path.display().to_string(),
+        });
     }
 
     let port = config.destination.port.to_string();
@@ -305,7 +310,7 @@ pub async fn restore_db(
             db,
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -320,7 +325,7 @@ pub async fn restore_db(
 
     let wait_fut = async {
         select! {
-            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_restore wait failed: {e}"))),
+            res = child.wait() => res.map_err(Error::from),
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
                 Err(Error::Cancelled(format!("pg_restore of {db}")))
@@ -364,7 +369,17 @@ pub async fn restore_db(
     Ok(())
 }
 
-pub async fn dump_delayed_data(config: &Config, db: &str, cancel: CancellationToken) -> Result<()> {
+pub async fn dump_delayed_data(
+    config: &Config,
+    db: &str,
+    tables: &[String],
+    copy_excludes: &[String],
+    cancel: CancellationToken,
+) -> Result<()> {
+    if tables.is_empty() {
+        return Ok(());
+    }
+
     let dump_path = delayed_dump_dir(&config.dump_root, db);
     fs::create_dir_all(&dump_path)?;
 
@@ -389,20 +404,15 @@ pub async fn dump_delayed_data(config: &Config, db: &str, cancel: CancellationTo
             "-f",
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
         ]);
 
-        let db_prefix = format!("{db}.");
-        let mut has_delayed = false;
-        for delay in &config.delay_table_data {
-            if let Some(table_pattern) = delay.strip_prefix(&db_prefix) {
-                command.arg(format!("--table={table_pattern}"));
-                has_delayed = true;
-            }
+        for table_pattern in tables {
+            command.arg(format!("--table={table_pattern}"));
         }
 
-        if !has_delayed {
-            return Ok(());
+        for exclude in copy_excludes {
+            command.arg(format!("--exclude-table={exclude}"));
         }
 
         let mut child = command
@@ -417,7 +427,7 @@ pub async fn dump_delayed_data(config: &Config, db: &str, cancel: CancellationTo
         let stderr = child.stderr.take();
 
         let status = select! {
-            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_dump (delayed) wait failed: {e}")))?,
+            res = child.wait() => res?,
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
                 return Err(Error::Cancelled(format!("pg_dump (delayed) of {db}")));
@@ -445,8 +455,12 @@ pub async fn dump_delayed_data(config: &Config, db: &str, cancel: CancellationTo
 pub async fn restore_delayed_data(
     config: &Config,
     db: &str,
+    has_delayed_tables: bool,
     cancel: CancellationToken,
 ) -> Result<()> {
+    if !has_delayed_tables {
+        return Ok(());
+    }
     let dump_path = delayed_dump_dir(&config.dump_root, db);
 
     if !dump_path.join("toc.dat").exists() {
@@ -472,7 +486,7 @@ pub async fn restore_delayed_data(
             db,
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::Other("invalid dump path".to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -487,7 +501,7 @@ pub async fn restore_delayed_data(
 
     let wait_fut = async {
         select! {
-            res = child.wait() => res.map_err(|e| Error::Other(format!("pg_restore (delayed) wait failed: {e}"))),
+            res = child.wait() => res.map_err(Error::from),
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
                 Err(Error::Cancelled(format!("pg_restore (delayed) of {db}")))
@@ -540,7 +554,7 @@ pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationTok
     for db in dbs {
         let sql = format!("CREATE DATABASE \"{db}\"");
         select! {
-            res = sqlx::query(AssertSqlSafe(sql)).execute(&pool) => {
+            res = pool.execute(&sql, &[]) => {
                 if let Err(e) = res {
                     warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
                 }
@@ -557,6 +571,24 @@ pub fn done_marker(db: &str) -> Result<PathBuf> {
 
 pub fn globals_marker() -> Result<PathBuf> {
     Ok(state_dir()?.join("globals.done"))
+}
+
+fn filter_globals_sql(content: &str, dest_user: &str) -> String {
+    let mut filtered_content = Vec::new();
+    let pattern1 = format!(" {dest_user} ");
+    let pattern2 = format!(" {dest_user};");
+
+    for line in content.lines() {
+        if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
+            && (line.contains(&pattern1) || line.ends_with(&pattern2))
+        {
+            info!("Skipping migration of role '{dest_user}' to avoid password overwrite.");
+            continue;
+        }
+
+        filtered_content.push(line);
+    }
+    filtered_content.join("\n")
 }
 
 pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Result<()> {
@@ -584,7 +616,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
             "-f",
             globals_path
                 .to_str()
-                .ok_or_else(|| Error::Other("invalid globals path".to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(globals_path.display().to_string()))?,
         ])
         .spawn()
         .map_err(|e| Error::SpawnFailed {
@@ -593,7 +625,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         })?;
 
     let status = select! {
-        res = child.wait() => res.map_err(|e| Error::Other(format!("pg_dumpall wait failed: {e}")))?,
+        res = child.wait() => res?,
         () = cancel.cancelled() => {
             let _ = child.kill().await;
             return Err(Error::Cancelled("pg_dumpall --globals-only".to_string()));
@@ -608,30 +640,8 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
     }
 
     let globals_content = fs::read_to_string(&globals_path)?;
-    let mut filtered_content = Vec::new();
-    for line in globals_content.lines() {
-        if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
-            && line.contains(&format!(" {} ", config.destination.user))
-        {
-            info!(
-                "Skipping migration of role '{}' to avoid password overwrite.",
-                config.destination.user
-            );
-            continue;
-        }
-        if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
-            && line.ends_with(&format!(" {};", config.destination.user))
-        {
-            info!(
-                "Skipping migration of role '{}' to avoid password overwrite.",
-                config.destination.user
-            );
-            continue;
-        }
-
-        filtered_content.push(line);
-    }
-    fs::write(&globals_path, filtered_content.join("\n"))?;
+    let filtered_content = filter_globals_sql(&globals_content, &config.destination.user);
+    fs::write(&globals_path, filtered_content)?;
 
     let pool = select! {
         res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
@@ -647,7 +657,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         let exec_sql = format!("{s};");
 
         let res = select! {
-            res = sqlx::query(AssertSqlSafe(exec_sql)).execute(&pool) => res,
+            res = pool.execute(&exec_sql, &[]) => res,
             () = cancel.cancelled() => return Err(Error::Cancelled("globals migration execution".to_string())),
         };
 
@@ -665,4 +675,31 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
 
     fs::write(globals_marker()?, "")?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_filter_globals_sql() {
+        let sql = "\
+CREATE ROLE postgres;
+ALTER ROLE postgres WITH PASSWORD 'abc';
+CREATE ROLE other;
+ALTER ROLE other WITH PASSWORD 'xyz';
+";
+        let filtered = filter_globals_sql(sql, "postgres");
+        assert!(!filtered.contains("CREATE ROLE postgres;"));
+        assert!(!filtered.contains("ALTER ROLE postgres WITH PASSWORD"));
+        assert!(filtered.contains("CREATE ROLE other;"));
+        assert!(filtered.contains("ALTER ROLE other WITH PASSWORD"));
+    }
+
+    #[test]
+    fn test_filter_globals_sql_with_spaces() {
+        let sql = "CREATE ROLE postgres WITH LOGIN;";
+        let filtered = filter_globals_sql(sql, "postgres");
+        assert_eq!(filtered, "");
+    }
 }

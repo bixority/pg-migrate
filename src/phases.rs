@@ -1,6 +1,7 @@
 use crate::Config;
 use crate::db;
 use crate::error::{Error, MigrationPhase, Result};
+use crate::plan::{DatabasePlan, MigrationPlan};
 use crate::tui::SharedMigrationStates;
 use crate::verification;
 use std::sync::Arc;
@@ -12,8 +13,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 struct PipelineArgs {
     config: Arc<Config>,
-    db_name: String,
-    size: u64,
+    db_plan: DatabasePlan,
     states: SharedMigrationStates,
     cancel: CancellationToken,
     dump_sem: Arc<Semaphore>,
@@ -22,7 +22,7 @@ struct PipelineArgs {
 
 pub async fn phase_migrate_all(
     config: Arc<Config>,
-    db_names_with_sizes: &[(String, u64)],
+    plan: MigrationPlan,
     states: SharedMigrationStates,
     cancel: &CancellationToken,
     dump_sem: Arc<Semaphore>,
@@ -34,14 +34,10 @@ pub async fn phase_migrate_all(
     let mut regular_tasks = JoinSet::new();
     let mut delayed_tasks = JoinSet::new();
 
-    for (db_name, size) in db_names_with_sizes {
-        let db_name_owned = db_name.clone();
-        let size_val = *size;
-
+    for db_plan in plan.databases {
         let args = PipelineArgs {
             config: config.clone(),
-            db_name: db_name_owned.clone(),
-            size: size_val,
+            db_plan: db_plan.clone(),
             states: states.clone(),
             cancel: cancel.clone(),
             dump_sem: dump_sem.clone(),
@@ -52,7 +48,7 @@ pub async fn phase_migrate_all(
         regular_tasks.spawn(run_regular_pipeline(args.clone()));
 
         // Spawn delayed pipeline if matching flags
-        if has_delayed(&config, &db_name_owned) {
+        if !db_plan.delayed_tables.is_empty() || !db_plan.copy_rules.is_empty() {
             delayed_tasks.spawn(run_delayed_pipeline(args, regular_done.clone()));
         }
     }
@@ -79,7 +75,7 @@ pub async fn phase_migrate_all(
             () = cancel.cancelled() => {
                 regular_tasks.abort_all();
                 delayed_tasks.abort_all();
-                return Err(Error::Cancelled("user".to_string()));
+                return Err(Error::Cancelled("user interruption".to_string()));
             }
         }
     }
@@ -107,13 +103,13 @@ pub async fn phase_migrate_all(
             }
             () = cancel.cancelled() => {
                 delayed_tasks.abort_all();
-                return Err(Error::Cancelled("user".to_string()));
+                return Err(Error::Cancelled("user interruption".to_string()));
             }
         }
     }
 
     if cancel.is_cancelled() {
-        return Err(Error::Cancelled("user".to_string()));
+        return Err(Error::Cancelled("user interruption".to_string()));
     }
 
     let total_duration = start.elapsed();
@@ -126,37 +122,28 @@ pub async fn phase_migrate_all(
     Ok((regular_duration, total_duration))
 }
 
-fn has_delayed(config: &Config, db_name: &str) -> bool {
-    let db_prefix = format!("{db_name}.");
-    config
-        .delay_table_data
-        .iter()
-        .any(|d| d.starts_with(&db_prefix))
-}
-
 async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<OwnedSemaphorePermit> {
     tokio::select! {
         res = sem.clone().acquire_owned() => Ok(res?),
-        () = cancel.cancelled() => Err(Error::Cancelled("waiting for semaphore".to_string())),
+        () = cancel.cancelled() => Err(Error::Cancelled("semaphore acquisition".to_string())),
     }
 }
 
 async fn run_regular_pipeline(args: PipelineArgs) -> Result<()> {
     let PipelineArgs {
         config,
-        db_name,
-        size,
+        db_plan,
         states,
         cancel,
         dump_sem,
         restore_sem,
     } = args;
 
+    let db_name = db_plan.name.clone();
     let res: Result<()> = async {
         phase_migrate_one(
             &config,
-            &db_name,
-            size,
+            &db_plan,
             states.clone(),
             &cancel,
             acquire(&dump_sem, &cancel).await?,
@@ -197,14 +184,14 @@ async fn run_regular_pipeline(args: PipelineArgs) -> Result<()> {
 async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> Result<()> {
     let PipelineArgs {
         config,
-        db_name,
-        size: _,
+        db_plan,
         states,
         cancel,
         dump_sem,
         restore_sem,
     } = args;
 
+    let db_name = db_plan.name.clone();
     let delayed_name = format!("{db_name} (delayed)");
     let regular_done_fut = regular_done.notified();
 
@@ -221,14 +208,25 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
                     1,
                     "dumping delayed table data",
                 );
-            db::dump_delayed_data(&config, &db_name, cancel.clone()).await?;
+            db::dump_delayed_data(
+                &config,
+                &db_name,
+                &db_plan.delayed_tables,
+                &db_plan
+                    .copy_rules
+                    .iter()
+                    .map(|r| r.table.clone())
+                    .collect::<Vec<_>>(),
+                cancel.clone(),
+            )
+            .await?;
         }
 
         // Wait for regular pipelines to finish before proceeding to restore phases
         regular_done_fut.await;
         if cancel.is_cancelled() {
             return Err(Error::Cancelled(
-                "regular pipelines finished with error".to_string(),
+                "migration process interrupted".to_string(),
             ));
         }
 
@@ -244,7 +242,16 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
                 3,
                 "restoring delayed table data",
             );
-        db::restore_delayed_data(&config, &db_name, cancel.clone()).await?;
+        db::restore_delayed_data(
+            &config,
+            &db_name,
+            !db_plan.delayed_tables.is_empty(),
+            cancel.clone(),
+        )
+        .await?;
+
+        // Phase 2.5: Copy Engine
+        migrate_copy_rules(&config, &db_plan, &delayed_name, &states).await?;
 
         // Phase 3: Delayed Verifying
         states
@@ -289,15 +296,56 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
     })
 }
 
+async fn migrate_copy_rules(
+    config: &Config,
+    db_plan: &DatabasePlan,
+    delayed_name: &str,
+    states: &SharedMigrationStates,
+) -> Result<()> {
+    for rule in &db_plan.copy_rules {
+        let table_name = &rule.table;
+        let db_name = &db_plan.name;
+        let marker = db::copy_rule_done_marker(db_name, table_name, rule.rule_hash)?;
+        if marker.exists() {
+            continue;
+        }
+
+        states
+            .lock()
+            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .update(
+                delayed_name,
+                MigrationPhase::DelayedRestoring,
+                4,
+                format!("copying {table_name} via copy engine"),
+            );
+
+        crate::run_copy_engine(
+            config,
+            db_name,
+            table_name,
+            &rule.column,
+            rule.from.as_deref(),
+            rule.till.as_deref(),
+            Some(&rule.method),
+        )
+        .await?;
+
+        std::fs::write(marker, "")?;
+    }
+    Ok(())
+}
+
 async fn phase_migrate_one(
     config: &Config,
-    db_name: &str,
-    size: u64,
+    db_plan: &DatabasePlan,
     states: SharedMigrationStates,
     cancel: &CancellationToken,
     dump_permit: OwnedSemaphorePermit,
     restore_sem: &Arc<Semaphore>,
 ) -> Result<()> {
+    let db_name = &db_plan.name;
+    let size = db_plan.size;
     {
         let _dump_permit = dump_permit;
 
@@ -306,7 +354,14 @@ async fn phase_migrate_one(
             .map_err(|e| Error::LockPoisoned(e.to_string()))?
             .update(db_name, MigrationPhase::Dumping, 1, "dumping database");
 
-        db::dump_db(config, db_name, size, cancel.clone()).await?;
+        db::dump_db(
+            config,
+            db_name,
+            size,
+            &db_plan.regular_data_excludes,
+            cancel.clone(),
+        )
+        .await?;
     }
 
     let _restore_permit = acquire(restore_sem, cancel).await?;

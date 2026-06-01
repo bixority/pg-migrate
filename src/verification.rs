@@ -5,7 +5,6 @@ use crate::tui::render_verification_report;
 use crate::verify_dir;
 use futures::stream::{self, StreamExt};
 use log::{info, warn};
-use sqlx::{AssertSqlSafe, Row};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
@@ -212,7 +211,7 @@ pub async fn stat_counts(
     let pool = config.pool_cache.get(args, db_name).await?;
 
     let tables = tokio::select! {
-        res = sqlx::query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2").fetch_all(&pool) => res?,
+        res = pool.query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2", &[]) => res?,
         () = cancel.cancelled() => return Err(Error::Cancelled(format!("table discovery for {db_name}"))),
     };
 
@@ -250,7 +249,7 @@ pub async fn stat_counts(
                 let full_name = format!("\"{schema}\".\"{table}\"");
                 let count_query = format!("SELECT count(*) FROM {full_name}");
                 let count: i64 = tokio::select! {
-                    res = sqlx::query(AssertSqlSafe(count_query)).fetch_one(&pool) => res?.get(0),
+                    res = pool.query_one(&count_query, &[]) => res?.get(0),
                     () = cancel.cancelled() => return Err(Error::Cancelled(format!("row count of {schema}.{table}"))),
                 };
                 Ok((format!("{schema}.{table}"), count.to_string()))
@@ -271,7 +270,7 @@ pub async fn stat_counts(
 
 async fn fast_stat_counts(
     config: &Config,
-    pool: &sqlx::PgPool,
+    pool: &tokio_postgres::Client,
     entries: &[(String, String, bool)],
     cancel: CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
@@ -285,14 +284,14 @@ async fn fast_stat_counts(
         .collect();
 
     let rows = tokio::select! {
-        res = sqlx::query(
+        res = pool.query(
             "SELECT n.nspname, c.relname, c.reltuples::bigint \
              FROM pg_class c \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
              WHERE c.relkind = 'r' \
-               AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')"
-        )
-        .fetch_all(pool) => res?,
+               AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')",
+            &[]
+        ) => res?,
         () = cancel.cancelled() => return Err(Error::Cancelled("reltuples query".to_string())),
     };
 
@@ -315,7 +314,7 @@ async fn fast_stat_counts(
             let full_name = format!("\"{schema}\".\"{table}\"");
             let count_query = format!("SELECT count(*) FROM {full_name}");
             let count: i64 = tokio::select! {
-                res = sqlx::query(AssertSqlSafe(count_query)).fetch_one(pool) => res?.get(0),
+                res = pool.query_one(&count_query, &[]) => res?.get(0),
                 () = cancel.cancelled() => return Err(Error::Cancelled(format!("exact count of {schema}.{table}"))),
             };
             counts.insert(format!("{schema}.{table}"), count.to_string());

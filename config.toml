@@ -1,0 +1,52 @@
+# pg-migrate configuration file example
+
+# Number of parallel jobs for pg_dump
+dump_jobs = 12
+
+# Number of parallel jobs for pg_restore
+restore_jobs = 12
+
+# Maximum number of parallel database migrations
+max_parallel = 4
+
+# Optional: Number of parallel dump operations (defaults to max_parallel)
+# dump_parallel = 6
+
+# Optional: Number of parallel restore operations (defaults to max_parallel)
+# restore_parallel = 6
+
+# Root directory for database dumps
+dump_root = "pg_dumps"
+
+# Whether to migrate global objects (roles, etc.)
+migrate_globals = true
+
+# Tables to delay data migration for (e.g. large tables)
+# Format: "DATABASE.TABLE_PATTERN"
+delay_table_data = [
+  "pdb1.table3",
+  "pdb2.table*"
+]
+
+# Whether to perform fast verification
+fast_verify = false
+
+# Concurrency for verification phase
+verify_concurrency = 16
+
+# Zstd compression level for dumps (1-22)
+zstd_level = 5
+
+# Tables to copy using the copy engine instead of pg_dump/restore.
+# Tables MUST also be listed in delay_table_data to be handled here.
+# Multiple rules can be specified for the same table (e.g. to split by time ranges).
+[[copy_rules]]
+table = "pdb1.table3"
+split_by_column = "created_at"   # column used for WHERE / range splitting (default: created_at)
+from = "2023-01-01 00:00:00"     # inclusive lower bound (optional; omit for no lower bound)
+till = "2023-06-01 00:00:00"     # exclusive upper bound (optional; omit for no upper bound)
+
+[[copy_rules]]
+table = "pdb2.table3"
+split_by_column = "created_at"
+from = "2023-06-01 00:00:00"

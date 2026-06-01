@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 /// Returns an error if the template is invalid.
 pub fn migration_style() -> Result<ProgressStyle> {
     ProgressStyle::with_template("{msg}")
-        .map_err(|e| Error::Other(format!("Invalid template: {e}")))
+        .map_err(|e| Error::Config(format!("Invalid progress style template: {e}")))
 }
 
 #[derive(Clone, Debug)]

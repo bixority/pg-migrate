@@ -27,17 +27,14 @@ Ensure PostgreSQL client utilities `pg_dump`, `pg_dumpall`, and `pg_restore` are
 
 ```bash
 pg-migrate \
+  --config config.toml \
   --from-host source-db.example.com --from-port 5432 \
   --from-user postgres --from-pass secret123 \
   --to-host   target-db.example.com --to-port 5433 \
-  --to-user   postgres --to-pass newsecret456 \
-  --max-parallel 6 \
-  --dump-jobs 24 --restore-jobs 12 \
-  --delay-table-data analytics.events \
-  --delay-table-data warehouse.fact_*
+  --to-user   postgres --to-pass newsecret456
 ```
 
-The tool discovers databases on the source, dumps them to `--dump-root`, restores them to the target, and verifies row counts. State files in `$HOME/pg_migrate_state` and `$HOME/pg_verify_state` let it resume after interruption (Ctrl-C cancels gracefully and kills child `pg_dump`/`pg_restore` processes).
+The tool discovers databases on the source, dumps them to `dump_root` (specified in config), restores them to the target, and verifies row counts. State files in `$HOME/pg_migrate_state` and `$HOME/pg_verify_state` let it resume after interruption (Ctrl-C cancels gracefully and kills child `pg_dump`/`pg_restore` processes).
 
 ### Process Flow
 
@@ -289,6 +286,9 @@ podman-compose up --build
 
 #### CLI Arguments
 
+**Global**
+- `-c`, `--config` — path to the TOML configuration file (default: `config.toml`)
+
 **Source connection**
 - `--from-host` — source host (default: `localhost`)
 - `--from-port` — source port (default: `5432`)
@@ -303,23 +303,61 @@ podman-compose up --build
 - `--to-pass` — target password (default: `newpass`)
 - `--to-db` — initial database for ALTER SYSTEM / globals (default: `postgres`)
 
-**Parallelism**
-- `--dump-jobs` — `pg_dump -j` per database (default: `24`)
-- `--restore-jobs` — `pg_restore -j` per database; also bounds parallel `CREATE INDEX` during delayed-index recreate (default: `12`)
-- `-p`, `--max-parallel` — number of databases dumped/restored concurrently. Internally split into two semaphores (source-side and destination-side) so the next dump can overlap the previous restore (default: `6`)
-- `--dump-parallel` — override the source-side semaphore independently of `--max-parallel`. Use this when your source's `max_connections` can't accommodate `max_parallel × (1 + dump_jobs)` connections (default: same as `--max-parallel`)
-- `--restore-parallel` — override the destination-side semaphore independently (default: same as `--max-parallel`)
-- `--verify-concurrency` — **global** cap on concurrent `count(*)` queries across all DBs and both servers during verification (default: `16`). Lower this if your source/destination has a tight `max_connections` budget.
+#### TOML Configuration
 
-**Behavior**
-- `--dump-root` — local dump directory (default: `pg_dumps`)
-- `--migrate-globals` — migrate roles/globals (default: `true`)
-- `--disable-dst-optimizations` — skip the `ALTER SYSTEM` fast-restore knobs on the destination (default: `false`)
-- `--fast-verify` — replace per-table `count(*)` with `pg_class.reltuples` (single query per side). Delayed tables still use exact counts. Run `ANALYZE` on both sides beforehand for meaningful estimates. Non-delayed mismatches become warnings, not failures (default: `false`)
-- `--delay-table-data <DATABASE.TABLE_PATTERN>` — repeatable. Defers data load and secondary-index rebuild for the matching tables. `*` and `?` glob wildcards are supported in the table portion. Examples:
-  - `mydb.events` — single table
-  - `mydb.fact_*` — all tables in `mydb` whose name starts with `fact_`
-  - `mydb.public.events_2024_*` — schema-qualified pattern
+The configuration file (default `config.toml`) matches the structure of `config.toml.example`. All parameters are optional and will use their default values if omitted.
+
+```toml
+# Number of parallel jobs (-j) for pg_dump per database (default: 24)
+dump_jobs = 24
+
+# Number of parallel jobs (-j) for pg_restore per database (default: 12).
+# Also bounds parallel CREATE INDEX during the delayed phase.
+restore_jobs = 12
+
+# Maximum number of databases being migrated concurrently (default: 6)
+max_parallel = 6
+
+# (Optional) Independent override for source-side concurrency (defaults to max_parallel)
+# dump_parallel = 6
+
+# (Optional) Independent override for destination-side concurrency (defaults to max_parallel)
+# restore_parallel = 6
+
+# Local directory where database dumps are stored (default: "pg_dumps")
+dump_root = "pg_dumps"
+
+# Whether to migrate global objects like roles and groups (default: true)
+migrate_globals = true
+
+# List of "DATABASE.TABLE_PATTERN" patterns to defer data load for.
+# Schema is restored normally, but bulk data is copied after indexes
+# are dropped to speed up restoration.
+# delay_table_data = [
+#   "mydb.large_table"
+# ]
+
+# If true, uses pg_class.reltuples estimates instead of count(*)
+# for regular tables (default: false).
+fast_verify = false
+
+# Global cap on concurrent row-count/verification queries
+# across all databases (default: 16).
+verify_concurrency = 16
+
+# Zstd compression level for database dumps (1-22, default: 5)
+zstd_level = 5
+
+# (Optional) List of tables to migrate using the high-performance Copy Engine.
+# See COPY_ENGINE.md for details.
+# Multiple rules can be specified for the same table.
+[[copy_rules]]
+table = "DATABASE.TABLE"          # The table to migrate
+split_by_column = "created_at"    # Column used for WHERE / partitioning (default: created_at)
+method = "time"                   # Partitioning method: "time" (default) or "hash"
+from = "2023-01-01"               # Inclusive lower bound (optional; auto-discovered for parallel 'time' split)
+till = "2024-01-01"               # Exclusive upper bound (optional; auto-discovered for parallel 'time' split)
+```
 
 #### Environment Variables
 

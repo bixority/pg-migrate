@@ -44,7 +44,7 @@ impl fmt::Display for MigrationPhase {
 #[derive(Debug, Error)]
 pub enum Error {
     #[error("Database error: {0}")]
-    Sqlx(#[from] sqlx::Error),
+    Postgres(#[from] tokio_postgres::Error),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -74,8 +74,29 @@ pub enum Error {
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
 
+    #[error("TOML error: {0}")]
+    Toml(#[from] toml::de::Error),
+
     #[error("Lock poisoned: {0}")]
     LockPoisoned(String),
+
+    #[error("Copy engine error: {0}")]
+    CopyEngine(#[from] crate::copy_engine::error::CopyEngineError),
+
+    #[error("Environment error: {0}")]
+    Env(String),
+
+    #[error("Configuration error: {0}")]
+    Config(String),
+
+    #[error("Database '{database}' not found")]
+    DatabaseNotFound { database: String },
+
+    #[error("Dump not found for {database} at {path}")]
+    DumpNotFound { database: String, path: String },
+
+    #[error("Invalid path: {0}")]
+    InvalidPath(String),
 
     #[error("Error in database '{database}', phase {phase}, step {step}: {source}")]
     WithContext {
