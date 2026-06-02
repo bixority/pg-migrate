@@ -3,6 +3,7 @@ use crate::{Config, Error, Result};
 use indicatif::HumanBytes;
 use log::info;
 use std::sync::Arc;
+use tokio::select;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone)]
@@ -64,7 +65,10 @@ pub async fn create_plan(
                         "Discovering range for {db_name}.{table_name}.{}...",
                         rule.split_by_column
                     );
-                    let pool = config.pool_cache.get(&config.source, db_name).await?;
+                    let pool = select! {
+                        res = config.pool_cache.get(&config.source, db_name) => res?,
+                        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
+                    };
 
                     if actual_from.is_none() {
                         let query = format!(

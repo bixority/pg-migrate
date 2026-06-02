@@ -6,7 +6,7 @@ use log::{info, warn};
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -114,9 +114,12 @@ impl PoolCache {
             args.user.clone(),
             db.to_string(),
         );
-        let mut lock = self.inner.lock().await;
-        if let Some(p) = lock.get(&key) {
-            return Ok(p.clone());
+
+        {
+            let lock = self.inner.lock().await;
+            if let Some(p) = lock.get(&key) {
+                return Ok(p.clone());
+            }
         }
 
         let mut config = tokio_postgres::Config::new();
@@ -127,7 +130,10 @@ impl PoolCache {
             .password(&args.pass)
             .dbname(db);
 
-        let (client, connection) = config.connect(NoTls).await?;
+        let (client, connection) =
+            tokio::time::timeout(Duration::from_secs(30), config.connect(NoTls))
+                .await
+                .map_err(|_| Error::Timeout(format!("to {} database {}", args.host, db)))??;
 
         let db_name = db.to_string();
         tokio::spawn(async move {
@@ -137,8 +143,9 @@ impl PoolCache {
         });
 
         let client = Arc::new(client);
-        lock.insert(key, client.clone());
-        drop(lock);
+
+        self.inner.lock().await.insert(key, client.clone());
+
         Ok(client)
     }
 }

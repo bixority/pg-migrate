@@ -86,6 +86,9 @@ pub enum Error {
     #[error("Environment error: {0}")]
     Env(String),
 
+    #[error("Connection timeout: {0}")]
+    Timeout(String),
+
     #[error("Configuration error: {0}")]
     Config(String),
 

@@ -208,7 +208,10 @@ pub async fn stat_counts(
     include_delayed: bool,
     cancel: CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
-    let pool = config.pool_cache.get(args, db_name).await?;
+    let pool = tokio::select! {
+        res = config.pool_cache.get(args, db_name) => res?,
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("verification connection for {db_name}"))),
+    };
 
     let tables = tokio::select! {
         res = pool.query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2", &[]) => res?,
