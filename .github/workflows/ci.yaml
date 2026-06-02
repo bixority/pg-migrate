@@ -64,7 +64,7 @@ jobs:
     steps:
       - name: Get lowercase GitHub username
         id: repository
-        uses: ASzc/change-string-case-action@v7
+        uses: ASzc/change-string-case-action@v6
         with:
           string: ${{ github.repository }}
 
