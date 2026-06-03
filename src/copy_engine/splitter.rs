@@ -404,7 +404,13 @@ mod tests {
 
     #[test]
     fn test_split_by_date_whole_days() -> Result<()> {
-        let partitions = Splitter::split("ts", Some("2023-01-01"), Some("2023-01-04"), Some("date"), 4)?;
+        let partitions = Splitter::split(
+            "ts",
+            Some("2023-01-01"),
+            Some("2023-01-04"),
+            Some("date"),
+            4,
+        )?;
         // 3 full days: [01, 02), [02, 03), [03, 04)
         assert_eq!(partitions.len(), 3);
         assert!(partitions.iter().all(|p| p.method == "date"));
@@ -435,7 +441,8 @@ mod tests {
     #[test]
     fn test_split_by_date_partial_edges() -> Result<()> {
         // Range that does not start or end on a midnight boundary.
-        let partitions = Splitter::split_by_date("ts", "2023-01-01 06:00:00", "2023-01-03 09:00:00")?;
+        let partitions =
+            Splitter::split_by_date("ts", "2023-01-01 06:00:00", "2023-01-03 09:00:00")?;
         // [06:00, day2 00:00), [day2 00:00, day3 00:00), [day3 00:00, 09:00)
         assert_eq!(partitions.len(), 3);
         assert!(
@@ -475,7 +482,8 @@ mod tests {
 
     #[test]
     fn test_split_by_date_day_alias() -> Result<()> {
-        let partitions = Splitter::split("ts", Some("2023-01-01"), Some("2023-01-03"), Some("day"), 4)?;
+        let partitions =
+            Splitter::split("ts", Some("2023-01-01"), Some("2023-01-03"), Some("day"), 4)?;
         assert_eq!(partitions.len(), 2);
         assert_eq!(partitions[0].method, "date");
         Ok(())
