@@ -2,7 +2,6 @@ use crate::copy_engine::error::{CopyEngineError, Result};
 use crate::copy_engine::splitter::Partition;
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use log::{error, info};
-use tokio_postgres::NoTls;
 
 pub struct Worker {
     id: usize,
@@ -38,7 +37,7 @@ impl Worker {
         info!("Worker {} starting partition: {}", self.id, partition);
 
         let (client_src, connection_src) =
-            tokio_postgres::connect(&self.source_config, NoTls).await?;
+            tokio_postgres::connect(&self.source_config, crate::tls::make_tls()).await?;
         tokio::spawn(async move {
             if let Err(e) = connection_src.await {
                 error!("Source connection error: {e}");
@@ -46,7 +45,7 @@ impl Worker {
         });
 
         let (client_dest, connection_dest) =
-            tokio_postgres::connect(&self.dest_config, NoTls).await?;
+            tokio_postgres::connect(&self.dest_config, crate::tls::make_tls()).await?;
         tokio::spawn(async move {
             if let Err(e) = connection_dest.await {
                 error!("Destination connection error: {e}");

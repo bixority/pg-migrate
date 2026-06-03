@@ -75,6 +75,23 @@ When `method` is `time`, the range is split into parallel sub-partitions (automa
 When `method` is `hash`, the table is split into `num_partitions` based on the hash of the column values.
 - `--max-parallel`: Number of concurrent workers (default matches global parallelism settings).
 
+## Integration with the migration pipeline
+
+A copy-engine table is treated as **deferred** throughout the pipeline, the same
+way `delay_table_data` tables are — it does not need to appear in
+`delay_table_data`:
+
+- **Regular `pg_dump`**: the table's data is excluded (`--exclude-table-data`);
+  only its schema is dumped/restored, so the destination table exists (empty)
+  before the copy engine runs.
+- **Delayed `pg_dump`**: the table is excluded (`--exclude-table`), so its data
+  is never dumped by `pg_dump` even if it also matches a `delay_table_data`
+  pattern. The copy engine is the single owner of that data.
+- **Copy engine**: runs during the delayed phase and `COPY`s the data directly.
+- **Verification**: the table is row-count-verified only in the *delayed*
+  verification pass (after the copy completes), never in the regular pass —
+  otherwise it would be compared while still empty and fail the migration.
+
 ## Technical Requirements
 
 - **Rust**: 1.96 (2024 edition)

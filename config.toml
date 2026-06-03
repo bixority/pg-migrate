@@ -21,8 +21,11 @@ dump_root = "pg_dumps"
 # Whether to migrate global objects (roles, etc.)
 migrate_globals = true
 
-# Tables to delay data migration for (e.g. large tables)
-# Format: "DATABASE.TABLE_PATTERN"
+# Tables whose data is migrated in a separate, delayed pass (e.g. large tables).
+# Every table matching one of these patterns is dumped/restored after the
+# regular tables and is only row-count-verified once that delayed pass finishes.
+# Format: "DATABASE.TABLE_PATTERN", where TABLE_PATTERN uses pg_dump wildcards
+# (* matches any sequence, ? matches a single character).
 delay_table_data = [
   "pdb1.table3",
   "pdb2.table*"
@@ -37,9 +40,22 @@ verify_concurrency = 16
 # Zstd compression level for dumps (1-22)
 zstd_level = 5
 
+# TLS mode for native (tokio-postgres) connections: disable, prefer, or require.
+# Mirrors libpq's sslmode. "prefer" (default) uses TLS when the server offers it
+# and falls back to plaintext otherwise, so it works against both TLS and non-TLS
+# servers. The server certificate is not verified (matching sslmode=prefer/require).
+# Can be overridden on the command line with --sslmode.
+sslmode = "prefer"
+
 # Tables to copy using the copy engine instead of pg_dump/restore.
-# Tables MUST also be listed in delay_table_data to be handled here.
-# Multiple rules can be specified for the same table (e.g. to split by time ranges).
+# A copy-engine table is treated as deferred automatically: it is excluded from
+# the regular pg_dump, excluded from the delayed pg_dump, migrated by the copy
+# engine, and only verified after the copy completes. It therefore does NOT need
+# to be listed in delay_table_data, and listing it there (or matching it with a
+# delay pattern) is harmless — the copy engine still wins and the delayed
+# pg_dump still excludes it. Each table must be fully qualified as
+# "DATABASE.TABLE". Multiple rules can target the same table (e.g. to split by
+# time ranges).
 [[copy_rules]]
 table = "pdb1.table3"
 split_by_column = "created_at"   # column used for WHERE / range splitting (default: created_at)

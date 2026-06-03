@@ -101,6 +101,9 @@ pub enum Error {
     #[error("Invalid path: {0}")]
     InvalidPath(String),
 
+    #[error("Invalid copy rule for table '{table}': {reason}")]
+    InvalidCopyRule { table: String, reason: String },
+
     #[error("Error in database '{database}', phase {phase}, step {step}: {source}")]
     WithContext {
         database: String,

@@ -1,7 +1,8 @@
 use crate::copy_engine::Splitter;
+use crate::verification::is_delayed_table;
 use crate::{Config, Error, Result};
 use indicatif::HumanBytes;
-use log::info;
+use log::{info, warn};
 use std::sync::Arc;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -18,6 +19,13 @@ pub struct DatabasePlan {
     pub regular_data_excludes: Vec<String>,
     pub delayed_tables: Vec<String>,
     pub copy_rules: Vec<CopyRulePlan>,
+
+    /// Resolved `schema.table` names taking each migration path, populated from
+    /// the live source catalog. These are informational (for the plan printout
+    /// and diagnostics); the migration mechanics drive off the fields above.
+    pub regular_table_names: Vec<String>,
+    pub delayed_table_names: Vec<String>,
+    pub copy_table_names: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -39,100 +47,21 @@ pub async fn create_plan(
     let mut db_plans = Vec::new();
 
     for (db_name, size) in dbs_with_sizes {
-        let mut db_plan = DatabasePlan {
-            name: db_name.clone(),
-            size: *size,
-            regular_data_excludes: Vec::new(),
-            delayed_tables: Vec::new(),
-            copy_rules: Vec::new(),
-        };
-
-        let db_prefix = format!("{db_name}.");
-
-        // 1. Identify copy rules and their partitions
-        let mut copy_excludes = std::collections::HashSet::new();
-        for rule in &config.copy_rules {
-            if let Some(table_name) = rule.table.strip_prefix(&db_prefix) {
-                copy_excludes.insert(table_name.to_string());
-
-                let mut actual_from = rule.from.clone();
-                let mut actual_till = rule.till.clone();
-
-                if rule.method.as_deref().unwrap_or("time") == "time"
-                    && (actual_from.is_none() || actual_till.is_none())
-                {
-                    info!(
-                        "Discovering range for {db_name}.{table_name}.{}...",
-                        rule.split_by_column
-                    );
-                    let pool = select! {
-                        res = config.pool_cache.get(&config.source, db_name) => res?,
-                        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
-                    };
-
-                    if actual_from.is_none() {
-                        let query = format!(
-                            "SELECT min({})::text FROM {}",
-                            rule.split_by_column, table_name
-                        );
-                        let row = pool.query_one(&query, &[]).await?;
-                        actual_from = row.get(0);
-                        if let Some(ref f) = actual_from {
-                            info!("Discovered 'from' bound for {table_name}: {f}");
-                        }
-                    }
-                    if actual_till.is_none() {
-                        let query = format!(
-                            "SELECT max({})::text FROM {}",
-                            rule.split_by_column, table_name
-                        );
-                        let row = pool.query_one(&query, &[]).await?;
-                        actual_till = row.get(0);
-                        if let Some(ref t) = actual_till {
-                            info!("Discovered 'till' bound for {table_name}: {t}");
-                        }
-                    }
-                }
-
-                let partitions = Splitter::split(
-                    &rule.split_by_column,
-                    actual_from.as_deref(),
-                    actual_till.as_deref(),
-                    rule.method.as_deref(),
-                    config.max_parallel,
-                )?;
-
-                db_plan.copy_rules.push(CopyRulePlan {
-                    table: table_name.to_string(),
-                    column: rule.split_by_column.clone(),
-                    method: rule.method.clone().unwrap_or_else(|| "time".to_string()),
-                    from: actual_from,
-                    till: actual_till,
-                    partitions: partitions.len(),
-                    rule_hash: rule.rule_hash(),
-                });
-
-                db_plan.regular_data_excludes.push(table_name.to_string());
-            }
-        }
-
-        // 2. Identify delayed tables
-        for delay in &config.delay_table_data {
-            if let Some(table_pattern) = delay.strip_prefix(&db_prefix) {
-                db_plan
-                    .regular_data_excludes
-                    .push(table_pattern.to_string());
-                if !copy_excludes.contains(table_pattern) {
-                    db_plan.delayed_tables.push(table_pattern.to_string());
-                }
-            }
-        }
-
-        db_plans.push(db_plan);
+        db_plans.push(plan_database(&config, db_name, *size, &cancel).await?);
 
         if cancel.is_cancelled() {
             return Err(Error::Cancelled("planning interrupted".to_string()));
         }
+    }
+
+    // A delay/copy entry only produces delayed work (and therefore a delayed TUI
+    // row) when its "DATABASE." prefix matches a migrated database. Warn about
+    // entries that match nothing, since that silently yields no delayed rows.
+    for entry in &config.delay_table_data {
+        warn_unmatched(entry, dbs_with_sizes, "delay_table_data");
+    }
+    for rule in &config.copy_rules {
+        warn_unmatched(&rule.table, dbs_with_sizes, "copy_rules");
     }
 
     Ok(MigrationPlan {
@@ -140,40 +69,227 @@ pub async fn create_plan(
     })
 }
 
+/// Builds the plan for a single database: copy-engine rules (with resolved
+/// ranges and partitions), delayed-dump patterns, and the resolved per-table
+/// classification used by the plan printout.
+async fn plan_database(
+    config: &Config,
+    db_name: &str,
+    size: u64,
+    cancel: &CancellationToken,
+) -> Result<DatabasePlan> {
+    let mut db_plan = DatabasePlan {
+        name: db_name.to_string(),
+        size,
+        regular_data_excludes: Vec::new(),
+        delayed_tables: Vec::new(),
+        copy_rules: Vec::new(),
+        regular_table_names: Vec::new(),
+        delayed_table_names: Vec::new(),
+        copy_table_names: Vec::new(),
+    };
+
+    let db_prefix = format!("{db_name}.");
+
+    // 1. Identify copy rules and their partitions.
+    let mut copy_excludes = std::collections::HashSet::new();
+    for rule in &config.copy_rules {
+        if let Some(table_name) = rule.table.strip_prefix(&db_prefix) {
+            copy_excludes.insert(table_name.to_string());
+
+            let (from, till) = resolve_range(config, db_name, table_name, rule, cancel).await?;
+            let partitions = Splitter::split(
+                &rule.split_by_column,
+                from.as_deref(),
+                till.as_deref(),
+                rule.method.as_deref(),
+                config.max_parallel,
+            )?;
+
+            db_plan.copy_rules.push(CopyRulePlan {
+                table: table_name.to_string(),
+                column: rule.split_by_column.clone(),
+                method: rule.method.clone().unwrap_or_else(|| "time".to_string()),
+                from,
+                till,
+                partitions: partitions.len(),
+                rule_hash: rule.rule_hash(),
+            });
+
+            db_plan.regular_data_excludes.push(table_name.to_string());
+        }
+    }
+
+    // 2. Identify delayed tables.
+    for delay in &config.delay_table_data {
+        if let Some(table_pattern) = delay.strip_prefix(&db_prefix) {
+            db_plan
+                .regular_data_excludes
+                .push(table_pattern.to_string());
+            if !copy_excludes.contains(table_pattern) {
+                db_plan.delayed_tables.push(table_pattern.to_string());
+            }
+        }
+    }
+
+    // 3. Resolve every table in the database against the rules so the plan
+    //    reflects exactly what will be migrated and how. Copy-engine tables win
+    //    over delayed (they are excluded from the delayed pg_dump), and delayed
+    //    wins over regular.
+    let copy_specs: Vec<String> = config.copy_rules.iter().map(|r| r.table.clone()).collect();
+    for (schema, table) in list_user_tables(config, db_name, cancel).await? {
+        let full = format!("{schema}.{table}");
+        if is_delayed_table(db_name, &schema, &table, &copy_specs) {
+            db_plan.copy_table_names.push(full);
+        } else if is_delayed_table(db_name, &schema, &table, &config.delay_table_data) {
+            db_plan.delayed_table_names.push(full);
+        } else {
+            db_plan.regular_table_names.push(full);
+        }
+    }
+
+    Ok(db_plan)
+}
+
+/// Resolves the `from`/`till` bounds for a `time`-method copy rule, discovering
+/// missing bounds from the source database to enable parallel splitting.
+async fn resolve_range(
+    config: &Config,
+    db_name: &str,
+    table_name: &str,
+    rule: &crate::config::CopyRule,
+    cancel: &CancellationToken,
+) -> Result<(Option<String>, Option<String>)> {
+    let mut from = rule.from.clone();
+    let mut till = rule.till.clone();
+
+    if rule.method.as_deref().unwrap_or("time") != "time" || (from.is_some() && till.is_some()) {
+        return Ok((from, till));
+    }
+
+    info!(
+        "Discovering range for {db_name}.{table_name}.{}...",
+        rule.split_by_column
+    );
+    let pool = select! {
+        res = config.pool_cache.get(&config.source, db_name) => res?,
+        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
+    };
+
+    if from.is_none() {
+        let query = format!(
+            "SELECT min({})::text FROM {}",
+            rule.split_by_column, table_name
+        );
+        from = pool.query_one(&query, &[]).await?.get(0);
+        if let Some(ref f) = from {
+            info!("Discovered 'from' bound for {table_name}: {f}");
+        }
+    }
+    if till.is_none() {
+        let query = format!(
+            "SELECT max({})::text FROM {}",
+            rule.split_by_column, table_name
+        );
+        till = pool.query_one(&query, &[]).await?.get(0);
+        if let Some(ref t) = till {
+            info!("Discovered 'till' bound for {table_name}: {t}");
+        }
+    }
+
+    Ok((from, till))
+}
+
+/// Warns when a `DATABASE.TABLE` config entry targets a database that is not in
+/// the migrated set, so it contributes no delayed/copy-engine work.
+fn warn_unmatched(entry: &str, dbs_with_sizes: &[(String, u64)], source: &str) {
+    let db = entry.split_once('.').map_or(entry, |(db, _)| db);
+    if !dbs_with_sizes.iter().any(|(name, _)| name.as_str() == db) {
+        warn!(
+            "Config {source} entry '{entry}' targets database '{db}', which is not among \
+             the migrated databases — it produces no delayed/copy-engine work (no '(delayed)' row)"
+        );
+    }
+}
+
+/// Lists the ordinary and partitioned user tables of a database as
+/// `(schema, table)` pairs, used to resolve the per-table migration plan.
+async fn list_user_tables(
+    config: &Config,
+    db_name: &str,
+    cancel: &CancellationToken,
+) -> Result<Vec<(String, String)>> {
+    let pool = select! {
+        res = config.pool_cache.get(&config.source, db_name) => res?,
+        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
+    };
+
+    let rows = select! {
+        res = pool.query(
+            "SELECT n.nspname, c.relname \
+             FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE c.relkind IN ('r', 'p') \
+               AND n.nspname NOT IN ('pg_catalog', 'information_schema', 'pg_toast') \
+             ORDER BY 1, 2",
+            &[],
+        ) => res?,
+        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
+    };
+
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect())
+}
+
 impl MigrationPlan {
     pub fn print(&self) {
         info!("=== Migration Plan ===");
         for db in &self.databases {
-            info!("Database: {}", db.name);
-            info!("  Size: {}", HumanBytes(db.size));
+            info!("Database: {} ({})", db.name, HumanBytes(db.size));
 
-            if !db.regular_data_excludes.is_empty() {
-                info!(
-                    "  Excluded from regular data dump: {:?}",
-                    db.regular_data_excludes
-                );
-            }
-
-            if !db.delayed_tables.is_empty() {
-                info!(
-                    "  Delayed tables (regular pg_dump): {:?}",
-                    db.delayed_tables
-                );
-            }
-
+            info!(
+                "  Copy engine: {} rule(s), {} table(s) matched",
+                db.copy_rules.len(),
+                db.copy_table_names.len()
+            );
             for rule in &db.copy_rules {
-                info!("  Copy engine table: {}", rule.table);
-                info!("    Column: {}", rule.column);
-                info!("    Method: {}", rule.method);
-                if let Some(from) = &rule.from {
-                    info!("    From:   {from}");
-                }
-                if let Some(till) = &rule.till {
-                    info!("    Till:   {till}");
-                }
-                info!("    Partitions: {}", rule.partitions);
+                let range = match (rule.from.as_deref(), rule.till.as_deref()) {
+                    (Some(from), Some(till)) => format!("{from} .. {till}"),
+                    (Some(from), None) => format!("{from} .."),
+                    (None, Some(till)) => format!(".. {till}"),
+                    (None, None) => "full range".to_string(),
+                };
+                info!(
+                    "    - {} [{} split on {}, {}, {} partition(s)]",
+                    rule.table, rule.method, rule.column, range, rule.partitions
+                );
             }
+            print_tables(&db.copy_table_names, usize::MAX);
+
+            info!(
+                "  Delayed (deferred pg_dump --data-only): {} table(s)",
+                db.delayed_table_names.len()
+            );
+            print_tables(&db.delayed_table_names, usize::MAX);
+
+            info!(
+                "  Regular (pg_dump / pg_restore): {} table(s)",
+                db.regular_table_names.len()
+            );
+            print_tables(&db.regular_table_names, 25);
         }
         info!("======================");
+    }
+}
+
+/// Logs up to `max` table names, then a `... and N more` summary line.
+fn print_tables(tables: &[String], max: usize) {
+    for table in tables.iter().take(max) {
+        info!("    - {table}");
+    }
+    if tables.len() > max {
+        info!("    ... and {} more", tables.len() - max);
     }
 }

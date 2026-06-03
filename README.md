@@ -287,7 +287,7 @@ podman-compose up --build
 #### CLI Arguments
 
 **Global**
-- `-c`, `--config` — path to the TOML configuration file (default: `config.toml`)
+- `-c`, `--config` — path to the TOML configuration file. When omitted, `config.toml` in the working directory is used if present, otherwise built-in defaults apply. When given explicitly, the file **must** exist and parse — a missing or invalid path is a hard error (so a typo like `--config config.yaml` fails loudly instead of silently running with defaults).
 
 **Source connection**
 - `--from-host` — source host (default: `localhost`)
@@ -303,9 +303,12 @@ podman-compose up --build
 - `--to-pass` — target password (default: `newpass`)
 - `--to-db` — initial database for ALTER SYSTEM / globals (default: `postgres`)
 
+**TLS**
+- `--sslmode` — TLS mode for native connections: `disable`, `prefer`, or `require`. Overrides the `sslmode` value from the config file when set.
+
 #### TOML Configuration
 
-The configuration file (default `config.toml`) matches the structure of `config.toml.example`. All parameters are optional and will use their default values if omitted.
+The configuration file (default `config.toml`) is shown below; the repository ships a working `config.toml` you can copy. All parameters are optional and will use their default values if omitted.
 
 ```toml
 # Number of parallel jobs (-j) for pg_dump per database (default: 24)
@@ -330,11 +333,14 @@ dump_root = "pg_dumps"
 # Whether to migrate global objects like roles and groups (default: true)
 migrate_globals = true
 
-# List of "DATABASE.TABLE_PATTERN" patterns to defer data load for.
-# Schema is restored normally, but bulk data is copied after indexes
-# are dropped to speed up restoration.
+# List of "DATABASE.TABLE_PATTERN" patterns whose data is deferred to a
+# separate pass after the regular tables. Schema is restored normally, but bulk
+# data is loaded after indexes are dropped to speed up restoration, and these
+# tables are only row-count-verified once the delayed pass completes.
+# TABLE_PATTERN uses pg_dump wildcards (* = any sequence, ? = one character).
 # delay_table_data = [
-#   "mydb.large_table"
+#   "mydb.large_table",
+#   "mydb.events_*",
 # ]
 
 # If true, uses pg_class.reltuples estimates instead of count(*)
@@ -348,11 +354,22 @@ verify_concurrency = 16
 # Zstd compression level for database dumps (1-22, default: 5)
 zstd_level = 5
 
+# TLS mode for native (tokio-postgres) connections: disable, prefer, or require
+# (default: "prefer"). Mirrors libpq's sslmode: "prefer" negotiates TLS when the
+# server offers it and falls back to plaintext, so it works against both TLS and
+# non-TLS servers. The server certificate is not verified (matching
+# sslmode=prefer/require). Overridable via --sslmode.
+sslmode = "prefer"
+
 # (Optional) List of tables to migrate using the high-performance Copy Engine.
-# See COPY_ENGINE.md for details.
+# See COPY_ENGINE.md for details. A copy-engine table is treated as deferred
+# automatically: it is excluded from both the regular and delayed pg_dump,
+# migrated by the copy engine, and verified after the copy completes — so it
+# does NOT need to be listed in delay_table_data. Each `table` must be a
+# fully-qualified "DATABASE.TABLE" (an unqualified name is a hard error).
 # Multiple rules can be specified for the same table.
 [[copy_rules]]
-table = "DATABASE.TABLE"          # The table to migrate
+table = "DATABASE.TABLE"          # The table to migrate (must be DATABASE.TABLE)
 split_by_column = "created_at"    # Column used for WHERE / partitioning (default: created_at)
 method = "time"                   # Partitioning method: "time" (default) or "hash"
 from = "2023-01-01"               # Inclusive lower bound (optional; auto-discovered for parallel 'time' split)

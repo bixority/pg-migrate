@@ -1,9 +1,11 @@
 use crate::Config;
+use crate::copy_engine::CopyProgress;
 use crate::db;
 use crate::error::{Error, MigrationPhase, Result};
 use crate::plan::{DatabasePlan, MigrationPlan};
 use crate::tui::SharedMigrationStates;
 use crate::verification;
+use indicatif::HumanBytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -317,17 +319,39 @@ async fn migrate_copy_rules(
                 delayed_name,
                 MigrationPhase::DelayedRestoring,
                 4,
-                format!("copying {table_name} via copy engine"),
+                format!("preparing copy of {table_name} via copy engine"),
             );
+
+        // Reflect copy-engine partition progress in the delayed row as each
+        // partition completes; UI updates are best-effort, so a poisoned lock
+        // is ignored rather than aborting the migration.
+        let on_progress = |p: CopyProgress| {
+            if let Ok(mut lock) = states.lock() {
+                lock.update(
+                    delayed_name,
+                    MigrationPhase::DelayedRestoring,
+                    4,
+                    format!(
+                        "copying {table_name} via copy engine ({}/{} partitions, {})",
+                        p.completed_partitions,
+                        p.total_partitions,
+                        HumanBytes(p.total_bytes)
+                    ),
+                );
+            }
+        };
 
         crate::run_copy_engine(
             config,
             db_name,
-            table_name,
-            &rule.column,
-            rule.from.as_deref(),
-            rule.till.as_deref(),
-            Some(&rule.method),
+            crate::CopyTarget {
+                table: table_name,
+                column: &rule.column,
+                from: rule.from.as_deref(),
+                till: rule.till.as_deref(),
+                method: Some(&rule.method),
+            },
+            on_progress,
         )
         .await?;
 

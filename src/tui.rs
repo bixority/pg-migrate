@@ -1,6 +1,6 @@
-use crate::Config;
 use crate::db::MigrationState;
 use crate::error::{Error, MigrationPhase, Result};
+use crate::plan::MigrationPlan;
 use indicatif::{ProgressBar, ProgressStyle};
 use std::collections::BTreeMap;
 use std::fmt::Write;
@@ -26,25 +26,26 @@ pub struct MigrationStates {
 }
 
 impl MigrationStates {
+    /// Builds the state table from the migration plan.
+    ///
+    /// A `"<db> (delayed)"` row is created whenever the plan schedules delayed
+    /// work for that database — i.e. it has delayed tables *or* copy-engine
+    /// rules. This mirrors the spawn predicate in `phase_migrate_all` exactly,
+    /// so every delayed/copy-engine pipeline has a visible row to write into.
     #[must_use]
-    pub fn new(dbs_with_sizes: &[(String, u64)], config: &Config) -> Self {
+    pub fn new(plan: &MigrationPlan) -> Self {
         let mut order = Vec::new();
         let mut states = BTreeMap::new();
 
-        for (db, size) in dbs_with_sizes {
+        for db_plan in &plan.databases {
+            let db = &db_plan.name;
             order.push(db.clone());
-            let state = MigrationState::new(db.clone(), *size);
-            states.insert(db.clone(), state);
+            states.insert(db.clone(), MigrationState::new(db.clone(), db_plan.size));
 
-            let db_prefix = format!("{db}.");
-            if config
-                .delay_table_data
-                .iter()
-                .any(|d| d.starts_with(&db_prefix))
-            {
+            if !db_plan.delayed_tables.is_empty() || !db_plan.copy_rules.is_empty() {
                 let delayed_name = format!("{db} (delayed)");
                 order.push(delayed_name.clone());
-                let mut delayed_state = MigrationState::new(delayed_name.clone(), *size);
+                let mut delayed_state = MigrationState::new(delayed_name.clone(), db_plan.size);
                 delayed_state.total_steps = 6;
                 states.insert(delayed_name, delayed_state);
             }
@@ -140,11 +141,8 @@ fn colored_phase(phase: &MigrationPhase) -> String {
 pub type SharedMigrationStates = Arc<Mutex<MigrationStates>>;
 
 #[must_use]
-pub fn shared_migration_states(
-    dbs_with_sizes: &[(String, u64)],
-    config: &Config,
-) -> SharedMigrationStates {
-    Arc::new(Mutex::new(MigrationStates::new(dbs_with_sizes, config)))
+pub fn shared_migration_states(plan: &MigrationPlan) -> SharedMigrationStates {
+    Arc::new(Mutex::new(MigrationStates::new(plan)))
 }
 
 pub async fn redraw_loop(
@@ -239,4 +237,63 @@ pub fn render_verification_report(
     }
 
     (output, mismatch)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::plan::{CopyRulePlan, DatabasePlan, MigrationPlan};
+
+    fn db_plan(name: &str, delayed: Vec<String>, copy: Vec<CopyRulePlan>) -> DatabasePlan {
+        DatabasePlan {
+            name: name.to_string(),
+            size: 4096,
+            regular_data_excludes: Vec::new(),
+            delayed_tables: delayed,
+            copy_rules: copy,
+            regular_table_names: Vec::new(),
+            delayed_table_names: Vec::new(),
+            copy_table_names: Vec::new(),
+        }
+    }
+
+    fn copy_rule_plan(table: &str) -> CopyRulePlan {
+        CopyRulePlan {
+            table: table.to_string(),
+            column: "created_at".to_string(),
+            method: "time".to_string(),
+            from: None,
+            till: None,
+            partitions: 1,
+            rule_hash: 0,
+        }
+    }
+
+    #[test]
+    fn delayed_row_created_for_delayed_tables() {
+        let plan = MigrationPlan {
+            databases: vec![db_plan("pdb1", vec!["bigtable".to_string()], vec![])],
+        };
+        let table = MigrationStates::new(&plan).render_table();
+        assert!(table.contains("pdb1 (delayed)"), "table was:\n{table}");
+    }
+
+    #[test]
+    fn delayed_row_created_for_copy_rules_only() {
+        let plan = MigrationPlan {
+            databases: vec![db_plan("pdb2", vec![], vec![copy_rule_plan("events")])],
+        };
+        let table = MigrationStates::new(&plan).render_table();
+        assert!(table.contains("pdb2 (delayed)"), "table was:\n{table}");
+    }
+
+    #[test]
+    fn no_delayed_row_without_delayed_work() {
+        let plan = MigrationPlan {
+            databases: vec![db_plan("plain", vec![], vec![])],
+        };
+        let table = MigrationStates::new(&plan).render_table();
+        assert!(table.contains("plain"));
+        assert!(!table.contains("(delayed)"), "table was:\n{table}");
+    }
 }

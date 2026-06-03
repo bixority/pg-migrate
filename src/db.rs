@@ -15,7 +15,7 @@ use tokio::io::AsyncReadExt;
 use tokio::process::Command;
 use tokio::select;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio_postgres::NoTls;
+use tokio_postgres::config::SslMode;
 use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
@@ -97,13 +97,15 @@ type PoolKey = (String, u16, String, String);
 #[derive(Clone)]
 pub struct PoolCache {
     inner: Arc<AsyncMutex<HashMap<PoolKey, Arc<tokio_postgres::Client>>>>,
+    ssl_mode: SslMode,
 }
 
 impl PoolCache {
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(ssl_mode: SslMode) -> Self {
         Self {
             inner: Arc::new(AsyncMutex::new(HashMap::new())),
+            ssl_mode,
         }
     }
 
@@ -128,10 +130,12 @@ impl PoolCache {
             .port(args.port)
             .user(&args.user)
             .password(&args.pass)
-            .dbname(db);
+            .dbname(db)
+            .ssl_mode(self.ssl_mode);
 
+        let tls = crate::tls::make_tls();
         let (client, connection) =
-            tokio::time::timeout(Duration::from_secs(30), config.connect(NoTls))
+            tokio::time::timeout(Duration::from_secs(30), config.connect(tls))
                 .await
                 .map_err(|_| Error::Timeout(format!("to {} database {}", args.host, db)))??;
 

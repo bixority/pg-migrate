@@ -6,6 +6,15 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
+/// Progress snapshot emitted by [`Orchestrator::run`] after each partition
+/// completes, so callers can surface copy-engine progress in their UI.
+#[derive(Clone, Copy, Debug)]
+pub struct CopyProgress {
+    pub completed_partitions: usize,
+    pub total_partitions: usize,
+    pub total_bytes: u64,
+}
+
 pub struct Orchestrator {
     source_config: String,
     dest_config: String,
@@ -31,18 +40,24 @@ impl Orchestrator {
 
     /// Runs the migration for the given partitions.
     ///
+    /// `on_progress` is invoked once before any work starts and again after
+    /// each partition finishes, allowing the caller to surface live progress.
+    ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Connection to the source or destination database fails.
     /// - The `COPY` operation fails.
     /// - A worker fails to process its partition.
-    pub async fn run(&self, partitions: Vec<Partition>) -> Result<u64> {
+    pub async fn run(
+        &self,
+        partitions: Vec<Partition>,
+        mut on_progress: impl FnMut(CopyProgress),
+    ) -> Result<u64> {
+        let total_partitions = partitions.len();
         info!(
-            "Starting migration for table {} with {} workers and {} partitions",
-            self.table_name,
-            self.worker_count,
-            partitions.len()
+            "Starting migration for table {} with {} workers and {total_partitions} partitions",
+            self.table_name, self.worker_count,
         );
 
         let semaphore = Arc::new(Semaphore::new(self.worker_count));
@@ -70,9 +85,21 @@ impl Orchestrator {
         }
 
         let mut total_bytes = 0;
+        let mut completed = 0;
+        on_progress(CopyProgress {
+            completed_partitions: 0,
+            total_partitions,
+            total_bytes: 0,
+        });
         while let Some(res) = join_set.join_next().await {
             let bytes = res??;
             total_bytes += bytes;
+            completed += 1;
+            on_progress(CopyProgress {
+                completed_partitions: completed,
+                total_partitions,
+                total_bytes,
+            });
         }
 
         info!(
@@ -110,7 +137,7 @@ mod tests {
             "table".to_string(),
             4,
         );
-        let result = orch.run(vec![]).await?;
+        let result = orch.run(vec![], |_| {}).await?;
         assert_eq!(result, 0);
         Ok(())
     }
