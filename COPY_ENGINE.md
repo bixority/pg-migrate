@@ -67,11 +67,12 @@ till = "2024-01-01"
 
 - `table`: Fully-qualified table name (`database.table`).
 - `split_by_column`: Column used for the `WHERE` condition and partitioning (default: `created_at`).
-- `method`: Partitioning method. `time` (default) splits a time range. `hash` uses modulus-like partitioning (useful for large tables without a clear time range).
-- `from`: Inclusive lower bound for `time` method — generates `split_by_column >= 'from'`. If omitted, the minimum value is automatically discovered from the database to enable parallel splitting.
-- `till`: Exclusive upper bound for `time` method — generates `split_by_column < 'till'`. If omitted, the maximum value is automatically discovered from the database to enable parallel splitting.
+- `method`: Partitioning method. `time` (default) splits a time range into `max_parallel` equal sub-ranges. `date` (alias `day`) splits the range into one partition per calendar day (UTC). `hash` uses modulus-like partitioning (useful for large tables without a clear time range).
+- `from`: Inclusive lower bound for `time`/`date` methods — generates `split_by_column >= 'from'`. If omitted, the minimum value is automatically discovered from the database to enable parallel splitting.
+- `till`: Exclusive upper bound for `time`/`date` methods — generates `split_by_column < 'till'`. If omitted, the maximum value is automatically discovered from the database to enable parallel splitting.
 
 When `method` is `time`, the range is split into parallel sub-partitions (automatically discovering missing bounds if necessary).
+When `method` is `date` (or `day`), the range is split into one partition per UTC calendar day. Day boundaries are aligned to midnight, except the first partition starts at `from` and the last ends at `till`. The partition count follows the span of the range rather than `max_parallel`; concurrency is still capped by the worker pool.
 When `method` is `hash`, the table is split into `num_partitions` based on the hash of the column values.
 - `--max-parallel`: Number of concurrent workers (default matches global parallelism settings).
 

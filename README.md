@@ -371,7 +371,7 @@ sslmode = "prefer"
 [[copy_rules]]
 table = "DATABASE.TABLE"          # The table to migrate (must be DATABASE.TABLE)
 split_by_column = "created_at"    # Column used for WHERE / partitioning (default: created_at)
-method = "time"                   # Partitioning method: "time" (default) or "hash"
+method = "time"                   # Partitioning method: "time" (default), "date"/"day" (one partition per UTC day), or "hash"
 from = "2023-01-01"               # Inclusive lower bound (optional; auto-discovered for parallel 'time' split)
 till = "2024-01-01"               # Exclusive upper bound (optional; auto-discovered for parallel 'time' split)
 ```

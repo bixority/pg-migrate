@@ -30,6 +30,8 @@ impl Splitter {
     /// bounds and an optional `method`.
     ///
     /// When `method` is "hash", it uses hash-based partitioning.
+    /// When `method` is "date" (or "day") and both bounds are provided, the range is split
+    /// into one partition per calendar day (UTC), regardless of `num_partitions`.
     /// Otherwise, when both `from` and `till` are provided, the range is split into up to
     /// `num_partitions` time-based sub-ranges.
     /// In all other cases a single partition is returned.
@@ -45,8 +47,14 @@ impl Splitter {
         method: Option<&str>,
         num_partitions: usize,
     ) -> Result<Vec<Partition>> {
-        if method == Some("hash") {
-            return Ok(Self::split_hash(column, num_partitions));
+        match method {
+            Some("hash") => return Ok(Self::split_hash(column, num_partitions)),
+            Some("date" | "day") => {
+                if let (Some(f), Some(t)) = (from, till) {
+                    return Self::split_by_date(column, f, t);
+                }
+            }
+            _ => {}
         }
 
         match (from, till) {
@@ -129,6 +137,40 @@ impl Splitter {
         Ok(partitions)
     }
 
+    /// Creates one partition per calendar day (UTC) covering [`from_ts`, `till_ts`).
+    ///
+    /// Boundaries are aligned to UTC midnight, except the first partition starts at
+    /// `from_ts` and the last ends at `till_ts`, so no edge rows are missed. The number
+    /// of partitions therefore follows the span of the range, not `num_partitions`;
+    /// concurrency is still bounded by the orchestrator's worker pool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either timestamp cannot be parsed.
+    pub fn split_by_date(column: &str, from_ts: &str, till_ts: &str) -> Result<Vec<Partition>> {
+        let from = parse_ts(from_ts)?;
+        let till = parse_ts(till_ts)?;
+
+        if from >= till {
+            return Ok(vec![]);
+        }
+
+        let mut partitions = Vec::new();
+        let mut cursor = from;
+        while cursor < till {
+            let p_till = next_utc_midnight(cursor)?.min(till);
+            partitions.push(Partition {
+                column: column.to_string(),
+                from: Some(cursor.to_rfc3339()),
+                till: Some(p_till.to_rfc3339()),
+                method: "date".to_string(),
+            });
+            cursor = p_till;
+        }
+
+        Ok(partitions)
+    }
+
     #[must_use]
     pub fn split_hash(column: &str, num_partitions: usize) -> Vec<Partition> {
         (0..num_partitions)
@@ -142,13 +184,38 @@ impl Splitter {
     }
 }
 
+/// Returns the first UTC midnight strictly after `dt`.
+///
+/// # Errors
+///
+/// Returns an error if advancing past `dt` overflows the representable date range.
+fn next_utc_midnight(dt: DateTime<Utc>) -> Result<DateTime<Utc>> {
+    let naive = dt
+        .date_naive()
+        .checked_add_days(chrono::Days::new(1))
+        .and_then(|d| d.and_hms_opt(0, 0, 0))
+        .ok_or_else(|| {
+            CopyEngineError::Splitter(format!(
+                "Timestamp '{dt}' is too large to advance to the next day"
+            ))
+        })?;
+    Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc))
+}
+
 fn parse_ts(ts: &str) -> Result<DateTime<Utc>> {
     // Try RFC3339 (e.g., 2023-01-01T00:00:00Z)
     if let Ok(dt) = DateTime::parse_from_rfc3339(ts) {
         return Ok(dt.with_timezone(&Utc));
     }
 
-    // Try YYYY-MM-DD HH:MM:SS[.f]
+    // Try Postgres timestamptz text output, e.g. "2026-05-25 00:12:12.265033+03"
+    // (space separator, optional fractional seconds, hour-only offset). The `%#z`
+    // modifier accepts loose offsets like "+03", "+0300", and "+03:00".
+    if let Ok(dt) = DateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f%#z") {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // Try YYYY-MM-DD HH:MM:SS[.f] (no timezone; assume UTC)
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(ts, "%Y-%m-%d %H:%M:%S%.f") {
         return Ok(DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
     }
@@ -311,6 +378,113 @@ mod tests {
         let dt2 = parse_ts(ts2)?;
         assert_eq!(dt2.second(), 24);
         assert_eq!(dt2.nanosecond(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_parse_ts_pg_timestamptz_offset() -> Result<()> {
+        use chrono::Timelike;
+        // Postgres timestamptz text output: space separator, hour-only offset.
+        let dt = parse_ts("2026-05-25 00:12:12.265033+03")?;
+        // 00:12 at +03 is 21:12 UTC the previous day.
+        assert_eq!(dt.hour(), 21);
+        assert_eq!(dt.minute(), 12);
+        assert_eq!(dt.second(), 12);
+        assert_eq!(dt.nanosecond(), 265_033_000);
+
+        // Loose offset variants should all resolve to the same instant.
+        let compact = parse_ts("2026-05-25 00:12:12+0300")?;
+        let colon = parse_ts("2026-05-25 00:12:12+03:00")?;
+        let hour_only = parse_ts("2026-05-25 00:12:12+03")?;
+        assert_eq!(compact, colon);
+        assert_eq!(colon, hour_only);
+        assert_eq!(compact.hour(), 21);
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_by_date_whole_days() -> Result<()> {
+        let partitions = Splitter::split("ts", Some("2023-01-01"), Some("2023-01-04"), Some("date"), 4)?;
+        // 3 full days: [01, 02), [02, 03), [03, 04)
+        assert_eq!(partitions.len(), 3);
+        assert!(partitions.iter().all(|p| p.method == "date"));
+        assert!(
+            partitions[0]
+                .from
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2023-01-01T00:00:00")
+        );
+        assert!(
+            partitions[0]
+                .till
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2023-01-02T00:00:00")
+        );
+        assert!(
+            partitions[2]
+                .till
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2023-01-04T00:00:00")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_by_date_partial_edges() -> Result<()> {
+        // Range that does not start or end on a midnight boundary.
+        let partitions = Splitter::split_by_date("ts", "2023-01-01 06:00:00", "2023-01-03 09:00:00")?;
+        // [06:00, day2 00:00), [day2 00:00, day3 00:00), [day3 00:00, 09:00)
+        assert_eq!(partitions.len(), 3);
+        assert!(
+            partitions[0]
+                .from
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2023-01-01T06:00:00")
+        );
+        assert!(
+            partitions[0]
+                .till
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2023-01-02T00:00:00")
+        );
+        assert!(
+            partitions[2]
+                .from
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2023-01-03T00:00:00")
+        );
+        assert!(
+            partitions[2]
+                .till
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("2023-01-03T09:00:00")
+        );
+        // Partitions are contiguous and non-overlapping.
+        for w in partitions.windows(2) {
+            assert_eq!(w[0].till, w[1].from);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_by_date_day_alias() -> Result<()> {
+        let partitions = Splitter::split("ts", Some("2023-01-01"), Some("2023-01-03"), Some("day"), 4)?;
+        assert_eq!(partitions.len(), 2);
+        assert_eq!(partitions[0].method, "date");
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_by_date_empty_range() -> Result<()> {
+        let partitions = Splitter::split_by_date("ts", "2023-01-05", "2023-01-01")?;
+        assert!(partitions.is_empty());
         Ok(())
     }
 
