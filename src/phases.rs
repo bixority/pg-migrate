@@ -8,7 +8,7 @@ use crate::verification;
 use indicatif::HumanBytes;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
@@ -31,7 +31,14 @@ pub async fn phase_migrate_all(
     restore_sem: Arc<Semaphore>,
 ) -> Result<(Duration, Duration)> {
     let start = Instant::now();
-    let regular_done = Arc::new(Notify::new());
+    // A `watch` (rather than `Notify`) latches the "all regular pipelines
+    // finished" state. A delayed pipeline that reaches its wait point *after*
+    // the signal is sent still observes it, instead of missing the wake and
+    // hanging — which `Notify::notify_waiters` allows for a late-scheduled
+    // waiter. This gate is what guarantees a database's delayed restore never
+    // begins until every regular pipeline (including that same database's
+    // regular dump and restore) has completed.
+    let (regular_done_tx, regular_done_rx) = watch::channel(false);
 
     let mut regular_tasks = JoinSet::new();
     let mut delayed_tasks = JoinSet::new();
@@ -51,7 +58,7 @@ pub async fn phase_migrate_all(
 
         // Spawn delayed pipeline if matching flags
         if !db_plan.delayed_tables.is_empty() || !db_plan.copy_rules.is_empty() {
-            delayed_tasks.spawn(run_delayed_pipeline(args, regular_done.clone()));
+            delayed_tasks.spawn(run_delayed_pipeline(args, regular_done_rx.clone()));
         }
     }
 
@@ -82,8 +89,10 @@ pub async fn phase_migrate_all(
         }
     }
 
-    // Signal all delayed pipelines that they can proceed to restore phase
-    regular_done.notify_waiters();
+    // Open the gate for all delayed pipelines: every regular pipeline has
+    // finished, so the destination schema exists for every database. The value
+    // is latched, so a delayed pipeline that arrives later still sees it.
+    let _ = regular_done_tx.send(true);
 
     // Wait for all delayed pipelines to succeed
     loop {
@@ -183,7 +192,10 @@ async fn run_regular_pipeline(args: PipelineArgs) -> Result<()> {
     })
 }
 
-async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> Result<()> {
+async fn run_delayed_pipeline(
+    args: PipelineArgs,
+    mut regular_done: watch::Receiver<bool>,
+) -> Result<()> {
     let PipelineArgs {
         config,
         db_plan,
@@ -195,7 +207,6 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
 
     let db_name = db_plan.name.clone();
     let delayed_name = format!("{db_name} (delayed)");
-    let regular_done_fut = regular_done.notified();
 
     let res: Result<()> = async {
         // Phase 1: Delayed Dumping
@@ -224,8 +235,15 @@ async fn run_delayed_pipeline(args: PipelineArgs, regular_done: Arc<Notify>) -> 
             .await?;
         }
 
-        // Wait for regular pipelines to finish before proceeding to restore phases
-        regular_done_fut.await;
+        // Wait for regular pipelines to finish before proceeding to restore
+        // phases. This is what guarantees the delayed restore below never starts
+        // before this database's own regular dump and restore have completed.
+        // `wait_for` returns immediately if the gate is already open, and errors
+        // only if the sender was dropped without opening it (a torn-down run).
+        regular_done
+            .wait_for(|&done| done)
+            .await
+            .map_err(|_| Error::Cancelled("regular pipelines did not complete".to_string()))?;
         if cancel.is_cancelled() {
             return Err(Error::Cancelled(
                 "migration process interrupted".to_string(),
