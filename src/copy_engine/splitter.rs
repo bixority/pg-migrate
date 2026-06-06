@@ -26,19 +26,21 @@ impl Display for Partition {
 pub struct Splitter;
 
 impl Splitter {
-    /// Produces partitions for `column` given optional `from` (inclusive) and `till` (exclusive)
-    /// bounds and an optional `method`.
+    /// Produces partitions for `column` given a `from` (inclusive) lower bound, an optional
+    /// `till` (exclusive) upper bound, and an optional `method`.
     ///
     /// When `method` is "hash", it uses hash-based partitioning.
-    /// When `method` is "date" (or "day") and both bounds are provided, the range is split
-    /// into one partition per calendar day (UTC), regardless of `num_partitions`.
-    /// Otherwise, when both `from` and `till` are provided, the range is split into up to
-    /// `num_partitions` time-based sub-ranges.
-    /// In all other cases a single partition is returned.
+    /// For "date"/"day" and "time" methods the upper endpoint is only needed to place the
+    /// interior split boundaries: when `till` is absent the current time stands in as the
+    /// endpoint so the range can still be divided for parallelism, and the final partition is
+    /// left open-ended (`column >= x`) so rows at or beyond it — including ones inserted after
+    /// planning — are still copied. "date"/"day" splits one partition per calendar day (UTC);
+    /// "time" splits into up to `num_partitions` sub-ranges.
+    /// When no `from` is available a single partition is returned.
     ///
     /// # Errors
     ///
-    /// Returns an error if `num_partitions` is 0 or if either bound cannot be parsed as a
+    /// Returns an error if `num_partitions` is 0 or if a bound cannot be parsed as a
     /// timestamp.
     pub fn split(
         column: &str,
@@ -50,26 +52,32 @@ impl Splitter {
         match method {
             Some("hash") => return Ok(Self::split_hash(column, num_partitions)),
             Some("date" | "day") => {
-                if let (Some(f), Some(t)) = (from, till) {
-                    return Self::split_by_date(column, f, t);
+                if let Some(f) = from {
+                    let (upper, open_last) = resolve_upper(till);
+                    return Self::split_by_date(column, f, &upper, open_last);
                 }
             }
             _ => {}
         }
 
-        match (from, till) {
-            (Some(f), Some(t)) => Self::split_time_range(column, f, t, num_partitions),
-            _ => Ok(vec![Partition {
+        let Some(f) = from else {
+            return Ok(vec![Partition {
                 column: column.to_string(),
-                from: from.map(str::to_string),
+                from: None,
                 till: till.map(str::to_string),
                 method: method.unwrap_or("time").to_string(),
-            }]),
-        }
+            }]);
+        };
+        let (upper, open_last) = resolve_upper(till);
+        Self::split_time_range(column, f, &upper, num_partitions, open_last)
     }
 
     /// Creates time-based partitions by dividing the interval [`from_ts`, `till_ts`) into
     /// `num_partitions`.
+    ///
+    /// When `open_last` is set, `till_ts` is treated as a splitting endpoint only: the final
+    /// partition is left open-ended (`column >= x` with no upper bound) so rows at or beyond
+    /// it are still captured.
     ///
     /// # Errors
     ///
@@ -81,6 +89,7 @@ impl Splitter {
         from_ts: &str,
         till_ts: &str,
         num_partitions: usize,
+        open_last: bool,
     ) -> Result<Vec<Partition>> {
         if num_partitions == 0 {
             return Err(CopyEngineError::Splitter(
@@ -95,7 +104,25 @@ impl Splitter {
         let from = parse_ts(from_ts)?;
         let till = parse_ts(till_ts)?;
 
+        // Closed upper bound for the final partition, or `None` when it stays open.
+        let last_till = if open_last {
+            None
+        } else {
+            Some(till.to_rfc3339())
+        };
+
         if from >= till {
+            // The upper endpoint is at or before the start (e.g. a synthesized "now" bound
+            // with future-dated rows). With an open tail, still emit one partition so the
+            // data is captured; otherwise the range is genuinely empty.
+            if open_last {
+                return Ok(vec![Partition {
+                    column: column.to_string(),
+                    from: Some(from.to_rfc3339()),
+                    till: None,
+                    method: "time".to_string(),
+                }]);
+            }
             return Ok(vec![]);
         }
 
@@ -108,7 +135,7 @@ impl Splitter {
             return Ok(vec![Partition {
                 column: column.to_string(),
                 from: Some(from.to_rfc3339()),
-                till: Some(till.to_rfc3339()),
+                till: last_till,
                 method: "time".to_string(),
             }]);
         }
@@ -121,15 +148,15 @@ impl Splitter {
 
             let p_from = from + chrono::Duration::milliseconds(step_ms * i_i64);
             let p_till = if i == num_partitions - 1 {
-                till
+                last_till.clone()
             } else {
-                from + chrono::Duration::milliseconds(step_ms * (i_i64 + 1))
+                Some((from + chrono::Duration::milliseconds(step_ms * (i_i64 + 1))).to_rfc3339())
             };
 
             partitions.push(Partition {
                 column: column.to_string(),
                 from: Some(p_from.to_rfc3339()),
-                till: Some(p_till.to_rfc3339()),
+                till: p_till,
                 method: "time".to_string(),
             });
         }
@@ -144,14 +171,30 @@ impl Splitter {
     /// of partitions therefore follows the span of the range, not `num_partitions`;
     /// concurrency is still bounded by the orchestrator's worker pool.
     ///
+    /// When `open_last` is set, `till_ts` is treated as a splitting endpoint only: the final
+    /// partition is left open-ended (`column >= x`) so rows at or beyond it are still captured.
+    ///
     /// # Errors
     ///
     /// Returns an error if either timestamp cannot be parsed.
-    pub fn split_by_date(column: &str, from_ts: &str, till_ts: &str) -> Result<Vec<Partition>> {
+    pub fn split_by_date(
+        column: &str,
+        from_ts: &str,
+        till_ts: &str,
+        open_last: bool,
+    ) -> Result<Vec<Partition>> {
         let from = parse_ts(from_ts)?;
         let till = parse_ts(till_ts)?;
 
         if from >= till {
+            if open_last {
+                return Ok(vec![Partition {
+                    column: column.to_string(),
+                    from: Some(from.to_rfc3339()),
+                    till: None,
+                    method: "date".to_string(),
+                }]);
+            }
             return Ok(vec![]);
         }
 
@@ -159,10 +202,15 @@ impl Splitter {
         let mut cursor = from;
         while cursor < till {
             let p_till = next_utc_midnight(cursor)?.min(till);
+            let is_last = p_till >= till;
             partitions.push(Partition {
                 column: column.to_string(),
                 from: Some(cursor.to_rfc3339()),
-                till: Some(p_till.to_rfc3339()),
+                till: if is_last && open_last {
+                    None
+                } else {
+                    Some(p_till.to_rfc3339())
+                },
                 method: "date".to_string(),
             });
             cursor = p_till;
@@ -182,6 +230,19 @@ impl Splitter {
             })
             .collect()
     }
+}
+
+/// Resolves the upper splitting endpoint for time/date methods.
+///
+/// A configured `till` is used as a closed upper bound (`open_last` = false). When it is
+/// absent the current time stands in as the endpoint so the range can still be divided for
+/// parallelism, and the caller leaves the final partition open-ended (`open_last` = true) so
+/// rows at or beyond it — including ones inserted after planning — are still copied.
+fn resolve_upper(till: Option<&str>) -> (String, bool) {
+    till.map_or_else(
+        || (Utc::now().to_rfc3339(), true),
+        |t| (t.to_string(), false),
+    )
 }
 
 /// Returns the first UTC midnight strictly after `dt`.
@@ -301,10 +362,19 @@ mod tests {
 
     #[test]
     fn test_split_from_only() -> Result<()> {
+        // With only a lower bound, the upper endpoint is synthesized from the current time so
+        // the range is still split for parallelism, and the final partition is left
+        // open-ended (column >= x) to capture the tail, including rows added after planning.
         let partitions = Splitter::split("col", Some("2023-01-01"), None, None, 4)?;
-        assert_eq!(partitions.len(), 1);
-        assert_eq!(partitions[0].from.as_deref(), Some("2023-01-01"));
-        assert!(partitions[0].till.is_none());
+        assert_eq!(partitions.len(), 4);
+        assert!(
+            partitions[0]
+                .from
+                .as_deref()
+                .unwrap_or("")
+                .contains("2023-01-01")
+        );
+        assert!(partitions[3].till.is_none());
         Ok(())
     }
 
@@ -328,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_split_time_range() -> Result<()> {
-        let partitions = Splitter::split_time_range("col", "2023-01-01", "2023-01-10", 4)?;
+        let partitions = Splitter::split_time_range("col", "2023-01-01", "2023-01-10", 4, false)?;
         assert_eq!(partitions.len(), 4);
         assert!(
             partitions[0]
@@ -348,14 +418,51 @@ mod tests {
     }
 
     #[test]
+    fn test_split_time_range_open_last() -> Result<()> {
+        // open_last treats the upper timestamp as a splitting endpoint only: interior
+        // partitions stay bounded, but the final one is left open (column >= x).
+        let partitions = Splitter::split_time_range("col", "2023-01-01", "2023-01-10", 4, true)?;
+        assert_eq!(partitions.len(), 4);
+        assert!(partitions[2].till.is_some());
+        assert!(partitions[3].till.is_none());
+        assert!(
+            partitions[3]
+                .from
+                .as_deref()
+                .unwrap_or("")
+                .contains("2023-01-")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_time_range_open_last_reversed() -> Result<()> {
+        // A synthesized endpoint at or before the start still yields a single open partition
+        // so the data is captured rather than silently dropped.
+        let partitions = Splitter::split_time_range("col", "2023-01-10", "2023-01-01", 4, true)?;
+        assert_eq!(partitions.len(), 1);
+        assert!(partitions[0].till.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn test_split_by_date_open_last() -> Result<()> {
+        let partitions = Splitter::split_by_date("ts", "2023-01-01", "2023-01-04", true)?;
+        assert_eq!(partitions.len(), 3);
+        assert!(partitions[1].till.is_some());
+        assert!(partitions[2].till.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn test_split_time_range_invalid_format() {
-        let result = Splitter::split_time_range("col", "invalid", "2023-01-10", 4);
+        let result = Splitter::split_time_range("col", "invalid", "2023-01-10", 4, false);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_split_time_range_empty() -> Result<()> {
-        let partitions = Splitter::split_time_range("col", "2023-01-10", "2023-01-01", 4)?;
+        let partitions = Splitter::split_time_range("col", "2023-01-10", "2023-01-01", 4, false)?;
         assert_eq!(partitions.len(), 0);
         Ok(())
     }
@@ -442,7 +549,7 @@ mod tests {
     fn test_split_by_date_partial_edges() -> Result<()> {
         // Range that does not start or end on a midnight boundary.
         let partitions =
-            Splitter::split_by_date("ts", "2023-01-01 06:00:00", "2023-01-03 09:00:00")?;
+            Splitter::split_by_date("ts", "2023-01-01 06:00:00", "2023-01-03 09:00:00", false)?;
         // [06:00, day2 00:00), [day2 00:00, day3 00:00), [day3 00:00, 09:00)
         assert_eq!(partitions.len(), 3);
         assert!(
@@ -491,7 +598,7 @@ mod tests {
 
     #[test]
     fn test_split_by_date_empty_range() -> Result<()> {
-        let partitions = Splitter::split_by_date("ts", "2023-01-05", "2023-01-01")?;
+        let partitions = Splitter::split_by_date("ts", "2023-01-05", "2023-01-01", false)?;
         assert!(partitions.is_empty());
         Ok(())
     }

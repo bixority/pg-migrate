@@ -151,8 +151,13 @@ async fn plan_database(
     Ok(db_plan)
 }
 
-/// Resolves the `from`/`till` bounds for a `time`-method copy rule, discovering
-/// missing bounds from the source database to enable parallel splitting.
+/// Resolves the `from`/`till` bounds for a `time`-method copy rule.
+///
+/// Only the `from` (lower) bound is discovered from the source. The upper bound is never
+/// queried: the copy engine's final partition is always open-ended (`column >= x`), so the
+/// upper endpoint is only a splitting hint that the splitter synthesizes from the current
+/// time. Skipping the `max()` scan avoids a full read of the source on huge tables and
+/// captures rows inserted after planning for free.
 async fn resolve_range(
     config: &Config,
     db_name: &str,
@@ -160,15 +165,15 @@ async fn resolve_range(
     rule: &crate::config::CopyRule,
     cancel: &CancellationToken,
 ) -> Result<(Option<String>, Option<String>)> {
-    let mut from = rule.from.clone();
-    let mut till = rule.till.clone();
+    let from = rule.from.clone();
+    let till = rule.till.clone();
 
-    if rule.method.as_deref().unwrap_or("time") != "time" || (from.is_some() && till.is_some()) {
+    if rule.method.as_deref().unwrap_or("time") != "time" || from.is_some() {
         return Ok((from, till));
     }
 
     info!(
-        "Discovering range for {db_name}.{table_name}.{}...",
+        "Discovering 'from' bound for {db_name}.{table_name}.{}...",
         rule.split_by_column
     );
     let pool = select! {
@@ -176,25 +181,13 @@ async fn resolve_range(
         () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
     };
 
-    if from.is_none() {
-        let query = format!(
-            "SELECT min({})::text FROM {}",
-            rule.split_by_column, table_name
-        );
-        from = pool.query_one(&query, &[]).await?.get(0);
-        if let Some(ref f) = from {
-            info!("Discovered 'from' bound for {table_name}: {f}");
-        }
-    }
-    if till.is_none() {
-        let query = format!(
-            "SELECT max({})::text FROM {}",
-            rule.split_by_column, table_name
-        );
-        till = pool.query_one(&query, &[]).await?.get(0);
-        if let Some(ref t) = till {
-            info!("Discovered 'till' bound for {table_name}: {t}");
-        }
+    let query = format!(
+        "SELECT min({})::text FROM {}",
+        rule.split_by_column, table_name
+    );
+    let from: Option<String> = pool.query_one(&query, &[]).await?.get(0);
+    if let Some(ref f) = from {
+        info!("Discovered 'from' bound for {table_name}: {f}");
     }
 
     Ok((from, till))

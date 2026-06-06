@@ -673,14 +673,32 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         };
 
         if let Err(e) = res {
-            let msg = format!("{e}");
-            if msg.contains("already exists")
-                || msg.contains("MD5-encrypted password")
-                || msg.contains("MD5 password support is deprecated")
-            {
-                continue;
+            // `tokio_postgres::Error`'s Display only yields "db error"; the real
+            // server message, SQLSTATE and detail live in the underlying DbError.
+            if let Some(db_err) = e.as_db_error() {
+                let msg = db_err.message();
+                if msg.contains("already exists")
+                    || msg.contains("MD5-encrypted password")
+                    || msg.contains("MD5 password support is deprecated")
+                {
+                    continue;
+                }
+                warn!(
+                    "Warning: executing globals statement failed [{}]: {}{}{}\n  statement: {s}",
+                    db_err.code().code(),
+                    msg,
+                    db_err
+                        .detail()
+                        .map(|d| format!(" (detail: {d})"))
+                        .unwrap_or_default(),
+                    db_err
+                        .hint()
+                        .map(|h| format!(" (hint: {h})"))
+                        .unwrap_or_default(),
+                );
+            } else {
+                warn!("Warning: executing globals statement failed: {e}\n  statement: {s}");
             }
-            warn!("Warning: executing globals statement failed: {msg}");
         }
     }
 
