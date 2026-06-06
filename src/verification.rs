@@ -60,7 +60,10 @@ pub async fn verify_db(
     include_delayed: bool,
     cancel: CancellationToken,
 ) -> Result<()> {
-    let (mut src_map, mut dst_map) = tokio::try_join!(
+    // Delayed-data and copy-engine tables are excluded from count computation
+    // entirely (see `stat_counts`), so `src_map`/`dst_map` only ever contain
+    // regular tables. There is no separate delayed comparison to make here.
+    let (src_map, dst_map) = tokio::try_join!(
         get_or_compute_counts(
             config,
             &config.source,
@@ -79,43 +82,21 @@ pub async fn verify_db(
         )
     )?;
 
-    let deferred = config.deferred_table_patterns();
-
-    if !include_delayed {
-        filter_delayed_counts(db_name, &deferred, &mut src_map);
-        filter_delayed_counts(db_name, &deferred, &mut dst_map);
-    }
-
     let (output, mismatch) = render_verification_report(db_name, &src_map, &dst_map);
 
     info!("{output}");
 
     if mismatch {
-        let delayed_mismatch =
-            include_delayed && delayed_count_mismatch(db_name, &deferred, &src_map, &dst_map);
-        let non_delayed_mismatch =
-            non_delayed_count_mismatch(db_name, &deferred, &src_map, &dst_map);
-
         if config.fast_verify {
-            if delayed_mismatch {
-                warn!("Delayed-table row counts mismatch for {db_name}");
-            }
-            if non_delayed_mismatch {
-                warn!(
-                    "Fast verification mismatch for {db_name} (non-delayed estimates may differ; \
-                     ANALYZE both sides for closer values)"
-                );
-            }
+            warn!(
+                "Fast verification mismatch for {db_name} (row-count estimates may differ; \
+                 ANALYZE both sides for closer values)"
+            );
         } else {
-            if non_delayed_mismatch {
-                return Err(Error::VerificationFailed {
-                    database: db_name.to_string(),
-                    details: "tables or row counts mismatch".to_string(),
-                });
-            }
-            if delayed_mismatch {
-                warn!("Delayed-table row counts mismatch for {db_name}");
-            }
+            return Err(Error::VerificationFailed {
+                database: db_name.to_string(),
+                details: "tables or row counts mismatch".to_string(),
+            });
         }
     }
 
@@ -130,44 +111,6 @@ pub async fn verify_db(
         fs::write(verify_marker(db_name)?, "")?;
     }
     Ok(())
-}
-
-fn delayed_count_mismatch(
-    db_name: &str,
-    delay_table_data: &[String],
-    src_map: &BTreeMap<String, String>,
-    dst_map: &BTreeMap<String, String>,
-) -> bool {
-    let mut keys: HashSet<&String> = src_map.keys().collect();
-    keys.extend(dst_map.keys());
-    keys.iter().any(|k| {
-        let Some((schema, table)) = k.split_once('.') else {
-            return false;
-        };
-        if !is_delayed_table(db_name, schema, table, delay_table_data) {
-            return false;
-        }
-        src_map.get(*k) != dst_map.get(*k)
-    })
-}
-
-fn non_delayed_count_mismatch(
-    db_name: &str,
-    delay_table_data: &[String],
-    src_map: &BTreeMap<String, String>,
-    dst_map: &BTreeMap<String, String>,
-) -> bool {
-    let mut keys: HashSet<&String> = src_map.keys().collect();
-    keys.extend(dst_map.keys());
-    keys.iter().any(|k| {
-        let Some((schema, table)) = k.split_once('.') else {
-            return src_map.get(*k) != dst_map.get(*k);
-        };
-        if is_delayed_table(db_name, schema, table, delay_table_data) {
-            return false;
-        }
-        src_map.get(*k) != dst_map.get(*k)
-    })
 }
 
 pub async fn get_or_compute_counts(
@@ -193,7 +136,6 @@ pub async fn get_or_compute_counts(
             args,
             db_name,
             &config.deferred_table_patterns(),
-            include_delayed,
             cancel,
         )
         .await?;
@@ -208,7 +150,6 @@ pub async fn stat_counts(
     args: &DbArgs,
     db_name: &str,
     delay_table_data: &[String],
-    include_delayed: bool,
     cancel: CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
     let pool = tokio::select! {
@@ -221,16 +162,18 @@ pub async fn stat_counts(
         () = cancel.cancelled() => return Err(Error::Cancelled(format!("table discovery for {db_name}"))),
     };
 
-    let entries: Vec<(String, String, bool)> = tables
+    // Delayed-data and copy-engine tables are migrated out-of-band (delayed
+    // pipeline / copy engine), so their source and destination row counts are
+    // not meaningful to compare. Skip them on both sides, in every pass.
+    let entries: Vec<(String, String)> = tables
         .into_iter()
         .filter_map(|row| {
             let schema: String = row.get(0);
             let table: String = row.get(1);
-            let delayed = is_delayed_table(db_name, &schema, &table, delay_table_data);
-            if !include_delayed && delayed {
+            if is_delayed_table(db_name, &schema, &table, delay_table_data) {
                 return None;
             }
-            Some((schema, table, delayed))
+            Some((schema, table))
         })
         .collect();
 
@@ -243,7 +186,7 @@ pub async fn stat_counts(
     let verify_sem = config.verify_sem.clone();
 
     let results: Vec<Result<(String, String)>> = stream::iter(entries)
-        .map(|(schema, table, _)| {
+        .map(|(schema, table)| {
             let pool = pool.clone();
             let cancel = cancel_for_stream.clone();
             let verify_sem = verify_sem.clone();
@@ -277,17 +220,14 @@ pub async fn stat_counts(
 async fn fast_stat_counts(
     config: &Config,
     pool: &tokio_postgres::Client,
-    entries: &[(String, String, bool)],
+    entries: &[(String, String)],
     cancel: CancellationToken,
 ) -> Result<BTreeMap<String, String>> {
     let _permit = tokio::select! {
         res = config.verify_sem.clone().acquire_owned() => res?,
         () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".to_string())),
     };
-    let allowed: HashSet<(String, String)> = entries
-        .iter()
-        .map(|(s, t, _)| (s.clone(), t.clone()))
-        .collect();
+    let allowed: HashSet<(String, String)> = entries.iter().cloned().collect();
 
     let rows = tokio::select! {
         res = pool.query(
@@ -314,37 +254,13 @@ async fn fast_stat_counts(
 
     let mut counts: BTreeMap<String, String> = BTreeMap::new();
 
-    for (schema, table, delayed) in entries {
+    for (schema, table) in entries {
         let key = (schema.clone(), table.clone());
-        if *delayed {
-            let full_name = format!("\"{schema}\".\"{table}\"");
-            let count_query = format!("SELECT count(*) FROM {full_name}");
-            let count: i64 = tokio::select! {
-                res = pool.query_one(&count_query, &[]) => res?.get(0),
-                () = cancel.cancelled() => return Err(Error::Cancelled(format!("exact count of {schema}.{table}"))),
-            };
-            counts.insert(format!("{schema}.{table}"), count.to_string());
-        } else {
-            let est = estimates.get(&key).copied().unwrap_or(0);
-            counts.insert(format!("{schema}.{table}"), est.to_string());
-        }
+        let est = estimates.get(&key).copied().unwrap_or(0);
+        counts.insert(format!("{schema}.{table}"), est.to_string());
     }
 
     Ok(counts)
-}
-
-fn filter_delayed_counts(
-    db_name: &str,
-    delay_table_data: &[String],
-    counts: &mut BTreeMap<String, String>,
-) {
-    counts.retain(|full_table_name, _| {
-        let Some((schema, table)) = full_table_name.split_once('.') else {
-            return true;
-        };
-
-        !is_delayed_table(db_name, schema, table, delay_table_data)
-    });
 }
 
 /// Returns whether a table is deferred out of the regular pass.
@@ -374,7 +290,6 @@ pub fn is_delayed_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
 
     #[test]
     fn example_config_classifies_tables() {
@@ -424,80 +339,6 @@ mod tests {
             "public",
             "logs",
             &delay_table_data
-        ));
-    }
-
-    #[test]
-    fn test_mismatch_logic() {
-        let db_name = "db1";
-        let delay_table_data = vec!["db1.public.logs".to_string()];
-
-        let mut src_map = BTreeMap::new();
-        src_map.insert("public.users".to_string(), "100".to_string());
-        src_map.insert("public.logs".to_string(), "500".to_string());
-
-        let mut dst_map = BTreeMap::new();
-        dst_map.insert("public.users".to_string(), "100".to_string());
-        dst_map.insert("public.logs".to_string(), "500".to_string());
-
-        // No mismatch
-        assert!(!delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
-        ));
-        assert!(!non_delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
-        ));
-
-        // Delayed mismatch
-        dst_map.insert("public.logs".to_string(), "501".to_string());
-        assert!(delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
-        ));
-        assert!(!non_delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
-        ));
-
-        // Non-delayed mismatch
-        dst_map.insert("public.logs".to_string(), "500".to_string()); // reset
-        dst_map.insert("public.users".to_string(), "101".to_string());
-        assert!(!delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
-        ));
-        assert!(non_delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
-        ));
-
-        // Both mismatch
-        dst_map.insert("public.logs".to_string(), "501".to_string());
-        assert!(delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
-        ));
-        assert!(non_delayed_count_mismatch(
-            db_name,
-            &delay_table_data,
-            &src_map,
-            &dst_map
         ));
     }
 }
