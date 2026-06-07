@@ -24,11 +24,13 @@ migrate_globals = true
 # Tables whose data is migrated in a separate, delayed pass (e.g. large tables).
 # Every table matching one of these patterns is dumped/restored after the
 # regular tables and is only row-count-verified once that delayed pass finishes.
-# Format: "DATABASE.TABLE_PATTERN", where TABLE_PATTERN uses pg_dump wildcards
-# (* matches any sequence, ? matches a single character).
+# Format: "DATABASE.SCHEMA.TABLE_PATTERN" (all three parts are required). SCHEMA
+# and TABLE_PATTERN may use pg_dump wildcards (* matches any sequence, ? matches
+# a single character); the schema must be given explicitly so tables in any
+# schema can be targeted unambiguously (e.g. "mydb.audit.*").
 delay_table_data = [
-  "pdb1.table3",
-  "pdb2.table*"
+  "pdb1.public.table3",
+  "pdb2.public.table*"
 ]
 
 # Whether to perform fast verification
@@ -54,15 +56,15 @@ sslmode = "prefer"
 # to be listed in delay_table_data, and listing it there (or matching it with a
 # delay pattern) is harmless — the copy engine still wins and the delayed
 # pg_dump still excludes it. Each table must be fully qualified as
-# "DATABASE.TABLE". Multiple rules can target the same table (e.g. to split by
-# time ranges).
+# "DATABASE.SCHEMA.TABLE" (all three parts required). Multiple rules can target
+# the same table (e.g. to split by time ranges).
 [[copy_rules]]
-table = "pdb1.table3"
+table = "pdb1.public.table3"
 split_by_column = "created_at"   # column used for WHERE / range splitting (default: created_at)
 from = "2023-01-01 00:00:00"     # inclusive lower bound (optional; omit for no lower bound)
 till = "2023-06-01 00:00:00"     # exclusive upper bound (optional; omit for no upper bound)
 
 [[copy_rules]]
-table = "pdb2.table3"
+table = "pdb2.public.table3"
 split_by_column = "created_at"
 from = "2023-06-01 00:00:00"

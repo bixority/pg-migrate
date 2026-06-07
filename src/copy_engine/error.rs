@@ -28,8 +28,9 @@ pub enum CopyEngineError {
         "table \"{table}\" is not visible to the copy connection on the {side} database.\n  \
          search_path: {search_path}\n  \
          likely causes:\n    \
-         - the name resolves against the search_path above; if the table lives in a schema \
-         not listed there, qualify it in the copy rule as DATABASE.SCHEMA.TABLE;\n    \
+         - the copy rule names the table as SCHEMA.TABLE, so the SCHEMA must exist on the \
+         {side} and the name must be spelled correctly — confirm the schema is present and the \
+         table lives in it;\n    \
          - identifier case/quoting: an unquoted name folds to lower case, so a table created \
          as \"MyTable\" must be referenced with its exact case;\n    \
          - (destination only) the regular schema restore was skipped, e.g. a stale \

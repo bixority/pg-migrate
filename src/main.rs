@@ -74,6 +74,12 @@ pub async fn run_copy_engine(
     target: CopyTarget<'_>,
     on_progress: impl FnMut(copy_engine::CopyProgress),
 ) -> Result<()> {
+    // `target.table` is schema-qualified (`schema.table`): copy rules are
+    // configured as `DATABASE.SCHEMA.TABLE` and planning strips only the
+    // `DATABASE.` prefix. Because the COPY statements name the table with its
+    // schema, resolution does not depend on the connection role's `search_path`
+    // — a role whose default path omits `public` no longer makes a public table
+    // look missing.
     let source_conn = format!(
         "host={} port={} user={} password={} dbname={} sslmode={}",
         config.source.host,

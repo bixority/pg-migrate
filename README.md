@@ -211,13 +211,13 @@ Then, in parallel across up to `--max-parallel` databases, each database runs th
 
 | Step | Phase | What it does |
 |------|-------|--------------|
-| 1 | `dumping` | `pg_dump -Fd -j <dump-jobs> -Z zstd:5`. If any `--delay-table-data` patterns match this DB, the matching tables are emitted with `--exclude-table-data` (schema kept, data skipped). |
+| 1 | `dumping` | `pg_dump -Fd -j <dump-jobs> -Z zstd:5`. If any `delay_table_data` patterns match this DB, the matching tables are emitted with `--exclude-table-data` (schema kept, data skipped). |
 | 2 | `source counts` | `SELECT count(*)` per table on the source, cached to `$HOME/pg_verify_state/<db>.src_counts.json`. Queries run concurrently and the total in-flight queries across all DBs are bounded by `--verify-concurrency`. With `--fast-verify`, a single `pg_class.reltuples` query replaces per-table counts; cached to `<db>.src_counts.fast.json`. |
 | 3 | `restoring` | `pg_restore -j <restore-jobs> --disable-triggers`. Restores schema, indexes, PKs, FKs, sequences, triggers, and the data of non-delayed tables. Delayed tables exist but are empty. |
 | 4 | `dest counts` | Same as step 2, against the destination. |
 | 5 | `verifying` | Compare source vs. destination counts (delayed tables excluded). Mismatches fail the migration. With `--fast-verify`, non-delayed mismatches are logged as warnings rather than failures (since `reltuples` is an estimate); delayed-table mismatches still fail. |
 
-If a database has no matching `--delay-table-data` patterns, it transitions to `complete` (step 6) here.
+If a database has no matching `delay_table_data` patterns, it transitions to `complete` (step 6) here.
 
 Databases with delayed tables continue into a **delayed phase**:
 
@@ -276,7 +276,7 @@ Re-running the tool resumes from wherever it stopped. Delete the relevant marker
 
 ### Launching with Podman Compose
 
-The bundled `compose.yml` brings up a Postgres 9.5 source, a Postgres 18 target, and a one-shot migration container that depends on both being healthy. Edit the `command:` in `compose.yml` to change flags (the bundled example uses `--delay-table-data pdb1.table3` and `pdb2.table*`).
+The bundled `compose.yml` brings up a Postgres 9.5 source, a Postgres 18 target, and a one-shot migration container that depends on both being healthy. Edit the `command:` in `compose.yml` to change flags (the bundled example uses `--delay-table-data pdb1.public.table3` and `pdb2.public.table*`).
 
 ```bash
 podman-compose up --build
@@ -333,14 +333,16 @@ dump_root = "pg_dumps"
 # Whether to migrate global objects like roles and groups (default: true)
 migrate_globals = true
 
-# List of "DATABASE.TABLE_PATTERN" patterns whose data is deferred to a
+# List of "DATABASE.SCHEMA.TABLE_PATTERN" patterns whose data is deferred to a
 # separate pass after the regular tables. Schema is restored normally, but bulk
 # data is loaded after indexes are dropped to speed up restoration, and these
 # tables are only row-count-verified once the delayed pass completes.
-# TABLE_PATTERN uses pg_dump wildcards (* = any sequence, ? = one character).
+# All three parts are required; SCHEMA and TABLE_PATTERN may use pg_dump
+# wildcards (* = any sequence, ? = one character), so tables in any schema can be
+# targeted (e.g. "mydb.audit.*").
 # delay_table_data = [
-#   "mydb.large_table",
-#   "mydb.events_*",
+#   "mydb.public.large_table",
+#   "mydb.public.events_*",
 # ]
 
 # If true, uses pg_class.reltuples estimates instead of count(*)
@@ -366,10 +368,10 @@ sslmode = "prefer"
 # automatically: it is excluded from both the regular and delayed pg_dump,
 # migrated by the copy engine, and verified after the copy completes — so it
 # does NOT need to be listed in delay_table_data. Each `table` must be a
-# fully-qualified "DATABASE.TABLE" (an unqualified name is a hard error).
-# Multiple rules can be specified for the same table.
+# fully-qualified "DATABASE.SCHEMA.TABLE"; a missing schema (or database) is a
+# hard error. Multiple rules can be specified for the same table.
 [[copy_rules]]
-table = "DATABASE.TABLE"          # The table to migrate (must be DATABASE.TABLE)
+table = "DATABASE.SCHEMA.TABLE"   # The table to migrate (must be DATABASE.SCHEMA.TABLE)
 split_by_column = "created_at"    # Column used for WHERE / partitioning (default: created_at)
 method = "time"                   # Partitioning method: "time" (default), "date"/"day" (one partition per UTC day), or "hash"
 from = "2023-01-01"               # Inclusive lower bound (optional; auto-discovered for parallel 'time' split)

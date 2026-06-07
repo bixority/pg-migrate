@@ -53,19 +53,19 @@ Configure copy rules in `config.toml`. You can specify multiple rules for the sa
 
 ```toml
 [[copy_rules]]
-table = "mydb.large_table"
+table = "mydb.public.large_table"
 split_by_column = "created_at"
 from = "2023-01-01"
 till = "2023-06-01"
 
 [[copy_rules]]
-table = "mydb.large_table"
+table = "mydb.public.large_table"
 split_by_column = "created_at"
 from = "2023-06-01"
 till = "2024-01-01"
 ```
 
-- `table`: Fully-qualified table name (`database.table`).
+- `table`: Fully-qualified table name (`database.schema.table`). All three parts are required — the schema must be explicit so the `COPY` resolves the relation independently of the connection role's `search_path` (a role whose path omits `public` would otherwise report a public table as missing).
 - `split_by_column`: Column used for the `WHERE` condition and partitioning (default: `created_at`).
 - `method`: Partitioning method. `time` (default) splits a time range into `max_parallel` equal sub-ranges. `date` (alias `day`) splits the range into one partition per calendar day (UTC). `hash` uses modulus-like partitioning (useful for large tables without a clear time range).
 - `from`: Inclusive lower bound for `time`/`date` methods — generates `split_by_column >= 'from'`. If omitted, the minimum value is automatically discovered from the database to enable parallel splitting.

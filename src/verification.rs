@@ -266,9 +266,11 @@ async fn fast_stat_counts(
 /// Returns whether a table is deferred out of the regular pass.
 ///
 /// `delay_table_data` here is the full deferred set (delay patterns plus
-/// copy-engine tables — see [`crate::config::Config::deferred_table_patterns`]). The
-/// patterns use `pg_dump`'s `*`/`?` wildcard semantics, matched here with
-/// [`WildMatch`] against both the bare table name and `schema.table`.
+/// copy-engine tables — see [`crate::config::Config::deferred_table_patterns`]).
+/// Every entry is fully qualified as `DATABASE.SCHEMA.TABLE`; the `DATABASE.`
+/// prefix must equal `db_name`, and the remaining `SCHEMA.TABLE` pattern (which
+/// may use `pg_dump`'s `*`/`?` wildcards) is matched with [`WildMatch`] against
+/// the relation's `schema.table`.
 pub fn is_delayed_table(
     db_name: &str,
     schema: &str,
@@ -276,14 +278,14 @@ pub fn is_delayed_table(
     delay_table_data: &[String],
 ) -> bool {
     let db_prefix = format!("{db_name}.");
+    let qualified = format!("{schema}.{table}");
 
     delay_table_data.iter().any(|delay| {
-        let Some(table_pattern) = delay.strip_prefix(&db_prefix) else {
+        let Some(schema_table_pattern) = delay.strip_prefix(&db_prefix) else {
             return false;
         };
 
-        let matcher = WildMatch::new(table_pattern);
-        matcher.matches(table) || matcher.matches(&format!("{schema}.{table}"))
+        WildMatch::new(schema_table_pattern).matches(&qualified)
     })
 }
 
@@ -293,21 +295,30 @@ mod tests {
 
     #[test]
     fn example_config_classifies_tables() {
-        // The exact patterns from the shipped example config.toml.
-        let delay = vec!["pdb1.table3".to_string(), "pdb2.table*".to_string()];
-        let copy = vec!["pdb1.table3".to_string(), "pdb2.table3".to_string()];
+        // The exact (schema-qualified) patterns from the shipped example config.
+        let delay = vec![
+            "pdb1.public.table3".to_string(),
+            "pdb2.public.table*".to_string(),
+        ];
+        let copy = vec![
+            "pdb1.public.table3".to_string(),
+            "pdb2.public.table3".to_string(),
+        ];
 
         // Matching is per-database: it only fires when the entry's "DATABASE."
         // prefix equals the actual database name being planned.
 
-        // pdb1.table3 is matched by its copy rule (copy wins over delayed).
+        // pdb1.public.table3 is matched by its copy rule (copy wins over delayed).
         assert!(is_delayed_table("pdb1", "public", "table3", &copy));
-        // pdb2.table3 is matched by its copy rule.
+        // pdb2.public.table3 is matched by its copy rule.
         assert!(is_delayed_table("pdb2", "public", "table3", &copy));
-        // pdb2.table5 is not a copy table, but the "pdb2.table*" delay pattern
-        // matches it, so it goes to the delayed pass.
+        // pdb2.public.table5 is not a copy table, but the "pdb2.public.table*"
+        // delay pattern matches it, so it goes to the delayed pass.
         assert!(!is_delayed_table("pdb2", "public", "table5", &copy));
         assert!(is_delayed_table("pdb2", "public", "table5", &delay));
+        // The wildcard is anchored to the public schema: the same table name in
+        // another schema is not matched.
+        assert!(!is_delayed_table("pdb2", "audit", "table5", &delay));
         // A different table in pdb1 is neither copy nor delayed → regular.
         assert!(!is_delayed_table("pdb1", "public", "users", &copy));
         assert!(!is_delayed_table("pdb1", "public", "users", &delay));
@@ -325,6 +336,14 @@ mod tests {
         assert!(is_delayed_table(
             "db1",
             "audit",
+            "actions",
+            &delay_table_data
+        ));
+        // The "db1.audit.*" pattern is schema-anchored: a table of the same name
+        // in another schema is regular, not delayed.
+        assert!(!is_delayed_table(
+            "db1",
+            "public",
             "actions",
             &delay_table_data
         ));

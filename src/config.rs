@@ -95,9 +95,9 @@ impl Config {
 
 /// Builds the deferred-table pattern list from the raw config pieces.
 ///
-/// Copy-engine rule tables are already in `DATABASE.TABLE` form, identical to
-/// `delay_table_data` entries, so they slot straight into the same matching
-/// logic used by verification.
+/// Copy-engine rule tables are already in `DATABASE.SCHEMA.TABLE` form,
+/// identical to `delay_table_data` entries, so they slot straight into the same
+/// matching logic used by verification.
 fn deferred_table_patterns(delay_table_data: &[String], copy_rules: &[CopyRule]) -> Vec<String> {
     delay_table_data
         .iter()
@@ -287,6 +287,9 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
     let copy_rules = toml_config.copy_rules.unwrap_or_default();
     validate_copy_rules(&copy_rules)?;
 
+    let delay_table_data = toml_config.delay_table_data.unwrap_or_default();
+    validate_delay_table_data(&delay_table_data)?;
+
     Ok(Arc::new(Config {
         source: db::DbArgs {
             host: args.from_host,
@@ -309,7 +312,7 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
         restore_parallel,
         dump_root: toml_config.dump_root.into(),
         migrate_globals: toml_config.migrate_globals,
-        delay_table_data: toml_config.delay_table_data.unwrap_or_default(),
+        delay_table_data,
         fast_verify: toml_config.fast_verify,
         verify_concurrency,
         pool_cache: db::PoolCache::new(ssl_mode),
@@ -320,28 +323,68 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
     }))
 }
 
-/// Validates that every copy rule targets a fully-qualified `DATABASE.TABLE`.
+/// Splits a fully-qualified `DATABASE.SCHEMA.TABLE` entry into its three parts.
 ///
-/// A bare table name (no `DATABASE.` prefix) silently never matches any
-/// database during planning, so the copy rule would be skipped without notice.
-/// Catching it here turns that silent skip into an explicit error.
+/// Returns `None` unless the entry has exactly three dot-separated, non-empty
+/// components. The `SCHEMA` and `TABLE` components may carry `pg_dump` wildcards
+/// (`*`/`?`) for `delay_table_data` patterns; the database component is always a
+/// literal name. Table or schema identifiers containing a literal `.` are not
+/// supported (they would parse as extra components).
+fn parse_qualified(entry: &str) -> Option<(&str, &str, &str)> {
+    let mut parts = entry.split('.');
+    let (db, schema, table) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || db.is_empty() || schema.is_empty() || table.is_empty() {
+        return None;
+    }
+    Some((db, schema, table))
+}
+
+/// Validates that every copy rule targets a fully-qualified
+/// `DATABASE.SCHEMA.TABLE`.
+///
+/// Schema qualification is mandatory: a bare or schema-less name resolves
+/// against the destination role's `search_path`, which can omit `public` and
+/// make an existing table look missing (and it also never matches any database
+/// during planning, silently skipping the rule). Requiring all three components
+/// turns those silent or environment-dependent failures into an explicit error.
 ///
 /// # Errors
 ///
 /// Returns [`Error::InvalidCopyRule`] when a rule's table is not in
-/// `DATABASE.TABLE` form.
+/// `DATABASE.SCHEMA.TABLE` form.
 fn validate_copy_rules(rules: &[CopyRule]) -> Result<()> {
     for rule in rules {
-        let Some((db, table)) = rule.table.split_once('.') else {
+        if parse_qualified(&rule.table).is_none() {
             return Err(Error::InvalidCopyRule {
                 table: rule.table.clone(),
-                reason: "expected 'DATABASE.TABLE' format".to_string(),
+                reason: "expected 'DATABASE.SCHEMA.TABLE' format with all parts non-empty"
+                    .to_string(),
             });
-        };
-        if db.is_empty() || table.is_empty() {
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every `delay_table_data` entry is a fully-qualified
+/// `DATABASE.SCHEMA.TABLE` pattern.
+///
+/// As with copy rules, the schema must be explicit so the deferred `pg_dump`
+/// `--table`/`--exclude-table` patterns and the verification matcher are
+/// unambiguous. The `SCHEMA` and `TABLE` parts may use `pg_dump` wildcards
+/// (e.g. `mydb.public.events_*` or `mydb.audit.*`).
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidCopyRule`] when an entry is not in
+/// `DATABASE.SCHEMA.TABLE` form.
+fn validate_delay_table_data(patterns: &[String]) -> Result<()> {
+    for pattern in patterns {
+        if parse_qualified(pattern).is_none() {
             return Err(Error::InvalidCopyRule {
-                table: rule.table.clone(),
-                reason: "both DATABASE and TABLE must be non-empty".to_string(),
+                table: pattern.clone(),
+                reason: "delay_table_data entry must be 'DATABASE.SCHEMA.TABLE' with all parts \
+                         non-empty"
+                    .to_string(),
             });
         }
     }
@@ -393,7 +436,7 @@ mod tests {
     fn toml_parsing_copy_rules() -> Result<()> {
         let toml = "
 [[copy_rules]]
-table = \"mydb.large_table\"
+table = \"mydb.public.large_table\"
 split_by_column = \"created_at\"
 from = \"2023-01-01\"
 till = \"2024-01-01\"
@@ -403,7 +446,7 @@ till = \"2024-01-01\"
             .copy_rules
             .ok_or_else(|| Error::Config("copy_rules should be Some".into()))?;
         assert_eq!(rules.len(), 1);
-        assert_eq!(rules[0].table, "mydb.large_table");
+        assert_eq!(rules[0].table, "mydb.public.large_table");
         assert_eq!(rules[0].split_by_column, "created_at");
         assert_eq!(rules[0].from.as_deref(), Some("2023-01-01"));
         assert_eq!(rules[0].till.as_deref(), Some("2024-01-01"));
@@ -415,7 +458,7 @@ till = \"2024-01-01\"
     fn toml_parsing_copy_rules_hash_method() -> Result<()> {
         let toml = "
 [[copy_rules]]
-table = \"mydb.skewed_table\"
+table = \"mydb.public.skewed_table\"
 method = \"hash\"
 ";
         let config: TomlConfig = toml::from_str(toml)?;
@@ -431,12 +474,12 @@ method = \"hash\"
     fn toml_parsing_multiple_copy_rules_same_table() -> Result<()> {
         let toml = "
 [[copy_rules]]
-table = \"mydb.table1\"
+table = \"mydb.public.table1\"
 from = \"2023-01-01\"
 till = \"2023-02-01\"
 
 [[copy_rules]]
-table = \"mydb.table1\"
+table = \"mydb.public.table1\"
 from = \"2023-02-01\"
 till = \"2023-03-01\"
 ";
@@ -445,8 +488,8 @@ till = \"2023-03-01\"
             .copy_rules
             .ok_or_else(|| Error::Config("copy_rules should be Some".into()))?;
         assert_eq!(rules.len(), 2);
-        assert_eq!(rules[0].table, "mydb.table1");
-        assert_eq!(rules[1].table, "mydb.table1");
+        assert_eq!(rules[0].table, "mydb.public.table1");
+        assert_eq!(rules[1].table, "mydb.public.table1");
         assert_ne!(rules[0].rule_hash(), rules[1].rule_hash());
         Ok(())
     }
@@ -464,8 +507,11 @@ till = \"2023-03-01\"
     }
 
     #[test]
-    fn validate_copy_rules_accepts_qualified_tables() {
-        let rules = [copy_rule("mydb.table1"), copy_rule("mydb.public.table2")];
+    fn validate_copy_rules_accepts_schema_qualified_tables() {
+        let rules = [
+            copy_rule("mydb.public.table1"),
+            copy_rule("mydb.audit.table2"),
+        ];
         assert!(validate_copy_rules(&rules).is_ok());
     }
 
@@ -479,29 +525,67 @@ till = \"2023-03-01\"
     }
 
     #[test]
-    fn validate_copy_rules_rejects_empty_parts() {
+    fn validate_copy_rules_rejects_schema_less_table() {
+        // Two parts (DATABASE.TABLE, no schema) is no longer accepted: the
+        // schema must be explicit.
+        let rules = [copy_rule("mydb.table1")];
         assert!(matches!(
-            validate_copy_rules(&[copy_rule(".table1")]),
+            validate_copy_rules(&rules),
             Err(Error::InvalidCopyRule { .. })
         ));
+    }
+
+    #[test]
+    fn validate_copy_rules_rejects_empty_parts() {
+        for bad in [
+            ".public.table1",
+            "mydb..table1",
+            "mydb.public.",
+            "mydb.public.table.extra",
+        ] {
+            assert!(
+                matches!(
+                    validate_copy_rules(&[copy_rule(bad)]),
+                    Err(Error::InvalidCopyRule { .. })
+                ),
+                "expected '{bad}' to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_delay_table_data_accepts_schema_qualified_patterns() {
+        let patterns = vec![
+            "mydb.public.events_*".to_string(),
+            "mydb.audit.*".to_string(),
+        ];
+        assert!(validate_delay_table_data(&patterns).is_ok());
+    }
+
+    #[test]
+    fn validate_delay_table_data_rejects_schema_less_pattern() {
+        let patterns = vec!["mydb.events_*".to_string()];
         assert!(matches!(
-            validate_copy_rules(&[copy_rule("mydb.")]),
+            validate_delay_table_data(&patterns),
             Err(Error::InvalidCopyRule { .. })
         ));
     }
 
     #[test]
     fn deferred_patterns_include_copy_rule_tables() {
-        let delay = vec!["pdb1.table3".to_string()];
-        let rules = [copy_rule("pdb2.events"), copy_rule("pdb1.public.audit")];
+        let delay = vec!["pdb1.public.table3".to_string()];
+        let rules = [
+            copy_rule("pdb2.public.events"),
+            copy_rule("pdb1.public.audit"),
+        ];
 
         let deferred = deferred_table_patterns(&delay, &rules);
 
         assert_eq!(
             deferred,
             vec![
-                "pdb1.table3".to_string(),
-                "pdb2.events".to_string(),
+                "pdb1.public.table3".to_string(),
+                "pdb2.public.events".to_string(),
                 "pdb1.public.audit".to_string(),
             ]
         );

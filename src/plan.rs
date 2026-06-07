@@ -30,7 +30,7 @@ pub struct DatabasePlan {
 
 #[derive(Debug, Clone)]
 pub struct CopyRulePlan {
-    pub table: String, // Just the table name without DB prefix
+    pub table: String, // Schema-qualified `schema.table` (DB prefix stripped)
     pub column: String,
     pub method: String,
     pub from: Option<String>,
@@ -193,8 +193,8 @@ async fn resolve_range(
     Ok((from, till))
 }
 
-/// Warns when a `DATABASE.TABLE` config entry targets a database that is not in
-/// the migrated set, so it contributes no delayed/copy-engine work.
+/// Warns when a `DATABASE.SCHEMA.TABLE` config entry targets a database that is
+/// not in the migrated set, so it contributes no delayed/copy-engine work.
 fn warn_unmatched(entry: &str, dbs_with_sizes: &[(String, u64)], source: &str) {
     let db = entry.split_once('.').map_or(entry, |(db, _)| db);
     if !dbs_with_sizes.iter().any(|(name, _)| name.as_str() == db) {
