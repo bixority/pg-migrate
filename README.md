@@ -1,12 +1,17 @@
 ### PostgreSQL Migration Tool
 
-This tool automates migrating every user database (and global objects) between two PostgreSQL instances. It drives `pg_dump`/`pg_restore` in parallel, optionally defers bulk data for nominated tables until secondary indexes have been dropped (so the COPY runs without index overhead), and verifies row counts on both sides.
+This tool automates migrating every user database (and global objects) between two PostgreSQL instances. It drives `pg_dump`/`pg_restore` in parallel, optionally defers the bulk data of nominated tables to a separate pass that runs after all regular databases finish, can stream the very largest tables with a custom binary `COPY` engine, and verifies row counts on both sides.
 
 ### Purpose
 
-The tool migrates all user databases from a source server to a target server. It also migrates global objects like roles while carefully avoiding overwriting the migration user's credentials on the target. It optimizes the target server settings for fast restoration and reverts them after completion.
+The tool migrates all user databases from a source server to a target server. It also migrates global objects like roles while carefully avoiding overwriting the migration user's credentials on the target.
 
-For very large tables, it can additionally defer the data load: the table schema, PK/UNIQUE constraints, FKs, sequences, and triggers are restored as part of the regular phase (so clients can already INSERT into the table using its sequences), but the table's secondary indexes are dropped before the bulk COPY and rebuilt afterwards, avoiding per-row index maintenance on millions of inserts.
+For very large tables, two deferral mechanisms keep them out of the critical path:
+
+- **Delayed data** — the table's schema, constraints, indexes, sequences, and triggers are created during the regular restore (so the table is fully usable), but its bulk data is dumped `--data-only` and restored in a separate **delayed pass** that only starts once *every* database's regular pipeline has finished. This lets all the schema/structure work and the small tables complete first.
+- **Copy engine** — for tables too large even for the delayed `pg_dump` path, a built-in streaming engine partitions the table by a time/date/hash column and pipelines raw binary `COPY OUT → COPY IN` across many parallel workers. See [COPY_ENGINE.md](COPY_ENGINE.md).
+
+> **Note:** This tool does **not** drop/recreate indexes around the bulk load, and it does **not** alter destination server settings (`fsync`, `maintenance_work_mem`, etc.). If you want a "fast restore" configuration on the target, set it yourself before running (e.g. `postgres -c fsync=off -c synchronous_commit=off`) and revert it afterwards.
 
 ### Building
 
@@ -36,6 +41,8 @@ pg-migrate \
 
 The tool discovers databases on the source, dumps them to `dump_root` (specified in config), restores them to the target, and verifies row counts. State files in `$HOME/pg_migrate_state` and `$HOME/pg_verify_state` let it resume after interruption (Ctrl-C cancels gracefully and kills child `pg_dump`/`pg_restore` processes).
 
+> **All tuning is done in `config.toml`, not on the command line.** The only command-line flags are the source/target connection settings, `--config`, and `--sslmode` (see [Configuration](#configuration)). Parallelism, deferred tables, copy rules, verification mode, etc. are TOML keys.
+
 ### Process Flow
 
 ```
@@ -47,154 +54,142 @@ The tool discovers databases on the source, dumps them to `dump_root` (specified
                        +---------------+----------------+
                                        v
                        +--------------------------------+
-                       | enable_fast_restore  (dest)    |
-                       |   fsync/sync_commit=off,       |
-                       |   maintenance_work_mem=2GB,    |
-                       |   ALTER SYSTEM + reload        |
-                       +---------------+----------------+
-                                       v
-                       +--------------------------------+
-                       | migrate_globals                |
-                       |   pg_dumpall --globals-only,   |
-                       |   filter destination superuser |
+                       | migrate_globals (if enabled)   |
+                       |   pg_dumpall --globals-only,    |
+                       |   filter destination superuser  |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
                        | create_dbs  (CREATE DATABASE)  |
                        +---------------+----------------+
                                        v
+                       +--------------------------------+
+                       | build migration plan (source   |
+                       | catalog): classify each table  |
+                       | as regular / delayed / copy    |
+                       +---------------+----------------+
+                                       v
               +--------------------------------------------+
-              | Spawn one task per DB. Each task flows     |
-              | through the per-DB pipeline below.         |
-              | Two independent semaphores throttle the    |
-              | source-side and destination-side stages so |
-              | the next dump overlaps the previous restore|
+              | Spawn, per DB, a REGULAR pipeline (always) |
+              | and a DELAYED pipeline (only if the DB has |
+              | delayed tables or copy rules). Two         |
+              | independent semaphores throttle the        |
+              | source-side (dump_sem) and destination-    |
+              | side (restore_sem) stages so the next dump |
+              | overlaps the previous restore.             |
               +-----------------------+--------------------+
-                                      v
-   ============================================================
-   === acquire dump_sem  (max_parallel slots, source-side) ====
-   ============================================================
+
+   ===================== REGULAR PIPELINE =====================
+   === acquire dump_sem (dump_parallel slots, source-side) ====
                                       v
                        +--------------------------------+
                        | 1. dumping                     |
-                       |    pg_dump -Fd -j dump-jobs    |
-                       |             -Z zstd:5          |
-                       |    delayed tables get          |
+                       |    pg_dump -Fd -j dump_jobs    |
+                       |             -Z zstd:<level>    |
+                       |    delayed/copy tables get     |
                        |       --exclude-table-data     |
                        +---------------+----------------+
                                        v
-                       +--------------------------------+
-                       | 2. source counts               |
-                       |    concurrent count(*),        |
-                       |    GLOBALLY capped by          |
-                       |    verify_concurrency (one     |
-                       |    semaphore shared by every   |
-                       |    DB and both servers).       |
-                       |    --fast-verify => single     |
-                       |    pg_class.reltuples query    |
-                       +---------------+----------------+
-                                       v
    ===================== release dump_sem =====================
-                                       v
-   ============================================================
-   === acquire restore_sem (max_parallel, destination-side) ===
-   ============================================================
-                                       v
+   === acquire restore_sem (restore_parallel, dest-side) ======
+                                      v
                        +--------------------------------+
-                       | 3. restoring                   |
-                       |    pg_restore -j restore-jobs  |
+                       | 2. restoring                   |
+                       |    pg_restore -j restore_jobs  |
                        |               --disable-       |
                        |               triggers         |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
-                       | 4. dest counts  (same logic as |
-                       |    source counts)              |
+                       | 3. source counts               |
+                       |    concurrent count(*),        |
+                       |    GLOBALLY capped by          |
+                       |    verify_concurrency (one     |
+                       |    semaphore shared by every   |
+                       |    DB and both servers).       |
+                       |    fast_verify => single       |
+                       |    pg_class.reltuples query    |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
-                       | 5. verifying  (compare maps)   |
-                       |    fast-verify: non-delayed    |
-                       |    mismatches => warning;      |
-                       |    strict mode => failure      |
-                       +---------------+----------------+
-                                       v
-                          mark_regular_done
-                                       v
-                       no delayed tables for this DB?
-                       --------- yes ---------> Complete
-                                  | no
-                                  v
-   ==================== release restore_sem ===================
-                                       v
-   ============================================================
-   === acquire dump_sem again ================================
-   ============================================================
-                                       v
-                       +--------------------------------+
-                       | 7. delayed dumping             |
-                       |    pg_dump --data-only         |
-                       |             --table=<pattern>  |
-                       +---------------+----------------+
-                                       v
-   ===================== release dump_sem =====================
-                                       v
-   ============================================================
-   === acquire restore_sem again =============================
-   ============================================================
-                                       v
-                       +--------------------------------+
-                       | 8. drop indexes (destination)  |
-                       |    DROP non-constraint indexes |
-                       |    on delayed tables           |
+                       | 4. dest counts (same logic)    |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
-                       | 9. delayed restoring           |
+                       | 5. verifying  (compare maps;   |
+                       |    deferred tables excluded)   |
+                       |    strict => mismatch fails;   |
+                       |    fast_verify => warning      |
+                       +---------------+----------------+
+                                       v
+   ===================== release restore_sem ==================
+                                       v
+                                   Complete
+
+   ===================== DELAYED PIPELINE =====================
+   (only for DBs with delayed_table_data and/or copy_rules)
+                                      v
+   === acquire dump_sem ======================================
+                       +--------------------------------+
+                       | A. delayed dumping             |
+                       |    pg_dump -Fd --data-only     |
+                       |       --table=<delayed pattern>|
+                       |       --exclude-table=<copy>   |
+                       +---------------+----------------+
+   === release dump_sem ======================================
+                                      v
+                  wait until EVERY regular pipeline is done
+                  (latched gate; guarantees this DB's own
+                   schema already exists on the target)
+                                      v
+   === acquire restore_sem ===================================
+                       +--------------------------------+
+                       | B. delayed restoring           |
                        |    pg_restore --data-only      |
                        |                --disable-      |
                        |                triggers        |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
-                       | 10. recreate indexes           |
-                       |     JoinSet + Semaphore(       |
-                       |        restore-jobs);          |
-                       |     CREATE INDEX in parallel   |
+                       | C. copy engine                 |
+                       |    for each copy_rule: split   |
+                       |    into partitions, stream     |
+                       |    binary COPY OUT -> COPY IN  |
+                       |    (max_parallel workers)      |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
-                       | 11. delayed verifying          |
-                       |     exact count(*) on delayed; |
-                       |     reltuples on the rest in   |
-                       |     --fast-verify              |
+                       | D. delayed verifying           |
+                       |    re-run count comparison of  |
+                       |    the REGULAR tables (delayed |
+                       |    and copy tables are never   |
+                       |    row-count compared)         |
                        +---------------+----------------+
-                                       v
-   ==================== release restore_sem ===================
-                                       v
+   === release restore_sem ===================================
+                                      v
                                    Complete
 
    After every DB reaches Complete:
-       restore_safe_settings  (ALTER SYSTEM RESET + reload)
        render summary table; print regular vs. total durations.
 ```
 
-Pipeline overlap (illustrative timeline with `--max-parallel 2`):
+Pipeline overlap (illustrative timeline with `dump_parallel = restore_parallel = 2`):
 
 ```
   time -->
 
-  DB A : [ dump ][ src ][ restore           ][ dst ][ verify ] -> Complete
-  DB B :        [ dump ][ src ][ restore           ][ dst ][ verify ] -> Complete
-  DB C :               [ dump ][ src ][ restore        ][ dst ][ verify ] -> ...
+  DB A : [ dump ][ restore ][ src ][ dst ][ verify ] -> Complete
+  DB B :        [ dump ][ restore ][ src ][ dst ][ verify ] -> Complete
+  DB C :               [ dump ][ restore ][ src ][ dst ][ verify ] -> ...
                 ^             ^
                 |             |
                 |             +-- DB C grabs dump_sem the moment B vacates it,
                 |                 even while A and B are still restoring.
                 +-- DB B grabs dump_sem as soon as A finishes dumping;
-                    A keeps holding restore_sem.
+                    A keeps holding restore_sem through restore + counts + verify.
 
-  Legend:  src/dst = source/dest count(*) (or reltuples in --fast-verify)
+  Legend:  src/dst = source/dest count(*) (or reltuples in fast_verify),
+                     run under restore_sem after the restore completes.
 ```
 
 ### Migration Workflow
@@ -203,57 +198,57 @@ Per-server, before any database:
 
 1. **Preparation** — create `$HOME/pg_migrate_state` and `$HOME/pg_verify_state`.
 2. **Discovery** — list user databases on the source via `pg_database`, ordered by size ascending.
-3. **Destination optimization** (unless `--disable-dst-optimizations`) — `ALTER SYSTEM SET` to turn off `fsync`, `synchronous_commit`, `full_page_writes`, raise `maintenance_work_mem` to 2GB, set `checkpoint_completion_target=0.9`, then `pg_reload_conf()`.
-4. **Globals** (unless `--migrate-globals=false`) — `pg_dumpall --globals-only`, filter out `CREATE/ALTER ROLE` lines that would overwrite the destination superuser, and execute the rest. Existing-object errors are tolerated.
-5. **Database creation** — `CREATE DATABASE` for every discovered database on the target.
+3. **Globals** (when `migrate_globals = true`) — `pg_dumpall --globals-only`, filter out `CREATE/ALTER ROLE` lines that would overwrite the destination superuser, and execute the rest. Existing-object errors (and deprecated-MD5-password warnings) are tolerated.
+4. **Database creation** — `CREATE DATABASE` for every discovered database on the target (already-exists errors are warned and ignored).
+5. **Planning** — query the source catalog and classify every table as **regular**, **delayed**, or **copy-engine** (copy wins over delayed, delayed wins over regular). The plan is printed before migration starts.
 
-Then, in parallel across up to `--max-parallel` databases, each database runs through a **regular phase**:
+Then, in parallel (bounded by the concurrency knobs), each database runs through a **regular phase**:
 
-| Step | Phase | What it does |
-|------|-------|--------------|
-| 1 | `dumping` | `pg_dump -Fd -j <dump-jobs> -Z zstd:5`. If any `delay_table_data` patterns match this DB, the matching tables are emitted with `--exclude-table-data` (schema kept, data skipped). |
-| 2 | `source counts` | `SELECT count(*)` per table on the source, cached to `$HOME/pg_verify_state/<db>.src_counts.json`. Queries run concurrently and the total in-flight queries across all DBs are bounded by `--verify-concurrency`. With `--fast-verify`, a single `pg_class.reltuples` query replaces per-table counts; cached to `<db>.src_counts.fast.json`. |
-| 3 | `restoring` | `pg_restore -j <restore-jobs> --disable-triggers`. Restores schema, indexes, PKs, FKs, sequences, triggers, and the data of non-delayed tables. Delayed tables exist but are empty. |
-| 4 | `dest counts` | Same as step 2, against the destination. |
-| 5 | `verifying` | Compare source vs. destination counts (delayed tables excluded). Mismatches fail the migration. With `--fast-verify`, non-delayed mismatches are logged as warnings rather than failures (since `reltuples` is an estimate); delayed-table mismatches still fail. |
+| Step | Phase           | What it does                                                                                                                                                                                                                                                                                                                                  |
+|------|-----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| 1    | `dumping`       | `pg_dump -Fd -j <dump_jobs> -Z zstd:<zstd_level>`. Tables matching any `delay_table_data` pattern or any `copy_rules` table are emitted with `--exclude-table-data` (schema kept, data skipped).                                                                                                                                              |
+| 2    | `restoring`     | `pg_restore -j <restore_jobs> --disable-triggers`. Restores schema, indexes, PKs, FKs, sequences, triggers, and the data of regular tables. Deferred tables exist but are empty.                                                                                                                                                              |
+| 3    | `source counts` | `SELECT count(*)` per table on the source, cached to `$HOME/pg_verify_state/<db>.src_counts.json`. Queries run concurrently, globally bounded by `verify_concurrency`. With `fast_verify`, a single `pg_class.reltuples` query replaces per-table counts (cached to `<db>.src_counts.fast.json`). Deferred (delayed/copy) tables are skipped. |
+| 4    | `dest counts`   | Same as step 3, against the destination.                                                                                                                                                                                                                                                                                                      |
+| 5    | `verifying`     | Compare source vs. destination counts. Mismatches fail the migration. With `fast_verify`, mismatches are logged as warnings rather than failures (since `reltuples` is an estimate).                                                                                                                                                          |
 
-If a database has no matching `delay_table_data` patterns, it transitions to `complete` (step 6) here.
+If a database has no delayed tables and no copy rules, it reaches `complete` here.
 
-Databases with delayed tables continue into a **delayed phase**:
+Databases with delayed tables and/or copy rules also run a **delayed phase**. Its delayed *dump* starts as soon as `dump_sem` is free, but its *restore* waits until every regular pipeline (including this database's own) has completed:
 
-| Step | Phase | What it does |
-|------|-------|--------------|
-| 7 | `delayed dumping` | `pg_dump -Fd --data-only --table=<pattern>` for the delayed tables. |
-| 8 | `dropping indexes` | Query the source for each delayed table's non-constraint indexes (PK/UNIQUE/EXCLUDE indexes are kept). `DROP INDEX IF EXISTS` for each on the destination. |
-| 9 | `delayed restoring` | `pg_restore --data-only --disable-triggers` COPYs delayed data into the now-index-less tables. |
-| 10 | `recreating indexes` | Re-run each saved `CREATE INDEX` DDL on the destination, in parallel bounded by `--restore-jobs` (skipping any that already exist, for resumability). |
-| 11 | `delayed verifying` | Re-count every table on both sides (including delayed) and compare. With `--fast-verify`, delayed tables still use exact `count(*)` (and must match); non-delayed tables use `reltuples`. |
+| Step | Phase               | What it does                                                                                                                                                                                                   |
+|------|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| A    | `delayed dumping`   | `pg_dump -Fd --data-only --table=<pattern>` for delayed tables, with `--exclude-table` for any copy-engine tables. (Skipped if the DB has only copy rules and no delayed tables.)                              |
+| B    | `delayed restoring` | `pg_restore --data-only --disable-triggers` COPYs the delayed data into the already-built tables.                                                                                                              |
+| C    | `copy engine`       | For each `copy_rules` entry, partition the table and stream it with the binary COPY engine. Each rule writes a completion marker so a resumed run skips finished rules.                                        |
+| D    | `delayed verifying` | Re-run the row-count comparison of the **regular** tables (using a separate cache namespace). Delayed-data and copy-engine tables are migrated out-of-band and are **not** row-count compared in either phase. |
 
-Finally, the destination optimizations are reverted (`ALTER SYSTEM RESET` + reload) and a summary table is printed.
+Finally a summary table is printed with the regular-phase and total durations.
 
 ### Connection Budget
 
-PostgreSQL connections are bound to a specific database at handshake, so the tool keeps a small cached pool per `(server, database)` (idle connections drain in ~10s). Total client-side connections to either server at peak are bounded by:
+PostgreSQL connections are bound to a specific database at handshake, so the tool keeps a small cached pool per `(server, database)` (idle connections drain in ~10s). All tuning below is set in `config.toml`. Approximate peak client-side connections to either server:
 
 ```
-peak_source_conns  ≈  dump_parallel    × (1 + dump_jobs)     # active pg_dump workers
-                     + verify_concurrency                     # global cap, all DBs combined
-                     + small idle-pool residue                # drains in ~2s
+peak_source_conns  ≈  dump_parallel × (1 + dump_jobs)    # active pg_dump leaders + workers
+                     + verify_concurrency                  # global cap, all DBs combined
+                     + max_parallel                        # copy-engine source workers (delayed phase)
 
-peak_dest_conns    ≈  restore_parallel × (1 + restore_jobs)  # active pg_restore workers
-                     + verify_concurrency                     # global cap
-                     + restore_parallel × restore_jobs        # parallel CREATE INDEX (delayed phase only)
-                     + small idle-pool residue
+peak_dest_conns    ≈  restore_parallel × (1 + restore_jobs) # active pg_restore leaders + workers
+                     + verify_concurrency                    # global cap
+                     + max_parallel                          # copy-engine dest workers (delayed phase)
 ```
 
-With defaults (`--max-parallel 6 --dump-jobs 24 --restore-jobs 12 --verify-concurrency 16`) the source needs roughly `6 × 25 + 16 ≈ 166` connection slots; the destination needs roughly `6 × 13 + 16 ≈ 94` during the regular phase and up to `6 × 12 + 16 ≈ 88` during delayed-index recreate. Both PostgreSQL's `max_connections` default of 100 is therefore **too low** for the defaults — bump it (e.g. `postgres -c max_connections=300`) or back off the parallelism knobs.
+With the example defaults (`max_parallel = 6`, `dump_jobs = 24`, `restore_jobs = 12`, `verify_concurrency = 16`) the source needs roughly `6 × 25 + 16 + 6 ≈ 172` slots and the destination roughly `6 × 13 + 16 + 6 ≈ 100`. PostgreSQL's default `max_connections = 100` is therefore **too low** for the defaults — raise it (e.g. `postgres -c max_connections=300`) or lower the parallelism knobs in `config.toml`.
 
-If you can't change server settings, throttle the source-side concurrency independently with `--dump-parallel`:
+If you can't change server settings, throttle the source side independently with `dump_parallel` (which defaults to `max_parallel`):
 
-```bash
-# Source has max_connections=100, can fit ~3 × 25 = 75 pg_dump conns + overhead.
+```toml
+# Source has max_connections=100, room for ~3 × 25 = 75 pg_dump conns + overhead.
 # Destination has room for more parallel restores.
-pg-migrate --max-parallel 6 --dump-parallel 3 --restore-parallel 6 ...
+max_parallel = 6
+dump_parallel = 3
+restore_parallel = 6
 ```
 
 ### State and Resumability
@@ -263,62 +258,66 @@ Markers under `$HOME/pg_migrate_state/`:
 - `globals.done`
 - `<db>.dumped`, `<db>.done` — regular dump/restore complete
 - `<db>.delayed_dumped`, `<db>.delayed_done` — delayed dump/restore complete
-- `<db>.delayed_indexes_dropped`, `<db>.delayed_indexes_recreated`
+- `<db>.<schema.table>.copy.<hash>.done` — a copy-engine rule finished (hash identifies the specific rule, so multiple rules on one table track independently)
 
 Markers under `$HOME/pg_verify_state/`:
 
 - `<db>.src_counts.json`, `<db>.dst_counts.json` — cached counts (regular phase, strict verify)
-- `<db>.src_counts.fast.json`, `<db>.dst_counts.fast.json` — cached counts when `--fast-verify` is used (separate files so modes don't collide)
-- `<db>.src_counts.delayed.json`, `<db>.dst_counts.delayed.json` (plus `.fast` variants) — cached counts for the delayed-verify phase
+- `<db>.src_counts.fast.json`, `<db>.dst_counts.fast.json` — cached counts when `fast_verify` is used (separate files so modes don't collide)
+- `<db>.src_counts.delayed.json`, `<db>.dst_counts.delayed.json` (plus `.fast` variants) — cached counts for the delayed-verify pass
 - `<db>.verify`, `<db>.delayed_verify` — verification complete
 
-Re-running the tool resumes from wherever it stopped. Delete the relevant markers (and the `--dump-root/<db>` directory if you want a fresh dump) to redo a step.
+Re-running the tool resumes from wherever it stopped (it also skips any dump whose target directory already contains a `toc.dat`). Delete the relevant markers (and the `dump_root/<db>` directory if you want a fresh dump) to redo a step.
 
 ### Launching with Podman Compose
 
-The bundled `compose.yml` brings up a Postgres 9.5 source, a Postgres 18 target, and a one-shot migration container that depends on both being healthy. Edit the `command:` in `compose.yml` to change flags (the bundled example uses `--delay-table-data pdb1.public.table3` and `pdb2.public.table*`).
+The bundled `compose.yml` brings up a Postgres source, a Postgres target, and a one-shot migration container that depends on both being healthy.
 
 ```bash
 podman-compose up --build
 ```
+
+> **Heads-up:** deferred tables and copy rules are configured in `config.toml`, which the `Containerfile` does **not** copy into the runtime image — only the binary is. To exercise `delay_table_data`/`copy_rules` in a container you must mount or `COPY` a `config.toml` into the image and pass `--config` to it; otherwise the container runs with built-in defaults (every table on the regular path). The connection flags in `compose.yml`'s `command:` are passed through to the binary.
 
 ### Configuration
 
 #### CLI Arguments
 
 **Global**
-- `-c`, `--config` — path to the TOML configuration file. When omitted, `config.toml` in the working directory is used if present, otherwise built-in defaults apply. When given explicitly, the file **must** exist and parse — a missing or invalid path is a hard error (so a typo like `--config config.yaml` fails loudly instead of silently running with defaults).
+- `-c`, `--config` — path to the TOML configuration file. When omitted, `config.toml` in the working directory is used if present, otherwise built-in defaults apply. When given explicitly, the file **must** exist and parse — a missing or invalid path is a hard error (so a typo like `--config config.yaml` fails loudly instead of silently running with defaults, which would send every table down the regular path).
 
 **Source connection**
 - `--from-host` — source host (default: `localhost`)
 - `--from-port` — source port (default: `5432`)
 - `--from-user` — source user (default: `postgres`)
 - `--from-pass` — source password (default: `oldpass`)
-- `--from-db` — initial database for discovery (default: `postgres`)
+- `--from-db` — initial database used for discovery (default: `postgres`)
 
 **Target connection**
 - `--to-host` — target host (default: `localhost`)
 - `--to-port` — target port (default: `5432`)
 - `--to-user` — target user (default: `postgres`)
 - `--to-pass` — target password (default: `newpass`)
-- `--to-db` — initial database for ALTER SYSTEM / globals (default: `postgres`)
+- `--to-db` — initial database used for globals (default: `postgres`)
 
 **TLS**
 - `--sslmode` — TLS mode for native connections: `disable`, `prefer`, or `require`. Overrides the `sslmode` value from the config file when set.
 
+There are no command-line flags for parallelism, deferred tables, copy rules, globals, or verification mode — those live in the TOML file below.
+
 #### TOML Configuration
 
-The configuration file (default `config.toml`) is shown below; the repository ships a working `config.toml` you can copy. All parameters are optional and will use their default values if omitted.
+The configuration file (default `config.toml`) is shown below; the repository ships a working `config.toml` you can copy. All parameters are optional and use their default values if omitted.
 
 ```toml
 # Number of parallel jobs (-j) for pg_dump per database (default: 24)
 dump_jobs = 24
 
-# Number of parallel jobs (-j) for pg_restore per database (default: 12).
-# Also bounds parallel CREATE INDEX during the delayed phase.
+# Number of parallel jobs (-j) for pg_restore per database (default: 12)
 restore_jobs = 12
 
-# Maximum number of databases being migrated concurrently (default: 6)
+# Maximum number of databases being migrated concurrently (default: 6).
+# Also bounds the number of copy-engine workers per copy rule.
 max_parallel = 6
 
 # (Optional) Independent override for source-side concurrency (defaults to max_parallel)
@@ -333,24 +332,24 @@ dump_root = "pg_dumps"
 # Whether to migrate global objects like roles and groups (default: true)
 migrate_globals = true
 
-# List of "DATABASE.SCHEMA.TABLE_PATTERN" patterns whose data is deferred to a
-# separate pass after the regular tables. Schema is restored normally, but bulk
-# data is loaded after indexes are dropped to speed up restoration, and these
-# tables are only row-count-verified once the delayed pass completes.
-# All three parts are required; SCHEMA and TABLE_PATTERN may use pg_dump
-# wildcards (* = any sequence, ? = one character), so tables in any schema can be
-# targeted (e.g. "mydb.audit.*").
+# List of "DATABASE.SCHEMA.TABLE_PATTERN" patterns whose bulk data is deferred to
+# a separate pass that runs after every regular pipeline finishes. The schema and
+# all structure are restored normally during the regular phase; only the table
+# DATA is loaded later. All three parts are required; SCHEMA and TABLE_PATTERN may
+# use pg_dump wildcards (* = any sequence, ? = one character), so tables in any
+# schema can be targeted (e.g. "mydb.audit.*").
 # delay_table_data = [
 #   "mydb.public.large_table",
 #   "mydb.public.events_*",
 # ]
 
-# If true, uses pg_class.reltuples estimates instead of count(*)
-# for regular tables (default: false).
+# If true, uses pg_class.reltuples estimates instead of count(*) (default: false).
+# Mismatches become warnings rather than hard failures, since reltuples is an
+# estimate; ANALYZE both sides for closer values.
 fast_verify = false
 
 # Global cap on concurrent row-count/verification queries
-# across all databases (default: 16).
+# across all databases and both servers (default: 16).
 verify_concurrency = 16
 
 # Zstd compression level for database dumps (1-22, default: 5)
@@ -363,19 +362,19 @@ zstd_level = 5
 # sslmode=prefer/require). Overridable via --sslmode.
 sslmode = "prefer"
 
-# (Optional) List of tables to migrate using the high-performance Copy Engine.
+# (Optional) Tables to migrate using the high-performance Copy Engine.
 # See COPY_ENGINE.md for details. A copy-engine table is treated as deferred
 # automatically: it is excluded from both the regular and delayed pg_dump,
-# migrated by the copy engine, and verified after the copy completes — so it
-# does NOT need to be listed in delay_table_data. Each `table` must be a
-# fully-qualified "DATABASE.SCHEMA.TABLE"; a missing schema (or database) is a
-# hard error. Multiple rules can be specified for the same table.
+# migrated by the copy engine, and skipped by row-count verification — so it does
+# NOT need to be listed in delay_table_data. Each `table` must be a fully-
+# qualified "DATABASE.SCHEMA.TABLE"; anything else is a hard error. Multiple rules
+# may target the same table (e.g. to split it into separate time ranges).
 [[copy_rules]]
 table = "DATABASE.SCHEMA.TABLE"   # The table to migrate (must be DATABASE.SCHEMA.TABLE)
 split_by_column = "created_at"    # Column used for WHERE / partitioning (default: created_at)
 method = "time"                   # Partitioning method: "time" (default), "date"/"day" (one partition per UTC day), or "hash"
-from = "2023-01-01"               # Inclusive lower bound (optional; auto-discovered for parallel 'time' split)
-till = "2024-01-01"               # Exclusive upper bound (optional; auto-discovered for parallel 'time' split)
+from = "2023-01-01"               # Inclusive lower bound (optional; auto-discovered via min() for 'time' split when omitted)
+till = "2024-01-01"               # Exclusive upper bound (optional; the last partition is always open-ended)
 ```
 
 #### Environment Variables
