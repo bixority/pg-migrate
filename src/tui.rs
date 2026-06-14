@@ -249,6 +249,7 @@ mod tests {
             name: name.to_string(),
             size: 4096,
             regular_data_excludes: Vec::new(),
+            full_excludes: Vec::new(),
             delayed_tables: delayed,
             copy_rules: copy,
             regular_table_names: Vec::new(),

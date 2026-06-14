@@ -33,6 +33,18 @@ delay_table_data = [
   "pdb2.public.table*"
 ]
 
+# Tables, schemas, or databases to entirely exclude from the migration.
+# Uses the same pattern matching as delay_table_data. Matching entities are
+# skipped by both regular and delayed passes, and are not created on the target.
+# You can exclude an entire database ("DB"), an entire schema ("DB.SCHEMA"),
+# or specific tables ("DB.SCHEMA.TABLE"). Wildcards (*, ?) are supported in
+# the schema and table parts.
+exclude = [
+ "db5",
+ "pdb1.internal.*",
+ "pdb2.public.secret_table"
+]
+
 # Whether to perform fast verification
 fast_verify = false
 

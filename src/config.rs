@@ -13,6 +13,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::{env, fs};
 use tokio::sync::Semaphore;
+use wildmatch::WildMatch;
 
 /// Default config file looked up (relative to the working directory) when
 /// `--config` is not given.
@@ -64,6 +65,7 @@ pub struct Config {
     pub max_parallel: usize,
     pub migrate_globals: bool,
     pub delay_table_data: Vec<String>,
+    pub exclude: Vec<String>,
 
     pub verify_sem: Arc<Semaphore>,
     pub fast_verify: bool,
@@ -91,6 +93,62 @@ impl Config {
     pub fn deferred_table_patterns(&self) -> Vec<String> {
         deferred_table_patterns(&self.delay_table_data, &self.copy_rules)
     }
+
+    /// Returns whether a database is entirely excluded from migration.
+    /// A database is excluded if there is a pattern `DB`, `DB.*`, or `DB.*.*`
+    /// in the `exclude` list.
+    #[must_use]
+    pub fn is_db_excluded(&self, db_name: &str) -> bool {
+        self.exclude.iter().any(|pattern| {
+            let parts: Vec<&str> = pattern.split('.').collect();
+            match parts.as_slice() {
+                [p_db] => *p_db == db_name,
+                [p_db, p_schema] if *p_db == db_name => *p_schema == "*",
+                [p_db, p_schema, p_table] if *p_db == db_name => {
+                    *p_schema == "*" && *p_table == "*"
+                }
+                _ => false,
+            }
+        })
+    }
+
+    /// Returns whether a table is excluded from migration.
+    #[must_use]
+    pub fn is_table_excluded(&self, db_name: &str, schema: &str, table: &str) -> bool {
+        is_pattern_match(db_name, schema, table, &self.exclude)
+    }
+
+    /// Returns whether a table is deferred out of the regular pass.
+    #[must_use]
+    pub fn is_delayed_table(&self, db_name: &str, schema: &str, table: &str) -> bool {
+        is_pattern_match(db_name, schema, table, &self.deferred_table_patterns())
+    }
+}
+
+/// Returns whether a database.schema.table combination matches any of the
+/// provided patterns.
+///
+/// Entry formats:
+/// - `DATABASE`: matches every table in the database.
+/// - `DATABASE.SCHEMA_PATTERN`: matches every table in schemas matching the pattern.
+/// - `DATABASE.SCHEMA_PATTERN.TABLE_PATTERN`: matches tables matching the pattern.
+///
+/// The `DATABASE` part must be a literal name; `SCHEMA_PATTERN` and
+/// `TABLE_PATTERN` may use `pg_dump`'s `*`/`?` wildcards.
+pub fn is_pattern_match(db_name: &str, schema: &str, table: &str, patterns: &[String]) -> bool {
+    patterns.iter().any(|pattern| {
+        let parts: Vec<&str> = pattern.split('.').collect();
+        match parts.as_slice() {
+            [p_db] => *p_db == db_name,
+            [p_db, p_schema] if *p_db == db_name => WildMatch::new(p_schema).matches(schema),
+            [p_db, p_schema, p_table] if *p_db == db_name => {
+                let qualified = format!("{schema}.{table}");
+                let pattern_qualified = format!("{p_schema}.{p_table}");
+                WildMatch::new(&pattern_qualified).matches(&qualified)
+            }
+            _ => false,
+        }
+    })
 }
 
 /// Builds the deferred-table pattern list from the raw config pieces.
@@ -149,6 +207,7 @@ pub struct TomlConfig {
     pub dump_root: String,
     pub migrate_globals: bool,
     pub delay_table_data: Option<Vec<String>>,
+    pub exclude: Option<Vec<String>>,
     pub fast_verify: bool,
     pub verify_concurrency: usize,
     pub zstd_level: u8,
@@ -167,6 +226,7 @@ impl Default for TomlConfig {
             dump_root: "pg_dumps".to_string(),
             migrate_globals: true,
             delay_table_data: None,
+            exclude: None,
             fast_verify: false,
             verify_concurrency: 16,
             zstd_level: 5,
@@ -290,6 +350,9 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
     let delay_table_data = toml_config.delay_table_data.unwrap_or_default();
     validate_delay_table_data(&delay_table_data)?;
 
+    let exclude = toml_config.exclude.unwrap_or_default();
+    validate_exclude_patterns(&exclude)?;
+
     Ok(Arc::new(Config {
         source: db::DbArgs {
             host: args.from_host,
@@ -313,6 +376,7 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
         dump_root: toml_config.dump_root.into(),
         migrate_globals: toml_config.migrate_globals,
         delay_table_data,
+        exclude,
         fast_verify: toml_config.fast_verify,
         verify_concurrency,
         pool_cache: db::PoolCache::new(ssl_mode),
@@ -326,17 +390,24 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
 /// Splits a fully-qualified `DATABASE.SCHEMA.TABLE` entry into its three parts.
 ///
 /// Returns `None` unless the entry has exactly three dot-separated, non-empty
-/// components. The `SCHEMA` and `TABLE` components may carry `pg_dump` wildcards
-/// (`*`/`?`) for `delay_table_data` patterns; the database component is always a
-/// literal name. Table or schema identifiers containing a literal `.` are not
-/// supported (they would parse as extra components).
-fn parse_qualified(entry: &str) -> Option<(&str, &str, &str)> {
+/// components.
+fn parse_fully_qualified(entry: &str) -> Option<(&str, &str, &str)> {
     let mut parts = entry.split('.');
     let (db, schema, table) = (parts.next()?, parts.next()?, parts.next()?);
     if parts.next().is_some() || db.is_empty() || schema.is_empty() || table.is_empty() {
         return None;
     }
     Some((db, schema, table))
+}
+
+/// Returns true if the string is a valid pattern (1, 2, or 3 dot-separated,
+/// non-empty parts).
+fn is_valid_pattern(s: &str) -> bool {
+    let parts: Vec<&str> = s.split('.').collect();
+    if parts.is_empty() || parts.len() > 3 {
+        return false;
+    }
+    parts.iter().all(|p| !p.is_empty())
 }
 
 /// Validates that every copy rule targets a fully-qualified
@@ -354,7 +425,7 @@ fn parse_qualified(entry: &str) -> Option<(&str, &str, &str)> {
 /// `DATABASE.SCHEMA.TABLE` form.
 fn validate_copy_rules(rules: &[CopyRule]) -> Result<()> {
     for rule in rules {
-        if parse_qualified(&rule.table).is_none() {
+        if parse_fully_qualified(&rule.table).is_none() {
             return Err(Error::InvalidCopyRule {
                 table: rule.table.clone(),
                 reason: "expected 'DATABASE.SCHEMA.TABLE' format with all parts non-empty"
@@ -377,13 +448,34 @@ fn validate_copy_rules(rules: &[CopyRule]) -> Result<()> {
 ///
 /// Returns [`Error::InvalidCopyRule`] when an entry is not in
 /// `DATABASE.SCHEMA.TABLE` form.
-fn validate_delay_table_data(patterns: &[String]) -> Result<()> {
+pub fn validate_delay_table_data(patterns: &[String]) -> Result<()> {
     for pattern in patterns {
-        if parse_qualified(pattern).is_none() {
+        if !is_valid_pattern(pattern) {
             return Err(Error::InvalidCopyRule {
                 table: pattern.clone(),
-                reason: "delay_table_data entry must be 'DATABASE.SCHEMA.TABLE' with all parts \
-                         non-empty"
+                reason: "delay_table_data entry must be 'DB', 'DB.SCHEMA', or \
+                         'DB.SCHEMA.TABLE' with all parts non-empty"
+                    .to_string(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Validates that every `exclude` entry is a fully-qualified
+/// `DATABASE.SCHEMA.TABLE` pattern.
+///
+/// # Errors
+///
+/// Returns [`Error::InvalidCopyRule`] when an entry is not in
+/// `DATABASE.SCHEMA.TABLE` form.
+pub fn validate_exclude_patterns(patterns: &[String]) -> Result<()> {
+    for pattern in patterns {
+        if !is_valid_pattern(pattern) {
+            return Err(Error::InvalidCopyRule {
+                table: pattern.clone(),
+                reason: "exclude entry must be 'DB', 'DB.SCHEMA', or 'DB.SCHEMA.TABLE' with \
+                         all parts non-empty"
                     .to_string(),
             });
         }
@@ -554,8 +646,10 @@ till = \"2023-03-01\"
     }
 
     #[test]
-    fn validate_delay_table_data_accepts_schema_qualified_patterns() {
+    fn validate_delay_table_data_accepts_flexible_patterns() {
         let patterns = vec![
+            "mydb".to_string(),
+            "mydb.public".to_string(),
             "mydb.public.events_*".to_string(),
             "mydb.audit.*".to_string(),
         ];
@@ -563,18 +657,9 @@ till = \"2023-03-01\"
     }
 
     #[test]
-    fn validate_delay_table_data_rejects_schema_less_pattern() {
-        let patterns = vec!["mydb.events_*".to_string()];
-        assert!(matches!(
-            validate_delay_table_data(&patterns),
-            Err(Error::InvalidCopyRule { .. })
-        ));
-    }
-
-    #[test]
-    fn deferred_patterns_include_copy_rule_tables() {
+    fn deferred_patterns_include_copy_rule_tables() -> Result<()> {
         let delay = vec!["pdb1.public.table3".to_string()];
-        let rules = [
+        let rules = vec![
             copy_rule("pdb2.public.events"),
             copy_rule("pdb1.public.audit"),
         ];
@@ -590,10 +675,106 @@ till = \"2023-03-01\"
             ]
         );
 
+        let mut toml = TomlConfig::default();
+        toml.delay_table_data = Some(delay);
+        toml.copy_rules = Some(rules);
+        let config = build_config_with_toml(toml)?;
+
         // A copy-engine table not covered by any delay pattern must still be
         // recognised as deferred, so the regular verification pass skips it.
-        assert!(crate::verification::is_delayed_table(
-            "pdb2", "public", "events", &deferred
-        ));
+        assert!(config.is_delayed_table("pdb2", "public", "events"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_db_excluded() -> Result<()> {
+        let mut toml = TomlConfig::default();
+        toml.exclude = Some(vec![
+            "mydb.*.*".to_string(),
+            "db1".to_string(),
+            "db2.*".to_string(),
+        ]);
+        let config = build_config_with_toml(toml)?;
+
+        assert!(config.is_db_excluded("mydb"));
+        assert!(config.is_db_excluded("db1"));
+        assert!(config.is_db_excluded("db2"));
+        assert!(!config.is_db_excluded("otherdb"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_is_table_excluded() -> Result<()> {
+        let mut toml = TomlConfig::default();
+        toml.exclude = Some(vec![
+            "mydb.public.secret".to_string(),
+            "mydb.internal.*".to_string(),
+            "otherdb.*.temp_*".to_string(),
+            "db3".to_string(),
+            "db4.audit".to_string(),
+        ]);
+        let config = build_config_with_toml(toml)?;
+
+        assert!(config.is_table_excluded("mydb", "public", "secret"));
+        assert!(config.is_table_excluded("mydb", "internal", "anything"));
+        assert!(config.is_table_excluded("otherdb", "any", "temp_123"));
+        assert!(config.is_table_excluded("db3", "any", "any"));
+        assert!(config.is_table_excluded("db4", "audit", "any"));
+        assert!(!config.is_table_excluded("db4", "public", "any"));
+        assert!(!config.is_table_excluded("mydb", "public", "other"));
+        assert!(!config.is_table_excluded("another", "public", "secret"));
+        Ok(())
+    }
+
+    fn build_config_with_toml(toml_config: TomlConfig) -> Result<Arc<Config>> {
+        let verify_concurrency = toml_config.verify_concurrency.max(1);
+        let dump_parallel = toml_config
+            .dump_parallel
+            .unwrap_or(toml_config.max_parallel)
+            .max(1);
+        let restore_parallel = toml_config
+            .restore_parallel
+            .unwrap_or(toml_config.max_parallel)
+            .max(1);
+
+        let ssl_mode = tokio_postgres::config::SslMode::Prefer;
+        let ssl_mode_label = "prefer";
+
+        let copy_rules = toml_config.copy_rules.unwrap_or_default();
+        let delay_table_data = toml_config.delay_table_data.unwrap_or_default();
+        let exclude = toml_config.exclude.unwrap_or_default();
+
+        Ok(Arc::new(Config {
+            source: db::DbArgs {
+                host: "localhost".to_string(),
+                port: 5432,
+                user: "postgres".to_string(),
+                pass: "pass".to_string(),
+            },
+            source_db: "postgres".to_string(),
+            destination: db::DbArgs {
+                host: "localhost".to_string(),
+                port: 5432,
+                user: "postgres".to_string(),
+                pass: "pass".to_string(),
+            },
+            destination_db: "postgres".to_string(),
+            dump_jobs: toml_config.dump_jobs,
+            restore_jobs: toml_config.restore_jobs,
+            max_parallel: toml_config.max_parallel,
+            dump_parallel,
+            restore_parallel,
+            dump_root: toml_config.dump_root.into(),
+            migrate_globals: toml_config.migrate_globals,
+            delay_table_data,
+            exclude,
+            fast_verify: toml_config.fast_verify,
+            verify_concurrency,
+            pool_cache: db::PoolCache::new(ssl_mode),
+            verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
+            zstd_level: 5,
+            ssl_mode: ssl_mode_label.to_string(),
+            copy_rules,
+        }))
     }
 }

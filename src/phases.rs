@@ -401,6 +401,7 @@ async fn phase_migrate_one(
             db_name,
             size,
             &db_plan.regular_data_excludes,
+            &db_plan.full_excludes,
             cancel.clone(),
         )
         .await?;

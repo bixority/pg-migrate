@@ -1,6 +1,6 @@
 use crate::copy_engine::Splitter;
-use crate::verification::is_delayed_table;
 use crate::{Config, Error, Result};
+use wildmatch::WildMatch;
 use indicatif::HumanBytes;
 use log::{info, warn};
 use std::sync::Arc;
@@ -17,6 +17,7 @@ pub struct DatabasePlan {
     pub name: String,
     pub size: u64,
     pub regular_data_excludes: Vec<String>,
+    pub full_excludes: Vec<String>,
     pub delayed_tables: Vec<String>,
     pub copy_rules: Vec<CopyRulePlan>,
 
@@ -47,6 +48,10 @@ pub async fn create_plan(
     let mut db_plans = Vec::new();
 
     for (db_name, size) in dbs_with_sizes {
+        if config.is_db_excluded(db_name) {
+            info!("Skipping entirely excluded database: {db_name}");
+            continue;
+        }
         db_plans.push(plan_database(&config, db_name, *size, &cancel).await?);
 
         if cancel.is_cancelled() {
@@ -62,6 +67,10 @@ pub async fn create_plan(
     }
     for rule in &config.copy_rules {
         warn_unmatched(&rule.table, dbs_with_sizes, "copy_rules");
+    }
+
+    for entry in &config.exclude {
+        warn_unmatched(entry, dbs_with_sizes, "exclude");
     }
 
     Ok(MigrationPlan {
@@ -82,6 +91,7 @@ async fn plan_database(
         name: db_name.to_string(),
         size,
         regular_data_excludes: Vec::new(),
+        full_excludes: Vec::new(),
         delayed_tables: Vec::new(),
         copy_rules: Vec::new(),
         regular_table_names: Vec::new(),
@@ -91,10 +101,31 @@ async fn plan_database(
 
     let db_prefix = format!("{db_name}.");
 
+    // 0. Identify fully excluded tables/patterns.
+    for pattern in &config.exclude {
+        if pattern == db_name {
+            // Entire database is excluded; this is primarily handled in create_plan,
+            // but we can add a catch-all for completeness if passed to pg_dump.
+            db_plan.full_excludes.push("*.*".to_string());
+            continue;
+        }
+        if let Some(rest) = pattern.strip_prefix(&db_prefix) {
+            let translated = if rest.contains('.') {
+                rest.to_string()
+            } else {
+                format!("{rest}.*")
+            };
+            db_plan.full_excludes.push(translated);
+        }
+    }
+
     // 1. Identify copy rules and their partitions.
     let mut copy_excludes = std::collections::HashSet::new();
     for rule in &config.copy_rules {
         if let Some(table_name) = rule.table.strip_prefix(&db_prefix) {
+            if db_plan.full_excludes.iter().any(|p| WildMatch::new(p).matches(table_name)) {
+                continue;
+            }
             copy_excludes.insert(table_name.to_string());
 
             let (from, till) = resolve_range(config, db_name, table_name, rule, cancel).await?;
@@ -122,12 +153,31 @@ async fn plan_database(
 
     // 2. Identify delayed tables.
     for delay in &config.delay_table_data {
-        if let Some(table_pattern) = delay.strip_prefix(&db_prefix) {
+        let table_pattern = if delay == db_name {
+            Some("*.*".to_string())
+        } else {
+            delay.strip_prefix(&db_prefix).map(|rest| {
+                if rest.contains('.') {
+                    rest.to_string()
+                } else {
+                    format!("{rest}.*")
+                }
+            })
+        };
+
+        if let Some(table_pattern) = table_pattern {
+            if db_plan
+                .full_excludes
+                .iter()
+                .any(|p| WildMatch::new(p).matches(&table_pattern))
+            {
+                continue;
+            }
             db_plan
                 .regular_data_excludes
                 .push(table_pattern.to_string());
-            if !copy_excludes.contains(table_pattern) {
-                db_plan.delayed_tables.push(table_pattern.to_string());
+            if !copy_excludes.contains(&table_pattern) {
+                db_plan.delayed_tables.push(table_pattern);
             }
         }
     }
@@ -138,10 +188,14 @@ async fn plan_database(
     //    wins over regular.
     let copy_specs: Vec<String> = config.copy_rules.iter().map(|r| r.table.clone()).collect();
     for (schema, table) in list_user_tables(config, db_name, cancel).await? {
+        if config.is_table_excluded(db_name, &schema, &table) {
+            continue;
+        }
+
         let full = format!("{schema}.{table}");
-        if is_delayed_table(db_name, &schema, &table, &copy_specs) {
+        if crate::config::is_pattern_match(db_name, &schema, &table, &copy_specs) {
             db_plan.copy_table_names.push(full);
-        } else if is_delayed_table(db_name, &schema, &table, &config.delay_table_data) {
+        } else if config.is_delayed_table(db_name, &schema, &table) {
             db_plan.delayed_table_names.push(full);
         } else {
             db_plan.regular_table_names.push(full);

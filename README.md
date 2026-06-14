@@ -10,6 +10,7 @@ For very large tables, two deferral mechanisms keep them out of the critical pat
 
 - **Delayed data** — the table's schema, constraints, indexes, sequences, and triggers are created during the regular restore (so the table is fully usable), but its bulk data is dumped `--data-only` and restored in a separate **delayed pass** that only starts once *every* database's regular pipeline has finished. This lets all the schema/structure work and the small tables complete first.
 - **Copy engine** — for tables too large even for the delayed `pg_dump` path, a built-in streaming engine partitions the table by a time/date/hash column and pipelines raw binary `COPY OUT → COPY IN` across many parallel workers. See [COPY_ENGINE.md](COPY_ENGINE.md).
+- **Exclusion** — the `exclude` parameter lets you skip entire databases, schemas, or specific tables. These entities are not created on the target and are omitted from all migration and verification phases.
 
 > **Note:** This tool does **not** drop/recreate indexes around the bulk load, and it does **not** alter destination server settings (`fsync`, `maintenance_work_mem`, etc.). If you want a "fast restore" configuration on the target, set it yourself before running (e.g. `postgres -c fsync=off -c synchronous_commit=off`) and revert it afterwards.
 
@@ -332,15 +333,24 @@ dump_root = "pg_dumps"
 # Whether to migrate global objects like roles and groups (default: true)
 migrate_globals = true
 
-# List of "DATABASE.SCHEMA.TABLE_PATTERN" patterns whose bulk data is deferred to
-# a separate pass that runs after every regular pipeline finishes. The schema and
-# all structure are restored normally during the regular phase; only the table
-# DATA is loaded later. All three parts are required; SCHEMA and TABLE_PATTERN may
-# use pg_dump wildcards (* = any sequence, ? = one character), so tables in any
-# schema can be targeted (e.g. "mydb.audit.*").
+# List of patterns whose bulk data is deferred to a separate pass that runs after
+# every regular pipeline finishes. The schema and all structure are restored
+# normally during the regular phase; only the table DATA is loaded later.
+# Patterns can be "DB", "DB.SCHEMA", or "DB.SCHEMA.TABLE". SCHEMA and
+# TABLE_PATTERN may use pg_dump wildcards (* = any sequence, ? = one character),
+# so entire schemas can be targeted (e.g. "mydb.audit").
 # delay_table_data = [
 #   "mydb.public.large_table",
 #   "mydb.public.events_*",
+# ]
+
+# List of patterns to entirely exclude from the migration. Matched entities are
+# not created on the target and are skipped by both the regular and delayed
+# passes. Patterns can be "DB", "DB.SCHEMA", or "DB.SCHEMA.TABLE". Use "mydb"
+# to exclude a whole database or "mydb.internal" to exclude a whole schema.
+# exclude = [
+#   "mydb.internal.*",
+#   "test_db.*.*",
 # ]
 
 # If true, uses pg_class.reltuples estimates instead of count(*) (default: false).

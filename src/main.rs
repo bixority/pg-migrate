@@ -141,6 +141,18 @@ async fn run_migration_workflow(
     });
 
     let dbs_with_sizes = db::discover_databases(&config, cancel.clone()).await?;
+    let dbs_with_sizes: Vec<(String, u64)> = dbs_with_sizes
+        .into_iter()
+        .filter(|(name, _)| {
+            if config.is_db_excluded(name) {
+                info!("Excluding database: {name}");
+                false
+            } else {
+                true
+            }
+        })
+        .collect();
+
     let db_names_owned: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
 
     info!("Databases: {db_names_owned:?}");

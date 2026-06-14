@@ -207,7 +207,8 @@ pub async fn dump_db(
     config: &Config,
     db: &str,
     size: u64,
-    excludes: &[String],
+    data_excludes: &[String],
+    full_excludes: &[String],
     cancel: CancellationToken,
 ) -> Result<()> {
     let human_size = HumanBytes(size);
@@ -238,8 +239,12 @@ pub async fn dump_db(
                 .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
         ]);
 
-        for table_pattern in excludes {
+        for table_pattern in data_excludes {
             command.arg(format!("--exclude-table-data={table_pattern}"));
+        }
+
+        for table_pattern in full_excludes {
+            command.arg(format!("--exclude-table={table_pattern}"));
         }
 
         let mut child = command
