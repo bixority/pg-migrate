@@ -1,11 +1,11 @@
 use crate::copy_engine::Splitter;
 use crate::{Config, Error, Result};
-use wildmatch::WildMatch;
 use indicatif::HumanBytes;
 use log::{info, warn};
 use std::sync::Arc;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
+use wildmatch::WildMatch;
 
 #[derive(Debug, Clone)]
 pub struct MigrationPlan {
@@ -55,7 +55,7 @@ pub async fn create_plan(
         db_plans.push(plan_database(&config, db_name, *size, &cancel).await?);
 
         if cancel.is_cancelled() {
-            return Err(Error::Cancelled("planning interrupted".to_string()));
+            return Err(Error::Cancelled("planning interrupted".into()));
         }
     }
 
@@ -123,7 +123,11 @@ async fn plan_database(
     let mut copy_excludes = std::collections::HashSet::new();
     for rule in &config.copy_rules {
         if let Some(table_name) = rule.table.strip_prefix(&db_prefix) {
-            if db_plan.full_excludes.iter().any(|p| WildMatch::new(p).matches(table_name)) {
+            if db_plan
+                .full_excludes
+                .iter()
+                .any(|p| WildMatch::new(p).matches(table_name))
+            {
                 continue;
             }
             copy_excludes.insert(table_name.to_string());
@@ -173,9 +177,7 @@ async fn plan_database(
             {
                 continue;
             }
-            db_plan
-                .regular_data_excludes
-                .push(table_pattern.to_string());
+            db_plan.regular_data_excludes.push(table_pattern.clone());
             if !copy_excludes.contains(&table_pattern) {
                 db_plan.delayed_tables.push(table_pattern);
             }
@@ -186,14 +188,17 @@ async fn plan_database(
     //    reflects exactly what will be migrated and how. Copy-engine tables win
     //    over delayed (they are excluded from the delayed pg_dump), and delayed
     //    wins over regular.
-    let copy_specs: Vec<String> = config.copy_rules.iter().map(|r| r.table.clone()).collect();
     for (schema, table) in list_user_tables(config, db_name, cancel).await? {
         if config.is_table_excluded(db_name, &schema, &table) {
             continue;
         }
 
         let full = format!("{schema}.{table}");
-        if crate::config::is_pattern_match(db_name, &schema, &table, &copy_specs) {
+        if config
+            .copy_rule_patterns
+            .iter()
+            .any(|p| p.matches(db_name, &schema, &table))
+        {
             db_plan.copy_table_names.push(full);
         } else if config.is_delayed_table(db_name, &schema, &table) {
             db_plan.delayed_table_names.push(full);
@@ -232,7 +237,7 @@ async fn resolve_range(
     );
     let pool = select! {
         res = config.pool_cache.get(&config.source, db_name) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".into())),
     };
 
     let query = format!(
@@ -268,7 +273,7 @@ async fn list_user_tables(
 ) -> Result<Vec<(String, String)>> {
     let pool = select! {
         res = config.pool_cache.get(&config.source, db_name) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".into())),
     };
 
     let rows = select! {
@@ -281,7 +286,7 @@ async fn list_user_tables(
              ORDER BY 1, 2",
             &[],
         ) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".into())),
     };
 
     Ok(rows

@@ -46,6 +46,45 @@ impl CopyRule {
     }
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub enum TablePattern {
+    Db(String),
+    DbSchema(String, WildMatch),
+    DbSchemaTable(String, WildMatch, WildMatch),
+}
+
+impl TablePattern {
+    #[must_use]
+    pub fn parse(s: &str) -> Option<Self> {
+        let parts: Vec<&str> = s.split('.').collect();
+        match parts.as_slice() {
+            [db] if !db.is_empty() => Some(Self::Db((*db).to_string())),
+            [db, schema] if !db.is_empty() && !schema.is_empty() => {
+                Some(Self::DbSchema((*db).to_string(), WildMatch::new(schema)))
+            }
+            [db, schema, table] if !db.is_empty() && !schema.is_empty() && !table.is_empty() => {
+                Some(Self::DbSchemaTable(
+                    (*db).to_string(),
+                    WildMatch::new(schema),
+                    WildMatch::new(table),
+                ))
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn matches(&self, db_name: &str, schema: &str, table: &str) -> bool {
+        match self {
+            Self::Db(p_db) => p_db == db_name,
+            Self::DbSchema(p_db, p_schema) => p_db == db_name && p_schema.matches(schema),
+            Self::DbSchemaTable(p_db, p_schema, p_table) => {
+                p_db == db_name && p_schema.matches(schema) && p_table.matches(table)
+            }
+        }
+    }
+}
+
 /// Fully resolved configuration shared across the migration.
 pub struct Config {
     pub source: db::DbArgs,
@@ -78,6 +117,11 @@ pub struct Config {
     pub ssl_mode: String,
 
     pub copy_rules: Vec<CopyRule>,
+
+    /// Pre-compiled patterns for efficient matching.
+    pub(crate) exclude_patterns: Vec<TablePattern>,
+    pub(crate) deferred_patterns: Vec<TablePattern>,
+    pub(crate) copy_rule_patterns: Vec<TablePattern>,
 }
 
 impl Config {
@@ -99,56 +143,31 @@ impl Config {
     /// in the `exclude` list.
     #[must_use]
     pub fn is_db_excluded(&self, db_name: &str) -> bool {
-        self.exclude.iter().any(|pattern| {
-            let parts: Vec<&str> = pattern.split('.').collect();
-            match parts.as_slice() {
-                [p_db] => *p_db == db_name,
-                [p_db, p_schema] if *p_db == db_name => *p_schema == "*",
-                [p_db, p_schema, p_table] if *p_db == db_name => {
-                    *p_schema == "*" && *p_table == "*"
-                }
-                _ => false,
+        self.exclude_patterns.iter().any(|p| match p {
+            TablePattern::Db(p_db) => p_db == db_name,
+            TablePattern::DbSchema(p_db, p_schema) if p_db == db_name => p_schema.matches("*"),
+            TablePattern::DbSchemaTable(p_db, p_schema, p_table) if p_db == db_name => {
+                p_schema.matches("*") && p_table.matches("*")
             }
+            _ => false,
         })
     }
 
     /// Returns whether a table is excluded from migration.
     #[must_use]
     pub fn is_table_excluded(&self, db_name: &str, schema: &str, table: &str) -> bool {
-        is_pattern_match(db_name, schema, table, &self.exclude)
+        self.exclude_patterns
+            .iter()
+            .any(|p| p.matches(db_name, schema, table))
     }
 
     /// Returns whether a table is deferred out of the regular pass.
     #[must_use]
     pub fn is_delayed_table(&self, db_name: &str, schema: &str, table: &str) -> bool {
-        is_pattern_match(db_name, schema, table, &self.deferred_table_patterns())
+        self.deferred_patterns
+            .iter()
+            .any(|p| p.matches(db_name, schema, table))
     }
-}
-
-/// Returns whether a database.schema.table combination matches any of the
-/// provided patterns.
-///
-/// Entry formats:
-/// - `DATABASE`: matches every table in the database.
-/// - `DATABASE.SCHEMA_PATTERN`: matches every table in schemas matching the pattern.
-/// - `DATABASE.SCHEMA_PATTERN.TABLE_PATTERN`: matches tables matching the pattern.
-///
-/// The `DATABASE` part must be a literal name; `SCHEMA_PATTERN` and
-/// `TABLE_PATTERN` may use `pg_dump`'s `*`/`?` wildcards.
-pub fn is_pattern_match(db_name: &str, schema: &str, table: &str, patterns: &[String]) -> bool {
-    patterns.iter().any(|pattern| {
-        let parts: Vec<&str> = pattern.split('.').collect();
-        match parts.as_slice() {
-            [p_db] => *p_db == db_name,
-            [p_db, p_schema] if *p_db == db_name => WildMatch::new(p_schema).matches(schema),
-            [p_db, p_schema, p_table] if *p_db == db_name => {
-                let qualified = format!("{schema}.{table}");
-                let pattern_qualified = format!("{p_schema}.{p_table}");
-                WildMatch::new(&pattern_qualified).matches(&qualified)
-            }
-            _ => false,
-        }
-    })
 }
 
 /// Builds the deferred-table pattern list from the raw config pieces.
@@ -172,7 +191,7 @@ fn deferred_table_patterns(delay_table_data: &[String], copy_rules: &[CopyRule])
 pub fn home() -> Result<PathBuf> {
     env::var_os("HOME")
         .map(PathBuf::from)
-        .ok_or_else(|| Error::Env("HOME environment variable not set".to_string()))
+        .ok_or_else(|| Error::Env("HOME environment variable not set".into()))
 }
 
 /// Returns the directory used for state markers.
@@ -292,10 +311,7 @@ pub struct Args {
 fn load_toml_config(path: Option<&Path>) -> Result<TomlConfig> {
     if let Some(path) = path {
         let content = fs::read_to_string(path).map_err(|e| {
-            Error::Config(format!(
-                "failed to read config file '{}': {e}",
-                path.display()
-            ))
+            Error::Config(format!("failed to read config file '{}': {e}", path.display()).into())
         })?;
         return Ok(toml::from_str(&content)?);
     }
@@ -353,19 +369,35 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
     let exclude = toml_config.exclude.unwrap_or_default();
     validate_exclude_patterns(&exclude)?;
 
+    let exclude_patterns = exclude
+        .iter()
+        .filter_map(|s| TablePattern::parse(s))
+        .collect();
+
+    let deferred_raw = deferred_table_patterns(&delay_table_data, &copy_rules);
+    let deferred_patterns = deferred_raw
+        .iter()
+        .filter_map(|s| TablePattern::parse(s))
+        .collect();
+
+    let copy_rule_patterns = copy_rules
+        .iter()
+        .filter_map(|r| TablePattern::parse(&r.table))
+        .collect();
+
     Ok(Arc::new(Config {
         source: db::DbArgs {
-            host: args.from_host,
+            host: args.from_host.into(),
             port: args.from_port,
-            user: args.from_user,
-            pass: args.from_pass,
+            user: args.from_user.into(),
+            pass: args.from_pass.into(),
         },
         source_db: args.from_db,
         destination: db::DbArgs {
-            host: args.to_host,
+            host: args.to_host.into(),
             port: args.to_port,
-            user: args.to_user,
-            pass: args.to_pass,
+            user: args.to_user.into(),
+            pass: args.to_pass.into(),
         },
         destination_db: args.to_db,
         dump_jobs: toml_config.dump_jobs,
@@ -384,6 +416,9 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
         zstd_level,
         ssl_mode: ssl_mode_label.to_string(),
         copy_rules,
+        exclude_patterns,
+        deferred_patterns,
+        copy_rule_patterns,
     }))
 }
 
@@ -428,8 +463,7 @@ fn validate_copy_rules(rules: &[CopyRule]) -> Result<()> {
         if parse_fully_qualified(&rule.table).is_none() {
             return Err(Error::InvalidCopyRule {
                 table: rule.table.clone(),
-                reason: "expected 'DATABASE.SCHEMA.TABLE' format with all parts non-empty"
-                    .to_string(),
+                reason: "expected 'DATABASE.SCHEMA.TABLE' format with all parts non-empty".into(),
             });
         }
     }
@@ -455,7 +489,7 @@ pub fn validate_delay_table_data(patterns: &[String]) -> Result<()> {
                 table: pattern.clone(),
                 reason: "delay_table_data entry must be 'DB', 'DB.SCHEMA', or \
                          'DB.SCHEMA.TABLE' with all parts non-empty"
-                    .to_string(),
+                    .into(),
             });
         }
     }
@@ -476,7 +510,7 @@ pub fn validate_exclude_patterns(patterns: &[String]) -> Result<()> {
                 table: pattern.clone(),
                 reason: "exclude entry must be 'DB', 'DB.SCHEMA', or 'DB.SCHEMA.TABLE' with \
                          all parts non-empty"
-                    .to_string(),
+                    .into(),
             });
         }
     }
@@ -744,19 +778,33 @@ till = \"2023-03-01\"
         let delay_table_data = toml_config.delay_table_data.unwrap_or_default();
         let exclude = toml_config.exclude.unwrap_or_default();
 
+        let exclude_patterns = exclude
+            .iter()
+            .filter_map(|s| TablePattern::parse(s))
+            .collect();
+        let deferred_raw = deferred_table_patterns(&delay_table_data, &copy_rules);
+        let deferred_patterns = deferred_raw
+            .iter()
+            .filter_map(|s| TablePattern::parse(s))
+            .collect();
+        let copy_rule_patterns = copy_rules
+            .iter()
+            .filter_map(|r| TablePattern::parse(&r.table))
+            .collect();
+
         Ok(Arc::new(Config {
             source: db::DbArgs {
-                host: "localhost".to_string(),
+                host: "localhost".into(),
                 port: 5432,
-                user: "postgres".to_string(),
-                pass: "pass".to_string(),
+                user: "postgres".into(),
+                pass: "pass".into(),
             },
             source_db: "postgres".to_string(),
             destination: db::DbArgs {
-                host: "localhost".to_string(),
+                host: "localhost".into(),
                 port: 5432,
-                user: "postgres".to_string(),
-                pass: "pass".to_string(),
+                user: "postgres".into(),
+                pass: "pass".into(),
             },
             destination_db: "postgres".to_string(),
             dump_jobs: toml_config.dump_jobs,
@@ -775,6 +823,9 @@ till = \"2023-03-01\"
             zstd_level: 5,
             ssl_mode: ssl_mode_label.to_string(),
             copy_rules,
+            exclude_patterns,
+            deferred_patterns,
+            copy_rule_patterns,
         }))
     }
 }

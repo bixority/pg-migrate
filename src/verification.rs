@@ -130,14 +130,7 @@ pub async fn get_or_compute_counts(
         let content = fs::read_to_string(&path)?;
         Ok(serde_json::from_str(&content)?)
     } else {
-        let counts = stat_counts(
-            config,
-            args,
-            db_name,
-            include_delayed,
-            cancel,
-        )
-        .await?;
+        let counts = stat_counts(config, args, db_name, include_delayed, cancel).await?;
         let content = serde_json::to_string(&counts)?;
         fs::write(&path, content)?;
         Ok(counts)
@@ -153,12 +146,12 @@ pub async fn stat_counts(
 ) -> Result<BTreeMap<String, String>> {
     let pool = tokio::select! {
         res = config.pool_cache.get(args, db_name) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled(format!("verification connection for {db_name}"))),
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("verification connection for {db_name}").into())),
     };
 
     let tables = tokio::select! {
         res = pool.query("SELECT schemaname, relname FROM pg_stat_user_tables ORDER BY 1, 2", &[]) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled(format!("table discovery for {db_name}"))),
+        () = cancel.cancelled() => return Err(Error::Cancelled(format!("table discovery for {db_name}").into())),
     };
 
     // Delayed-data and copy-engine tables are migrated out-of-band (delayed
@@ -192,13 +185,13 @@ pub async fn stat_counts(
             async move {
                 let _permit = tokio::select! {
                     res = verify_sem.clone().acquire_owned() => res?,
-                    () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".to_string())),
+                    () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".into())),
                 };
                 let full_name = format!("\"{schema}\".\"{table}\"");
                 let count_query = format!("SELECT count(*) FROM {full_name}");
                 let count: i64 = tokio::select! {
                     res = pool.query_one(&count_query, &[]) => res?.get(0),
-                    () = cancel.cancelled() => return Err(Error::Cancelled(format!("row count of {schema}.{table}"))),
+                    () = cancel.cancelled() => return Err(Error::Cancelled(format!("row count of {schema}.{table}").into())),
                 };
                 Ok((format!("{schema}.{table}"), count.to_string()))
             }
@@ -224,7 +217,7 @@ async fn fast_stat_counts(
 ) -> Result<BTreeMap<String, String>> {
     let _permit = tokio::select! {
         res = config.verify_sem.clone().acquire_owned() => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".into())),
     };
     let allowed: HashSet<(String, String)> = entries.iter().cloned().collect();
 
@@ -237,7 +230,7 @@ async fn fast_stat_counts(
                AND n.nspname NOT IN ('pg_catalog','information_schema','pg_toast')",
             &[]
         ) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("reltuples query".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("reltuples query".into())),
     };
 
     let mut estimates: BTreeMap<(String, String), i64> = BTreeMap::new();
@@ -261,5 +254,3 @@ async fn fast_stat_counts(
 
     Ok(counts)
 }
-
-

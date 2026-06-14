@@ -40,9 +40,7 @@ delay_table_data = [
 # or specific tables ("DB.SCHEMA.TABLE"). Wildcards (*, ?) are supported in
 # the schema and table parts.
 exclude = [
- "db5",
- "pdb1.internal.*",
- "pdb2.public.secret_table"
+ "db5"
 ]
 
 # Whether to perform fast verification

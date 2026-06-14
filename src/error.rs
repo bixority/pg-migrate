@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::fmt;
 use thiserror::Error;
 
@@ -50,7 +51,7 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("Migration cancelled: {0}")]
-    Cancelled(String),
+    Cancelled(Cow<'static, str>),
 
     #[error("Process failed: {command}\nError: {stderr}")]
     ProcessFailed { command: String, stderr: String },
@@ -84,13 +85,13 @@ pub enum Error {
     CopyEngine(#[from] crate::copy_engine::error::CopyEngineError),
 
     #[error("Environment error: {0}")]
-    Env(String),
+    Env(Cow<'static, str>),
 
     #[error("Connection timeout: {0}")]
-    Timeout(String),
+    Timeout(Cow<'static, str>),
 
     #[error("Configuration error: {0}")]
-    Config(String),
+    Config(Cow<'static, str>),
 
     #[error("Database '{database}' not found")]
     DatabaseNotFound { database: String },
@@ -99,7 +100,7 @@ pub enum Error {
     DumpNotFound { database: String, path: String },
 
     #[error("Invalid path: {0}")]
-    InvalidPath(String),
+    InvalidPath(Cow<'static, str>),
 
     #[error("Invalid copy rule for table '{table}': {reason}")]
     InvalidCopyRule { table: String, reason: String },
@@ -114,7 +115,7 @@ pub enum Error {
     },
 
     #[error("{0}")]
-    Other(String),
+    Other(Cow<'static, str>),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

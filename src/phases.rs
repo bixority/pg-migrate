@@ -84,7 +84,7 @@ pub async fn phase_migrate_all(
             () = cancel.cancelled() => {
                 regular_tasks.abort_all();
                 delayed_tasks.abort_all();
-                return Err(Error::Cancelled("user interruption".to_string()));
+                return Err(Error::Cancelled("user interruption".into()));
             }
         }
     }
@@ -114,13 +114,13 @@ pub async fn phase_migrate_all(
             }
             () = cancel.cancelled() => {
                 delayed_tasks.abort_all();
-                return Err(Error::Cancelled("user interruption".to_string()));
+                return Err(Error::Cancelled("user interruption".into()));
             }
         }
     }
 
     if cancel.is_cancelled() {
-        return Err(Error::Cancelled("user interruption".to_string()));
+        return Err(Error::Cancelled("user interruption".into()));
     }
 
     let total_duration = start.elapsed();
@@ -136,7 +136,7 @@ pub async fn phase_migrate_all(
 async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<OwnedSemaphorePermit> {
     tokio::select! {
         res = sem.clone().acquire_owned() => Ok(res?),
-        () = cancel.cancelled() => Err(Error::Cancelled("semaphore acquisition".to_string())),
+        () = cancel.cancelled() => Err(Error::Cancelled("semaphore acquisition".into())),
     }
 }
 
@@ -243,11 +243,9 @@ async fn run_delayed_pipeline(
         regular_done
             .wait_for(|&done| done)
             .await
-            .map_err(|_| Error::Cancelled("regular pipelines did not complete".to_string()))?;
+            .map_err(|_| Error::Cancelled("regular pipelines did not complete".into()))?;
         if cancel.is_cancelled() {
-            return Err(Error::Cancelled(
-                "migration process interrupted".to_string(),
-            ));
+            return Err(Error::Cancelled("migration process interrupted".into()));
         }
 
         let _restore_permit = acquire(&restore_sem, &cancel).await?;

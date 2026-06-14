@@ -2,23 +2,24 @@ use crate::copy_engine::error::{CopyEngineError, CopyFailure, Result};
 use crate::copy_engine::splitter::Partition;
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use log::{error, info};
+use std::sync::Arc;
 use tokio_postgres::Error as PgError;
 use tokio_postgres::error::SqlState;
 
 pub struct Worker {
     id: usize,
-    source_config: String,
-    dest_config: String,
-    table_name: String,
+    source_config: Arc<str>,
+    dest_config: Arc<str>,
+    table_name: Arc<str>,
 }
 
 impl Worker {
     #[must_use]
     pub const fn new(
         id: usize,
-        source_config: String,
-        dest_config: String,
-        table_name: String,
+        source_config: Arc<str>,
+        dest_config: Arc<str>,
+        table_name: Arc<str>,
     ) -> Self {
         Self {
             id,
@@ -45,7 +46,7 @@ impl Worker {
         CopyEngineError::CopyFailed(Box::new(CopyFailure {
             stage,
             side,
-            table: self.table_name.clone(),
+            table: self.table_name.to_string(),
             partition: partition.to_string(),
             detail,
             hint,
@@ -224,15 +225,10 @@ mod tests {
 
     #[test]
     fn test_worker_new() {
-        let worker = Worker::new(
-            1,
-            "src".to_string(),
-            "dest".to_string(),
-            "table".to_string(),
-        );
+        let worker = Worker::new(1, Arc::from("src"), Arc::from("dest"), Arc::from("table"));
         assert_eq!(worker.id, 1);
-        assert_eq!(worker.source_config, "src");
-        assert_eq!(worker.dest_config, "dest");
-        assert_eq!(worker.table_name, "table");
+        assert_eq!(&*worker.source_config, "src");
+        assert_eq!(&*worker.dest_config, "dest");
+        assert_eq!(&*worker.table_name, "table");
     }
 }

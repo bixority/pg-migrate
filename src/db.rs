@@ -20,10 +20,10 @@ use tokio_util::sync::CancellationToken;
 
 #[derive(Clone, Debug)]
 pub struct DbArgs {
-    pub host: String,
+    pub host: Arc<str>,
     pub port: u16,
-    pub user: String,
-    pub pass: String,
+    pub user: Arc<str>,
+    pub pass: Arc<str>,
 }
 
 #[derive(Clone, Debug)]
@@ -92,7 +92,13 @@ pub fn delayed_dump_dir(root: &Path, db: &str) -> PathBuf {
     root.join(format!("{db}_delayed"))
 }
 
-type PoolKey = (String, u16, String, String);
+#[derive(Hash, PartialEq, Eq, Clone)]
+struct PoolKey {
+    host: Arc<str>,
+    port: u16,
+    user: Arc<str>,
+    db: Arc<str>,
+}
 
 #[derive(Clone)]
 pub struct PoolCache {
@@ -110,26 +116,25 @@ impl PoolCache {
     }
 
     pub async fn get(&self, args: &DbArgs, db: &str) -> Result<Arc<tokio_postgres::Client>> {
-        let key = (
-            args.host.clone(),
-            args.port,
-            args.user.clone(),
-            db.to_string(),
-        );
-
         {
             let lock = self.inner.lock().await;
-            if let Some(p) = lock.get(&key) {
-                return Ok(p.clone());
+            for (key, client) in lock.iter() {
+                if key.host == args.host
+                    && key.port == args.port
+                    && key.user == args.user
+                    && *key.db == *db
+                {
+                    return Ok(client.clone());
+                }
             }
         }
 
         let mut config = tokio_postgres::Config::new();
         config
-            .host(&args.host)
+            .host(&*args.host)
             .port(args.port)
-            .user(&args.user)
-            .password(&args.pass)
+            .user(&*args.user)
+            .password(&*args.pass)
             .dbname(db)
             .ssl_mode(self.ssl_mode);
 
@@ -137,7 +142,9 @@ impl PoolCache {
         let (client, connection) =
             tokio::time::timeout(Duration::from_secs(30), config.connect(tls))
                 .await
-                .map_err(|_| Error::Timeout(format!("to {} database {}", args.host, db)))??;
+                .map_err(|_| {
+                    Error::Timeout(format!("to {} database {}", &*args.host, db).into())
+                })??;
 
         let db_name = db.to_string();
         tokio::spawn(async move {
@@ -147,6 +154,12 @@ impl PoolCache {
         });
 
         let client = Arc::new(client);
+        let key = PoolKey {
+            host: args.host.clone(),
+            port: args.port,
+            user: args.user.clone(),
+            db: db.into(),
+        };
 
         self.inner.lock().await.insert(key, client.clone());
 
@@ -160,7 +173,7 @@ pub async fn discover_databases(
 ) -> Result<Vec<(String, u64)>> {
     let pool = select! {
         res = config.pool_cache.get(&config.source, &config.source_db) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".into())),
     };
 
     let rows = select! {
@@ -172,7 +185,7 @@ pub async fn discover_databases(
              ORDER BY pg_database_size(datname) ASC;",
              &[]
         ) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("database discovery".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database discovery".into())),
     };
 
     let mut dbs = Vec::with_capacity(rows.len());
@@ -221,13 +234,13 @@ pub async fn dump_db(
         let mut command = Command::new("pg_dump");
         let zstd_level = config.zstd_level;
         command.kill_on_drop(true);
-        command.env("PGPASSWORD", &config.source.pass).args([
+        command.env("PGPASSWORD", &*config.source.pass).args([
             "-h",
-            &config.source.host,
+            &*config.source.host,
             "-p",
             &port,
             "-U",
-            &config.source.user,
+            &*config.source.user,
             "-Fd",
             "-j",
             &config.dump_jobs.to_string(),
@@ -236,7 +249,7 @@ pub async fn dump_db(
             "-f",
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string().into()))?,
         ]);
 
         for table_pattern in data_excludes {
@@ -262,7 +275,7 @@ pub async fn dump_db(
             res = child.wait() => res?,
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                return Err(Error::Cancelled(format!("pg_dump of {db}")));
+                return Err(Error::Cancelled(format!("pg_dump of {db}").into()));
             }
         };
 
@@ -311,14 +324,14 @@ pub async fn restore_db(
     let port = config.destination.port.to_string();
     let mut child = Command::new("pg_restore")
         .kill_on_drop(true)
-        .env("PGPASSWORD", &config.destination.pass)
+        .env("PGPASSWORD", &*config.destination.pass)
         .args([
             "-h",
-            &config.destination.host,
+            &*config.destination.host,
             "-p",
             &port,
             "-U",
-            &config.destination.user,
+            &*config.destination.user,
             "-j",
             &config.restore_jobs.to_string(),
             "--disable-triggers",
@@ -326,7 +339,7 @@ pub async fn restore_db(
             db,
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string().into()))?,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -344,7 +357,7 @@ pub async fn restore_db(
             res = child.wait() => res.map_err(Error::from),
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                Err(Error::Cancelled(format!("pg_restore of {db}")))
+                Err(Error::Cancelled(format!("pg_restore of {db}").into()))
             }
         }
     };
@@ -404,13 +417,13 @@ pub async fn dump_delayed_data(
         let mut command = Command::new("pg_dump");
         let zstd_level = config.zstd_level;
         command.kill_on_drop(true);
-        command.env("PGPASSWORD", &config.source.pass).args([
+        command.env("PGPASSWORD", &*config.source.pass).args([
             "-h",
-            &config.source.host,
+            &*config.source.host,
             "-p",
             &port,
             "-U",
-            &config.source.user,
+            &*config.source.user,
             "-Fd",
             "-j",
             &config.dump_jobs.to_string(),
@@ -420,7 +433,7 @@ pub async fn dump_delayed_data(
             "-f",
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string().into()))?,
         ]);
 
         for table_pattern in tables {
@@ -446,7 +459,7 @@ pub async fn dump_delayed_data(
             res = child.wait() => res?,
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                return Err(Error::Cancelled(format!("pg_dump (delayed) of {db}")));
+                return Err(Error::Cancelled(format!("pg_dump (delayed) of {db}").into()));
             }
         };
 
@@ -486,14 +499,14 @@ pub async fn restore_delayed_data(
     let port = config.destination.port.to_string();
     let mut child = Command::new("pg_restore")
         .kill_on_drop(true)
-        .env("PGPASSWORD", &config.destination.pass)
+        .env("PGPASSWORD", &*config.destination.pass)
         .args([
             "-h",
-            &config.destination.host,
+            &*config.destination.host,
             "-p",
             &port,
             "-U",
-            &config.destination.user,
+            &*config.destination.user,
             "-j",
             &config.restore_jobs.to_string(),
             "--disable-triggers",
@@ -502,7 +515,7 @@ pub async fn restore_delayed_data(
             db,
             dump_path
                 .to_str()
-                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string().into()))?,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -520,7 +533,7 @@ pub async fn restore_delayed_data(
             res = child.wait() => res.map_err(Error::from),
             () = cancel.cancelled() => {
                 let _ = child.kill().await;
-                Err(Error::Cancelled(format!("pg_restore (delayed) of {db}")))
+                Err(Error::Cancelled(format!("pg_restore (delayed) of {db}").into()))
             }
         }
     };
@@ -564,7 +577,7 @@ pub async fn restore_delayed_data(
 pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationToken) -> Result<()> {
     let pool = select! {
         res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".into())),
     };
 
     for db in dbs {
@@ -575,7 +588,7 @@ pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationTok
                     warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
                 }
             }
-            () = cancel.cancelled() => return Err(Error::Cancelled(format!("database creation of {db}"))),
+            () = cancel.cancelled() => return Err(Error::Cancelled(format!("database creation of {db}").into())),
         }
     }
     Ok(())
@@ -620,19 +633,19 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
     let port = config.source.port.to_string();
     let mut child = Command::new("pg_dumpall")
         .kill_on_drop(true)
-        .env("PGPASSWORD", &config.source.pass)
+        .env("PGPASSWORD", &*config.source.pass)
         .args([
             "-h",
-            &config.source.host,
+            &*config.source.host,
             "-p",
             &port,
             "-U",
-            &config.source.user,
+            &*config.source.user,
             "--globals-only",
             "-f",
             globals_path
                 .to_str()
-                .ok_or_else(|| Error::InvalidPath(globals_path.display().to_string()))?,
+                .ok_or_else(|| Error::InvalidPath(globals_path.display().to_string().into()))?,
         ])
         .spawn()
         .map_err(|e| Error::SpawnFailed {
@@ -644,7 +657,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         res = child.wait() => res?,
         () = cancel.cancelled() => {
             let _ = child.kill().await;
-            return Err(Error::Cancelled("pg_dumpall --globals-only".to_string()));
+            return Err(Error::Cancelled("pg_dumpall --globals-only".into()));
         }
     };
 
@@ -661,7 +674,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
 
     let pool = select! {
         res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".to_string())),
+        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".into())),
     };
 
     let sql = fs::read_to_string(&globals_path)?;
@@ -674,7 +687,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
 
         let res = select! {
             res = pool.execute(&exec_sql, &[]) => res,
-            () = cancel.cancelled() => return Err(Error::Cancelled("globals migration execution".to_string())),
+            () = cancel.cancelled() => return Err(Error::Cancelled("globals migration execution".into())),
         };
 
         if let Err(e) = res {

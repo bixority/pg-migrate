@@ -35,12 +35,12 @@ async fn main() -> Result<()> {
 
     indicatif_log_bridge::LogWrapper::new((*mp).clone(), logger)
         .try_init()
-        .map_err(|e| Error::Env(format!("failed to init log wrapper: {e}")))?;
+        .map_err(|e| Error::Env(format!("failed to init log wrapper: {e}").into()))?;
 
     let total_time_pb = mp.add(ProgressBar::new_spinner());
     total_time_pb.set_style(
         ProgressStyle::with_template("{spinner:.green} Total elapsed time: {elapsed_precise}")
-            .map_err(|e| Error::Config(format!("Invalid progress style template: {e}")))?,
+            .map_err(|e| Error::Config(format!("Invalid progress style template: {e}").into()))?,
     );
     total_time_pb.enable_steady_tick(Duration::from_millis(100));
 
@@ -99,12 +99,8 @@ pub async fn run_copy_engine(
         config.ssl_mode
     );
 
-    let orchestrator = copy_engine::Orchestrator::new(
-        source_conn,
-        dest_conn,
-        target.table.to_string(),
-        config.max_parallel,
-    );
+    let orchestrator =
+        copy_engine::Orchestrator::new(source_conn, dest_conn, target.table, config.max_parallel);
 
     let partitions = copy_engine::Splitter::split(
         target.column,

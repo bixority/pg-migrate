@@ -17,24 +17,24 @@ pub struct CopyProgress {
 }
 
 pub struct Orchestrator {
-    source_config: String,
-    dest_config: String,
-    table_name: String,
+    source_config: Arc<str>,
+    dest_config: Arc<str>,
+    table_name: Arc<str>,
     worker_count: usize,
 }
 
 impl Orchestrator {
     #[must_use]
-    pub const fn new(
-        source_config: String,
-        dest_config: String,
-        table_name: String,
+    pub fn new(
+        source_config: impl Into<Arc<str>>,
+        dest_config: impl Into<Arc<str>>,
+        table_name: impl Into<Arc<str>>,
         worker_count: usize,
     ) -> Self {
         Self {
-            source_config,
-            dest_config,
-            table_name,
+            source_config: source_config.into(),
+            dest_config: dest_config.into(),
+            table_name: table_name.into(),
             worker_count,
         }
     }
@@ -68,10 +68,12 @@ impl Orchestrator {
 
         let probe = format!("SELECT 1 FROM {} LIMIT 0", self.table_name);
         if let Err(e) = client.simple_query(&probe).await {
-            if e.as_db_error().map(|d| d.code().clone()) == Some(SqlState::UNDEFINED_TABLE) {
+            if e.as_db_error().map(tokio_postgres::error::DbError::code)
+                == Some(&SqlState::UNDEFINED_TABLE)
+            {
                 return Err(CopyEngineError::TableNotFound {
                     side,
-                    table: self.table_name.clone(),
+                    table: self.table_name.to_string(),
                     search_path,
                 });
             }
@@ -167,26 +169,16 @@ mod tests {
 
     #[tokio::test]
     async fn test_orchestrator_new() {
-        let orch = Orchestrator::new(
-            "src".to_string(),
-            "dest".to_string(),
-            "table".to_string(),
-            4,
-        );
-        assert_eq!(orch.source_config, "src");
-        assert_eq!(orch.dest_config, "dest");
-        assert_eq!(orch.table_name, "table");
+        let orch = Orchestrator::new("src", "dest", "table", 4);
+        assert_eq!(&*orch.source_config, "src");
+        assert_eq!(&*orch.dest_config, "dest");
+        assert_eq!(&*orch.table_name, "table");
         assert_eq!(orch.worker_count, 4);
     }
 
     #[tokio::test]
     async fn test_orchestrator_empty_partitions() -> Result<()> {
-        let orch = Orchestrator::new(
-            "src".to_string(),
-            "dest".to_string(),
-            "table".to_string(),
-            4,
-        );
+        let orch = Orchestrator::new("src", "dest", "table", 4);
         let result = orch.run(vec![], |_| {}).await?;
         assert_eq!(result, 0);
         Ok(())
