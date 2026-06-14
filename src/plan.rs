@@ -2,6 +2,7 @@ use crate::copy_engine::Splitter;
 use crate::{Config, Error, Result};
 use indicatif::HumanBytes;
 use log::{info, warn};
+use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
@@ -101,7 +102,24 @@ async fn plan_database(
 
     let db_prefix = format!("{db_name}.");
 
-    // 0. Identify fully excluded tables/patterns.
+    identify_full_excludes(config, db_name, &db_prefix, &mut db_plan);
+
+    let copy_excludes =
+        identify_copy_rules(config, db_name, &db_prefix, &mut db_plan, cancel).await?;
+
+    identify_delayed_tables(config, db_name, &db_prefix, &copy_excludes, &mut db_plan);
+
+    resolve_table_classifications(config, db_name, &mut db_plan, cancel).await?;
+
+    Ok(db_plan)
+}
+
+fn identify_full_excludes(
+    config: &Config,
+    db_name: &str,
+    db_prefix: &str,
+    db_plan: &mut DatabasePlan,
+) {
     for pattern in &config.exclude {
         if pattern == db_name {
             // Entire database is excluded; this is primarily handled in create_plan,
@@ -109,7 +127,7 @@ async fn plan_database(
             db_plan.full_excludes.push("*.*".to_string());
             continue;
         }
-        if let Some(rest) = pattern.strip_prefix(&db_prefix) {
+        if let Some(rest) = pattern.strip_prefix(db_prefix) {
             let translated = if rest.contains('.') {
                 rest.to_string()
             } else {
@@ -118,11 +136,18 @@ async fn plan_database(
             db_plan.full_excludes.push(translated);
         }
     }
+}
 
-    // 1. Identify copy rules and their partitions.
-    let mut copy_excludes = std::collections::HashSet::new();
+async fn identify_copy_rules(
+    config: &Config,
+    db_name: &str,
+    db_prefix: &str,
+    db_plan: &mut DatabasePlan,
+    cancel: &CancellationToken,
+) -> Result<HashSet<String>> {
+    let mut copy_excludes = HashSet::new();
     for rule in &config.copy_rules {
-        if let Some(table_name) = rule.table.strip_prefix(&db_prefix) {
+        if let Some(table_name) = rule.table.strip_prefix(db_prefix) {
             if db_plan
                 .full_excludes
                 .iter()
@@ -154,13 +179,21 @@ async fn plan_database(
             db_plan.regular_data_excludes.push(table_name.to_string());
         }
     }
+    Ok(copy_excludes)
+}
 
-    // 2. Identify delayed tables.
+fn identify_delayed_tables(
+    config: &Config,
+    db_name: &str,
+    db_prefix: &str,
+    copy_excludes: &HashSet<String>,
+    db_plan: &mut DatabasePlan,
+) {
     for delay in &config.delay_table_data {
         let table_pattern = if delay == db_name {
             Some("*.*".to_string())
         } else {
-            delay.strip_prefix(&db_prefix).map(|rest| {
+            delay.strip_prefix(db_prefix).map(|rest| {
                 if rest.contains('.') {
                     rest.to_string()
                 } else {
@@ -183,11 +216,14 @@ async fn plan_database(
             }
         }
     }
+}
 
-    // 3. Resolve every table in the database against the rules so the plan
-    //    reflects exactly what will be migrated and how. Copy-engine tables win
-    //    over delayed (they are excluded from the delayed pg_dump), and delayed
-    //    wins over regular.
+async fn resolve_table_classifications(
+    config: &Config,
+    db_name: &str,
+    db_plan: &mut DatabasePlan,
+    cancel: &CancellationToken,
+) -> Result<()> {
     for (schema, table) in list_user_tables(config, db_name, cancel).await? {
         if config.is_table_excluded(db_name, &schema, &table) {
             continue;
@@ -206,8 +242,7 @@ async fn plan_database(
             db_plan.regular_table_names.push(full);
         }
     }
-
-    Ok(db_plan)
+    Ok(())
 }
 
 /// Resolves the `from`/`till` bounds for a `time`-method copy rule.
