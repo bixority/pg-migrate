@@ -2,7 +2,7 @@ use crate::Config;
 use crate::error::{Error, MigrationPhase, Result};
 use crate::state_dir;
 use indicatif::HumanBytes;
-use log::{info, warn};
+use log::info;
 use std::collections::HashMap;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -103,7 +103,7 @@ struct PoolKey {
 #[derive(Clone)]
 pub struct PoolCache {
     inner: Arc<AsyncMutex<HashMap<PoolKey, Arc<tokio_postgres::Client>>>>,
-    ssl_mode: SslMode,
+    pub ssl_mode: SslMode,
 }
 
 impl PoolCache {
@@ -585,7 +585,15 @@ pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationTok
         select! {
             res = pool.execute(&sql, &[]) => {
                 if let Err(e) = res {
-                    warn!("Warning: CREATE DATABASE \"{db}\" failed or already exists: {e}");
+                    if let Some(db_err) = e.as_db_error() {
+                        if db_err.code() == &tokio_postgres::error::SqlState::DUPLICATE_DATABASE {
+                            continue;
+                        }
+                    }
+                    return Err(Error::ProcessFailed {
+                        command: format!("CREATE DATABASE \"{db}\""),
+                        stderr: e.to_string(),
+                    });
                 }
             }
             () = cancel.cancelled() => return Err(Error::Cancelled(format!("database creation of {db}").into())),
@@ -604,12 +612,23 @@ pub fn globals_marker() -> Result<PathBuf> {
 
 fn filter_globals_sql(content: &str, dest_user: &str) -> String {
     let mut filtered_content = Vec::new();
-    let pattern1 = format!(" {dest_user} ");
-    let pattern2 = format!(" {dest_user};");
+    let quoted_user = format!("\"{dest_user}\"");
+    let patterns = [
+        format!(" {dest_user} "),
+        format!(" {dest_user};"),
+        format!(" {quoted_user} "),
+        format!(" {quoted_user};"),
+    ];
 
     for line in content.lines() {
+        let trimmed = line.trim_start();
+        // Skip psql meta-commands (like \restrict, \connect, \encoding)
+        if trimmed.starts_with('\\') {
+            continue;
+        }
+
         if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
-            && (line.contains(&pattern1) || line.ends_with(&pattern2))
+            && patterns.iter().any(|p| line.contains(p) || line.ends_with(p))
         {
             info!("Skipping migration of role '{dest_user}' to avoid password overwrite.");
             continue;
@@ -620,14 +639,7 @@ fn filter_globals_sql(content: &str, dest_user: &str) -> String {
     filtered_content.join("\n")
 }
 
-pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Result<()> {
-    if globals_marker()?.exists() {
-        return Ok(());
-    }
-
-    info!("Migrating global objects...");
-
-    let globals_path = config.dump_root.join("globals.sql");
+async fn dump_globals(config: &Config, globals_path: &Path, cancel: CancellationToken) -> Result<()> {
     fs::create_dir_all(&config.dump_root)?;
 
     let port = config.source.port.to_string();
@@ -668,17 +680,47 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         });
     }
 
-    let globals_content = fs::read_to_string(&globals_path)?;
+    let globals_content = fs::read_to_string(globals_path)?;
     let filtered_content = filter_globals_sql(&globals_content, &config.destination.user);
-    fs::write(&globals_path, filtered_content)?;
+    fs::write(globals_path, filtered_content)?;
 
-    let pool = select! {
-        res = config.pool_cache.get(&config.destination, &config.destination_db) => res?,
-        () = cancel.cancelled() => return Err(Error::Cancelled("database connection".into())),
-    };
+    Ok(())
+}
 
-    let sql = fs::read_to_string(&globals_path)?;
-    for stmt in sql.split(";\n") {
+async fn apply_globals(config: &Config, globals_path: &Path, cancel: CancellationToken) -> Result<()> {
+    let mut db_config = tokio_postgres::Config::new();
+    db_config
+        .host(&*config.destination.host)
+        .port(config.destination.port)
+        .user(&*config.destination.user)
+        .password(&*config.destination.pass)
+        .dbname(&config.destination_db)
+        .ssl_mode(config.pool_cache.ssl_mode);
+
+    let (client, connection) =
+        tokio::time::timeout(Duration::from_secs(30), db_config.connect(crate::tls::make_tls()))
+            .await
+            .map_err(|_| {
+                Error::Timeout(
+                    format!(
+                        "to {} database {} for globals",
+                        &*config.destination.host, &config.destination_db
+                    )
+                    .into(),
+                )
+            })??;
+
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            log::error!("Globals connection error: {e}");
+        }
+    });
+
+    let sql = fs::read_to_string(globals_path)?;
+    // We split by ";\n" because pg_dumpall output is generally one statement
+    // per line ending with a semicolon. We also support ";\r\n" for compatibility.
+    let sql_normalized = sql.replace(";\r\n", ";\n");
+    for stmt in sql_normalized.split(";\n") {
         let s = stmt.trim();
         if s.is_empty() {
             continue;
@@ -686,7 +728,7 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
         let exec_sql = format!("{s};");
 
         let res = select! {
-            res = pool.execute(&exec_sql, &[]) => res,
+            res = client.execute(&exec_sql, &[]) => res,
             () = cancel.cancelled() => return Err(Error::Cancelled("globals migration execution".into())),
         };
 
@@ -701,24 +743,45 @@ pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Resu
                 {
                     continue;
                 }
-                warn!(
-                    "Warning: executing globals statement failed [{}]: {}{}{}\n  statement: {s}",
-                    db_err.code().code(),
-                    msg,
-                    db_err
-                        .detail()
-                        .map(|d| format!(" (detail: {d})"))
-                        .unwrap_or_default(),
-                    db_err
-                        .hint()
-                        .map(|h| format!(" (hint: {h})"))
-                        .unwrap_or_default(),
-                );
-            } else {
-                warn!("Warning: executing globals statement failed: {e}\n  statement: {s}");
+                return Err(Error::ProcessFailed {
+                    command: "execute globals statement".into(),
+                    stderr: format!(
+                        "Error [{}]: {}{}{}\n  statement: {s}",
+                        db_err.code().code(),
+                        msg,
+                        db_err
+                            .detail()
+                            .map(|d| format!(" (detail: {d})"))
+                            .unwrap_or_default(),
+                        db_err
+                            .hint()
+                            .map(|h| format!(" (hint: {h})"))
+                            .unwrap_or_default(),
+                    ),
+                });
             }
+
+            return Err(Error::ProcessFailed {
+                command: "execute globals statement".into(),
+                stderr: format!("Error: {e}\n  statement: {s}"),
+            });
         }
     }
+
+    Ok(())
+}
+
+pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Result<()> {
+    if globals_marker()?.exists() {
+        return Ok(());
+    }
+
+    info!("Migrating global objects...");
+
+    let globals_path = config.dump_root.join("globals.sql");
+
+    dump_globals(config, &globals_path, cancel.clone()).await?;
+    apply_globals(config, &globals_path, cancel).await?;
 
     fs::write(globals_marker()?, "")?;
     Ok(())
@@ -746,6 +809,28 @@ ALTER ROLE other WITH PASSWORD 'xyz';
     #[test]
     fn test_filter_globals_sql_with_spaces() {
         let sql = "CREATE ROLE postgres WITH LOGIN;";
+        let filtered = filter_globals_sql(sql, "postgres");
+        assert_eq!(filtered, "");
+    }
+
+    #[test]
+    fn test_filter_globals_sql_psql_meta() {
+        let sql = "\
+-- comment
+\\restrict token
+SET x = y;
+\\unrestrict token
+";
+        let filtered = filter_globals_sql(sql, "postgres");
+        assert!(filtered.contains("-- comment"));
+        assert!(!filtered.contains("\\restrict token"));
+        assert!(!filtered.contains("\\unrestrict token"));
+        assert!(filtered.contains("SET x = y;"));
+    }
+
+    #[test]
+    fn test_filter_globals_sql_quoted_role() {
+        let sql = "CREATE ROLE \"postgres\" WITH LOGIN;";
         let filtered = filter_globals_sql(sql, "postgres");
         assert_eq!(filtered, "");
     }

@@ -4,16 +4,16 @@
 dump_jobs = 12
 
 # Number of parallel jobs for pg_restore
-restore_jobs = 12
+restore_jobs = 16
 
 # Maximum number of parallel database migrations
-max_parallel = 4
+max_parallel = 16
 
 # Optional: Number of parallel dump operations (defaults to max_parallel)
-# dump_parallel = 6
+dump_parallel = 12
 
 # Optional: Number of parallel restore operations (defaults to max_parallel)
-# restore_parallel = 6
+restore_parallel = 16
 
 # Root directory for database dumps
 dump_root = "pg_dumps"
