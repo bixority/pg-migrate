@@ -585,10 +585,8 @@ pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationTok
         select! {
             res = pool.execute(&sql, &[]) => {
                 if let Err(e) = res {
-                    if let Some(db_err) = e.as_db_error() {
-                        if db_err.code() == &tokio_postgres::error::SqlState::DUPLICATE_DATABASE {
+                    if let Some(db_err) = e.as_db_error() && db_err.code() == &tokio_postgres::error::SqlState::DUPLICATE_DATABASE {
                             continue;
-                        }
                     }
                     return Err(Error::ProcessFailed {
                         command: format!("CREATE DATABASE \"{db}\""),
@@ -628,7 +626,9 @@ fn filter_globals_sql(content: &str, dest_user: &str) -> String {
         }
 
         if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
-            && patterns.iter().any(|p| line.contains(p) || line.ends_with(p))
+            && patterns
+                .iter()
+                .any(|p| line.contains(p) || line.ends_with(p))
         {
             info!("Skipping migration of role '{dest_user}' to avoid password overwrite.");
             continue;
@@ -639,7 +639,11 @@ fn filter_globals_sql(content: &str, dest_user: &str) -> String {
     filtered_content.join("\n")
 }
 
-async fn dump_globals(config: &Config, globals_path: &Path, cancel: CancellationToken) -> Result<()> {
+async fn dump_globals(
+    config: &Config,
+    globals_path: &Path,
+    cancel: CancellationToken,
+) -> Result<()> {
     fs::create_dir_all(&config.dump_root)?;
 
     let port = config.source.port.to_string();
@@ -687,7 +691,11 @@ async fn dump_globals(config: &Config, globals_path: &Path, cancel: Cancellation
     Ok(())
 }
 
-async fn apply_globals(config: &Config, globals_path: &Path, cancel: CancellationToken) -> Result<()> {
+async fn apply_globals(
+    config: &Config,
+    globals_path: &Path,
+    cancel: CancellationToken,
+) -> Result<()> {
     let mut db_config = tokio_postgres::Config::new();
     db_config
         .host(&*config.destination.host)
@@ -697,18 +705,20 @@ async fn apply_globals(config: &Config, globals_path: &Path, cancel: Cancellatio
         .dbname(&config.destination_db)
         .ssl_mode(config.pool_cache.ssl_mode);
 
-    let (client, connection) =
-        tokio::time::timeout(Duration::from_secs(30), db_config.connect(crate::tls::make_tls()))
-            .await
-            .map_err(|_| {
-                Error::Timeout(
-                    format!(
-                        "to {} database {} for globals",
-                        &*config.destination.host, &config.destination_db
-                    )
-                    .into(),
-                )
-            })??;
+    let (client, connection) = tokio::time::timeout(
+        Duration::from_secs(30),
+        db_config.connect(crate::tls::make_tls()),
+    )
+    .await
+    .map_err(|_| {
+        Error::Timeout(
+            format!(
+                "to {} database {} for globals",
+                &*config.destination.host, &config.destination_db
+            )
+            .into(),
+        )
+    })??;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
