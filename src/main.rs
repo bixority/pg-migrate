@@ -12,11 +12,14 @@ use crate::config::{Args, Config, build_config, state_dir, verify_dir};
 use crate::error::{Error, Result};
 use crate::phases::phase_migrate_all;
 use crate::tui::{migration_style, redraw_loop, shared_migration_states};
+use chrono::Local;
 use clap::Parser;
 use indicatif::{MultiProgress, ProgressBar, ProgressDrawTarget, ProgressStyle};
 use log::info;
 use std::fs;
+use std::io::Write as _;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
@@ -26,6 +29,13 @@ async fn main() -> Result<()> {
     let start_time = Instant::now();
     let args = Args::parse();
 
+    let log_name = Local::now().format("%Y-%m-%dT%H:%M:%S.log").to_string();
+    let log_file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_name)
+        .map_err(|e| Error::Env(format!("failed to create log file {log_name}: {e}").into()))?;
+
     let logger =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).build();
 
@@ -33,7 +43,12 @@ async fn main() -> Result<()> {
         ProgressDrawTarget::stderr_with_hz(1),
     ));
 
-    indicatif_log_bridge::LogWrapper::new((*mp).clone(), logger)
+    let multi_logger = MultiLogger {
+        file: Mutex::new(log_file),
+        inner: logger,
+    };
+
+    indicatif_log_bridge::LogWrapper::new((*mp).clone(), multi_logger)
         .try_init()
         .map_err(|e| Error::Env(format!("failed to init log wrapper: {e}").into()))?;
 
@@ -243,4 +258,79 @@ async fn prepare_destination(
 
     db::create_dbs(config, db_names, cancel.clone()).await?;
     Ok(())
+}
+
+struct MultiLogger {
+    file: Mutex<fs::File>,
+    inner: env_logger::Logger,
+}
+
+impl log::Log for MultiLogger {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        self.inner.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record) {
+        // Always log to terminal via LogWrapper
+        self.inner.log(record);
+
+        if self.enabled(record.metadata()) {
+            let msg = format!("{}", record.args());
+
+            // Skip "TUI table" (progress table and verification report)
+            if msg.contains("Table Name | Source Rows | Dest Rows")
+                || msg.contains("Database | Size | Phase | %")
+            {
+                return;
+            }
+
+            if let Ok(mut file) = self.file.lock() {
+                let timestamp = Local::now().format("%Y-%m-%dT%H:%M:%S");
+                let stripped_msg = strip_ansi(&msg);
+                let _ = writeln!(
+                    file,
+                    "{} [{:<5}] {} - {}",
+                    timestamp,
+                    record.level(),
+                    record.target(),
+                    stripped_msg
+                );
+            }
+        }
+    }
+
+    fn flush(&self) {
+        self.inner.flush();
+        if let Ok(mut file) = self.file.lock() {
+            let _ = file.flush();
+        }
+    }
+}
+
+fn strip_ansi(s: &str) -> String {
+    let mut result = String::with_capacity(s.len());
+    let mut in_escape = false;
+    let mut skip = false;
+    for c in s.chars() {
+        if c == '\x1b' {
+            in_escape = true;
+            continue;
+        }
+        if in_escape {
+            if c == '[' {
+                skip = true;
+                continue;
+            }
+            if skip {
+                if c.is_ascii_alphabetic() {
+                    skip = false;
+                    in_escape = false;
+                }
+                continue;
+            }
+            in_escape = false;
+        }
+        result.push(c);
+    }
+    result
 }
