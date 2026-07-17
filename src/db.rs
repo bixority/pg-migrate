@@ -714,7 +714,7 @@ async fn apply_globals(
         Error::Timeout(
             format!(
                 "to {} database {} for globals",
-                &*config.destination.host, &config.destination_db
+                &*config.destination.host, config.destination_db
             )
             .into(),
         )
