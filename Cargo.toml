@@ -1,6 +1,6 @@
 [package]
 name = "pg-migrate"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2024"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
@@ -16,7 +16,7 @@ cli = ["dep:clap"]
 
 [dependencies]
 chrono = "0.4.45"
-clap = { version = "4.6.1", features = ["derive"], optional = true }
+clap = { version = "4.6.2", features = ["derive"], optional = true }
 env_logger = "0.11.11"
 futures = { version = "0.3.32", default-features = false, features = ["std", "async-await"] }
 futures-util = "0.3.32"

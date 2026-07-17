@@ -10,7 +10,7 @@ use wildmatch::WildMatch;
 
 #[derive(Debug, Clone)]
 pub struct MigrationPlan {
-    pub databases: Vec<DatabasePlan>,
+    pub databases: Vec<Arc<DatabasePlan>>,
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +75,7 @@ pub async fn create_plan(
     }
 
     Ok(MigrationPlan {
-        databases: db_plans,
+        databases: db_plans.into_iter().map(Arc::new).collect(),
     })
 }
 

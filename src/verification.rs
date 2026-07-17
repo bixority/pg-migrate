@@ -219,7 +219,10 @@ async fn fast_stat_counts(
         res = config.verify_sem.clone().acquire_owned() => res?,
         () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".into())),
     };
-    let allowed: HashSet<(String, String)> = entries.iter().cloned().collect();
+    let allowed: HashSet<(&str, &str)> = entries
+        .iter()
+        .map(|(s, t)| (s.as_str(), t.as_str()))
+        .collect();
 
     let rows = tokio::select! {
         res = pool.query(
@@ -237,7 +240,7 @@ async fn fast_stat_counts(
     for row in rows {
         let schema: String = row.get(0);
         let table: String = row.get(1);
-        if !allowed.contains(&(schema.clone(), table.clone())) {
+        if !allowed.contains(&(schema.as_str(), table.as_str())) {
             continue;
         }
         let est: i64 = row.get(2);

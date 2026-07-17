@@ -15,7 +15,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 struct PipelineArgs {
     config: Arc<Config>,
-    db_plan: DatabasePlan,
+    db_plan: Arc<DatabasePlan>,
     states: SharedMigrationStates,
     cancel: CancellationToken,
     dump_sem: Arc<Semaphore>,

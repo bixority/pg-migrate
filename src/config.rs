@@ -136,7 +136,9 @@ impl Config {
     /// compare their row counts before the copy engine has run.
     #[must_use]
     pub fn deferred_table_patterns(&self) -> Vec<String> {
-        deferred_table_patterns(&self.delay_table_data, &self.copy_rules)
+        deferred_table_patterns_iter(&self.delay_table_data, &self.copy_rules)
+            .map(String::from)
+            .collect()
     }
 
     /// Returns whether a database is entirely excluded from migration.
@@ -171,17 +173,14 @@ impl Config {
     }
 }
 
-/// Builds the deferred-table pattern list from the raw config pieces.
-///
-/// Copy-engine rule tables are already in `DATABASE.SCHEMA.TABLE` form,
-/// identical to `delay_table_data` entries, so they slot straight into the same
-/// matching logic used by verification.
-fn deferred_table_patterns(delay_table_data: &[String], copy_rules: &[CopyRule]) -> Vec<String> {
+fn deferred_table_patterns_iter<'a>(
+    delay_table_data: &'a [String],
+    copy_rules: &'a [CopyRule],
+) -> impl Iterator<Item = &'a str> {
     delay_table_data
         .iter()
-        .cloned()
-        .chain(copy_rules.iter().map(|rule| rule.table.clone()))
-        .collect()
+        .map(String::as_str)
+        .chain(copy_rules.iter().map(|rule| rule.table.as_str()))
 }
 
 /// Returns the user's home directory.
@@ -377,10 +376,8 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
         .filter_map(|s| TablePattern::parse(s))
         .collect();
 
-    let deferred_raw = deferred_table_patterns(&delay_table_data, &copy_rules);
-    let deferred_patterns = deferred_raw
-        .iter()
-        .filter_map(|s| TablePattern::parse(s))
+    let deferred_patterns = deferred_table_patterns_iter(&delay_table_data, &copy_rules)
+        .filter_map(TablePattern::parse)
         .collect();
 
     let copy_rule_patterns = copy_rules
@@ -702,7 +699,9 @@ till = \"2023-03-01\"
             copy_rule("pdb1.public.audit"),
         ];
 
-        let deferred = deferred_table_patterns(&delay, &rules);
+        let deferred: Vec<String> = deferred_table_patterns_iter(&delay, &rules)
+            .map(String::from)
+            .collect();
 
         assert_eq!(
             deferred,
@@ -789,10 +788,8 @@ till = \"2023-03-01\"
             .iter()
             .filter_map(|s| TablePattern::parse(s))
             .collect();
-        let deferred_raw = deferred_table_patterns(&delay_table_data, &copy_rules);
-        let deferred_patterns = deferred_raw
-            .iter()
-            .filter_map(|s| TablePattern::parse(s))
+        let deferred_patterns = deferred_table_patterns_iter(&delay_table_data, &copy_rules)
+            .filter_map(TablePattern::parse)
             .collect();
         let copy_rule_patterns = copy_rules
             .iter()

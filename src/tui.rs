@@ -273,7 +273,11 @@ mod tests {
     #[test]
     fn delayed_row_created_for_delayed_tables() {
         let plan = MigrationPlan {
-            databases: vec![db_plan("pdb1", vec!["public.bigtable".to_string()], vec![])],
+            databases: vec![Arc::new(db_plan(
+                "pdb1",
+                vec!["public.bigtable".to_string()],
+                vec![],
+            ))],
         };
         let table = MigrationStates::new(&plan).render_table();
         assert!(table.contains("pdb1 (delayed)"), "table was:\n{table}");
@@ -282,11 +286,11 @@ mod tests {
     #[test]
     fn delayed_row_created_for_copy_rules_only() {
         let plan = MigrationPlan {
-            databases: vec![db_plan(
+            databases: vec![Arc::new(db_plan(
                 "pdb2",
                 vec![],
                 vec![copy_rule_plan("public.events")],
-            )],
+            ))],
         };
         let table = MigrationStates::new(&plan).render_table();
         assert!(table.contains("pdb2 (delayed)"), "table was:\n{table}");
@@ -295,7 +299,7 @@ mod tests {
     #[test]
     fn no_delayed_row_without_delayed_work() {
         let plan = MigrationPlan {
-            databases: vec![db_plan("plain", vec![], vec![])],
+            databases: vec![Arc::new(db_plan("plain", vec![], vec![]))],
         };
         let table = MigrationStates::new(&plan).render_table();
         assert!(table.contains("plain"));
