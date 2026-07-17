@@ -3,8 +3,9 @@ use crate::copy_engine::splitter::Partition;
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use log::{error, info};
 use std::sync::Arc;
-use tokio_postgres::Error as PgError;
+use tokio::sync::Mutex;
 use tokio_postgres::error::SqlState;
+use tokio_postgres::{Error as PgError, Transaction};
 
 pub struct Worker {
     id: usize,
@@ -38,7 +39,7 @@ impl Worker {
         &self,
         stage: &'static str,
         side: &'static str,
-        partition: &Partition,
+        partition: Option<&Partition>,
         detail: String,
         source: PgError,
     ) -> CopyEngineError {
@@ -47,7 +48,7 @@ impl Worker {
             stage,
             side,
             table: self.table_name.to_string(),
-            partition: partition.to_string(),
+            partition: partition.map_or_else(|| "none".to_string(), ToString::to_string),
             detail,
             hint,
             source,
@@ -86,11 +87,10 @@ impl Worker {
 
     /// Opens a connection to one `side` ("source" or "destination") and spawns
     /// its connection driver task. Failures are wrapped with full copy context.
-    async fn connect(
+    async fn connect_side(
         &self,
         config: &str,
         side: &'static str,
-        partition: &Partition,
     ) -> Result<tokio_postgres::Client> {
         let (client, connection) = tokio_postgres::connect(config, crate::tls::make_tls())
             .await
@@ -98,7 +98,7 @@ impl Worker {
                 self.copy_failed(
                     "Connection",
                     side,
-                    partition,
+                    None,
                     format!("establishing {side} connection"),
                     e,
                 )
@@ -111,22 +111,89 @@ impl Worker {
         Ok(client)
     }
 
-    /// Runs the worker for a single partition.
+    /// Runs the worker loop, pulling partitions from the channel and processing
+    /// them over a single pair of connections and a single pair of transactions.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - Connection to the source or destination database fails.
-    /// - The `COPY` operation fails.
-    pub async fn run(&self, partition: Partition) -> Result<u64> {
-        info!("Worker {} starting partition: {}", self.id, partition);
+    /// - A transaction cannot be started.
+    /// - Any partition copy fails.
+    /// - A transaction cannot be committed.
+    pub async fn run(
+        &self,
+        rx: Arc<Mutex<tokio::sync::mpsc::Receiver<Partition>>>,
+        progress_tx: tokio::sync::mpsc::Sender<u64>,
+    ) -> Result<u64> {
+        let mut client_src = self.connect_side(&self.source_config, "source").await?;
+        let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
 
-        let client_src = self
-            .connect(&self.source_config, "source", &partition)
-            .await?;
-        let client_dest = self
-            .connect(&self.dest_config, "destination", &partition)
-            .await?;
+        let tx_src = client_src.transaction().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction start",
+                "source",
+                None,
+                "beginning source transaction".into(),
+                e,
+            )
+        })?;
+        let tx_dest = client_dest.transaction().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction start",
+                "destination",
+                None,
+                "beginning destination transaction".into(),
+                e,
+            )
+        })?;
+
+        let mut total_bytes = 0;
+        loop {
+            let partition = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            };
+
+            let Some(partition) = partition else {
+                break;
+            };
+
+            let bytes = self.copy_partition(&tx_src, &tx_dest, &partition).await?;
+            total_bytes += bytes;
+            let _ = progress_tx.send(bytes).await;
+        }
+
+        tx_src.commit().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction commit",
+                "source",
+                None,
+                "committing source transaction".into(),
+                e,
+            )
+        })?;
+        tx_dest.commit().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction commit",
+                "destination",
+                None,
+                "committing destination transaction".into(),
+                e,
+            )
+        })?;
+
+        Ok(total_bytes)
+    }
+
+    /// Copies a single partition using the provided transactions.
+    async fn copy_partition(
+        &self,
+        tx_src: &Transaction<'_>,
+        tx_dest: &Transaction<'_>,
+        partition: &Partition,
+    ) -> Result<u64> {
+        info!("Worker {} starting partition: {}", self.id, partition);
 
         let conditions: Vec<String> = if partition.method == "hash" {
             let i = partition.from.as_ref().ok_or_else(|| {
@@ -166,11 +233,23 @@ impl Worker {
 
         let dest_query = format!("COPY {} FROM STDIN", self.table_name);
 
-        let stream = client_src.copy_out(&source_query).await.map_err(|e| {
-            self.copy_failed("COPY OUT", "source", &partition, source_query.clone(), e)
+        let stream = tx_src.copy_out(&source_query).await.map_err(|e| {
+            self.copy_failed(
+                "COPY OUT",
+                "source",
+                Some(partition),
+                source_query.clone(),
+                e,
+            )
         })?;
-        let sink = client_dest.copy_in(&dest_query).await.map_err(|e| {
-            self.copy_failed("COPY IN", "destination", &partition, dest_query.clone(), e)
+        let sink = tx_dest.copy_in(&dest_query).await.map_err(|e| {
+            self.copy_failed(
+                "COPY IN",
+                "destination",
+                Some(partition),
+                dest_query.clone(),
+                e,
+            )
         })?;
 
         pin_mut!(stream);
@@ -183,7 +262,7 @@ impl Worker {
                 self.copy_failed(
                     "COPY OUT (streaming)",
                     "source",
-                    &partition,
+                    Some(partition),
                     source_query.clone(),
                     e,
                 )
@@ -193,7 +272,7 @@ impl Worker {
                 self.copy_failed(
                     "COPY IN (streaming)",
                     "destination",
-                    &partition,
+                    Some(partition),
                     dest_query.clone(),
                     e,
                 )
@@ -204,7 +283,7 @@ impl Worker {
             self.copy_failed(
                 "COPY IN (finalize)",
                 "destination",
-                &partition,
+                Some(partition),
                 dest_query.clone(),
                 e,
             )

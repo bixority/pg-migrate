@@ -22,9 +22,11 @@ The central coordinator that:
 - Limits concurrency using semaphores to prevent saturating disk I/O or WAL (Write-Ahead Log).
 - Collects and aggregates metrics (e.g., total bytes transferred).
 
-### 2. Worker (`src/copy_engine/worker.rs`)
-The execution unit for a single data partition:
-- Establishes independent source and destination connections.
+### 2. WorkerPool (`src/copy_engine/worker.rs`)
+The execution unit for data partitions:
+- Maintains a fixed pool of long-lived worker tasks (sized by `max_parallel`).
+- Reuses source and destination connections across multiple partitions.
+- Wraps the partition processing loop in a single database transaction, significantly reducing transaction overhead.
 - Pipelines the `COPY OUT` stream directly into the `COPY IN` sink.
 - Maintains bounded buffers to ensure constant memory usage regardless of table size.
 
@@ -42,8 +44,9 @@ Uses `thiserror` for structured, type-safe error propagation:
 ## Performance and Reliability
 
 - **Throughput**: Designed to be disk-bound or network-bound, reaching hundreds of MB/s depending on hardware.
+- **Reduced Overhead**: Connection and transaction reuse ensures that thousands of partitions can be migrated with only a handful of "Xact committed" events on the destination, minimizing impact on the Postgres transaction log.
 - **Backpressure**: If the destination database slows down (e.g., due to WAL pressure), the async sink will naturally slow down the source's `COPY OUT` stream.
-- **Fault Tolerance**: Workers operate independently. The orchestrator tracks completion, allowing for conceptual restartability at the partition level.
+- **Fault Tolerance**: Workers operate independently. The orchestrator tracks completion via persistent markers, allowing for resumability at the partition level.
 
 ## Usage
 

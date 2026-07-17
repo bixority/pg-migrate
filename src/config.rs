@@ -100,6 +100,7 @@ pub struct Config {
 
     pub restore_jobs: usize,
     pub restore_parallel: usize,
+    pub restore_single_transaction: bool,
 
     pub max_parallel: usize,
     pub migrate_globals: bool,
@@ -232,6 +233,7 @@ pub struct TomlConfig {
     pub zstd_level: u8,
     pub sslmode: String,
     pub copy_rules: Option<Vec<CopyRule>>,
+    pub restore_single_transaction: bool,
 }
 
 impl Default for TomlConfig {
@@ -251,6 +253,7 @@ impl Default for TomlConfig {
             zstd_level: 5,
             sslmode: "prefer".to_string(),
             copy_rules: None,
+            restore_single_transaction: false,
         }
     }
 }
@@ -402,6 +405,7 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
         destination_db: args.to_db,
         dump_jobs: toml_config.dump_jobs,
         restore_jobs: toml_config.restore_jobs,
+        restore_single_transaction: toml_config.restore_single_transaction,
         max_parallel: toml_config.max_parallel,
         dump_parallel,
         restore_parallel,
@@ -691,7 +695,7 @@ till = \"2023-03-01\"
     }
 
     #[test]
-    fn deferred_patterns_include_copy_rule_tables() -> Result<()> {
+    fn deferred_patterns_include_copy_rule_tables() {
         let delay = vec!["pdb1.public.table3".to_string()];
         let rules = vec![
             copy_rule("pdb2.public.events"),
@@ -709,45 +713,49 @@ till = \"2023-03-01\"
             ]
         );
 
-        let mut toml = TomlConfig::default();
-        toml.delay_table_data = Some(delay);
-        toml.copy_rules = Some(rules);
-        let config = build_config_with_toml(toml)?;
+        let toml = TomlConfig {
+            delay_table_data: Some(delay),
+            copy_rules: Some(rules),
+            ..Default::default()
+        };
+        let config = build_config_with_toml(toml);
 
         // A copy-engine table not covered by any delay pattern must still be
         // recognised as deferred, so the regular verification pass skips it.
         assert!(config.is_delayed_table("pdb2", "public", "events"));
-        Ok(())
     }
 
     #[test]
-    fn test_is_db_excluded() -> Result<()> {
-        let mut toml = TomlConfig::default();
-        toml.exclude = Some(vec![
-            "mydb.*.*".to_string(),
-            "db1".to_string(),
-            "db2.*".to_string(),
-        ]);
-        let config = build_config_with_toml(toml)?;
+    fn test_is_db_excluded() {
+        let toml = TomlConfig {
+            exclude: Some(vec![
+                "mydb.*.*".to_string(),
+                "db1".to_string(),
+                "db2.*".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let config = build_config_with_toml(toml);
 
         assert!(config.is_db_excluded("mydb"));
         assert!(config.is_db_excluded("db1"));
         assert!(config.is_db_excluded("db2"));
         assert!(!config.is_db_excluded("otherdb"));
-        Ok(())
     }
 
     #[test]
-    fn test_is_table_excluded() -> Result<()> {
-        let mut toml = TomlConfig::default();
-        toml.exclude = Some(vec![
-            "mydb.public.secret".to_string(),
-            "mydb.internal.*".to_string(),
-            "otherdb.*.temp_*".to_string(),
-            "db3".to_string(),
-            "db4.audit".to_string(),
-        ]);
-        let config = build_config_with_toml(toml)?;
+    fn test_is_table_excluded() {
+        let toml = TomlConfig {
+            exclude: Some(vec![
+                "mydb.public.secret".to_string(),
+                "mydb.internal.*".to_string(),
+                "otherdb.*.temp_*".to_string(),
+                "db3".to_string(),
+                "db4.audit".to_string(),
+            ]),
+            ..Default::default()
+        };
+        let config = build_config_with_toml(toml);
 
         assert!(config.is_table_excluded("mydb", "public", "secret"));
         assert!(config.is_table_excluded("mydb", "internal", "anything"));
@@ -757,10 +765,9 @@ till = \"2023-03-01\"
         assert!(!config.is_table_excluded("db4", "public", "any"));
         assert!(!config.is_table_excluded("mydb", "public", "other"));
         assert!(!config.is_table_excluded("another", "public", "secret"));
-        Ok(())
     }
 
-    fn build_config_with_toml(toml_config: TomlConfig) -> Result<Arc<Config>> {
+    fn build_config_with_toml(toml_config: TomlConfig) -> Arc<Config> {
         let verify_concurrency = toml_config.verify_concurrency.max(1);
         let dump_parallel = toml_config
             .dump_parallel
@@ -792,7 +799,7 @@ till = \"2023-03-01\"
             .filter_map(|r| TablePattern::parse(&r.table))
             .collect();
 
-        Ok(Arc::new(Config {
+        Arc::new(Config {
             source: db::DbArgs {
                 host: "localhost".into(),
                 port: 5432,
@@ -809,6 +816,7 @@ till = \"2023-03-01\"
             destination_db: "postgres".to_string(),
             dump_jobs: toml_config.dump_jobs,
             restore_jobs: toml_config.restore_jobs,
+            restore_single_transaction: toml_config.restore_single_transaction,
             max_parallel: toml_config.max_parallel,
             dump_parallel,
             restore_parallel,
@@ -826,6 +834,6 @@ till = \"2023-03-01\"
             exclude_patterns,
             deferred_patterns,
             copy_rule_patterns,
-        }))
+        })
     }
 }

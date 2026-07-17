@@ -322,7 +322,8 @@ pub async fn restore_db(
     }
 
     let port = config.destination.port.to_string();
-    let mut child = Command::new("pg_restore")
+    let mut command = Command::new("pg_restore");
+    command
         .kill_on_drop(true)
         .env("PGPASSWORD", &*config.destination.pass)
         .args([
@@ -332,15 +333,21 @@ pub async fn restore_db(
             &port,
             "-U",
             &*config.destination.user,
-            "-j",
-            &config.restore_jobs.to_string(),
             "--disable-triggers",
             "-d",
             db,
             dump_path
                 .to_str()
                 .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string().into()))?,
-        ])
+        ]);
+
+    if config.restore_single_transaction {
+        command.arg("--single-transaction");
+    } else {
+        command.arg("-j").arg(config.restore_jobs.to_string());
+    }
+
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -497,7 +504,8 @@ pub async fn restore_delayed_data(
     }
 
     let port = config.destination.port.to_string();
-    let mut child = Command::new("pg_restore")
+    let mut command = Command::new("pg_restore");
+    command
         .kill_on_drop(true)
         .env("PGPASSWORD", &*config.destination.pass)
         .args([
@@ -507,8 +515,6 @@ pub async fn restore_delayed_data(
             &port,
             "-U",
             &*config.destination.user,
-            "-j",
-            &config.restore_jobs.to_string(),
             "--disable-triggers",
             "--data-only",
             "-d",
@@ -516,7 +522,15 @@ pub async fn restore_delayed_data(
             dump_path
                 .to_str()
                 .ok_or_else(|| Error::InvalidPath(dump_path.display().to_string().into()))?,
-        ])
+        ]);
+
+    if config.restore_single_transaction {
+        command.arg("--single-transaction");
+    } else {
+        command.arg("-j").arg(config.restore_jobs.to_string());
+    }
+
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()

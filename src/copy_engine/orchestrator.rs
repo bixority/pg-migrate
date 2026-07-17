@@ -3,7 +3,6 @@ use crate::copy_engine::splitter::Partition;
 use crate::copy_engine::worker::Worker;
 use log::{error, info};
 use std::sync::Arc;
-use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_postgres::error::SqlState;
 
@@ -104,37 +103,43 @@ impl Orchestrator {
             self.table_name, self.worker_count,
         );
 
+        if total_partitions == 0 {
+            return Ok(0);
+        }
+
         // Fail fast with a precise, side-attributed message if the table is not
         // visible to the copy connection. Without this, a missing table only
         // surfaces as an opaque per-partition `COPY` error that does not say
-        // which side, or why. Skipped when there is nothing to copy.
-        if total_partitions > 0 {
-            self.ensure_table_visible(&self.source_config, "source")
-                .await?;
-            self.ensure_table_visible(&self.dest_config, "destination")
-                .await?;
-        }
+        // which side, or why.
+        self.ensure_table_visible(&self.source_config, "source")
+            .await?;
+        self.ensure_table_visible(&self.dest_config, "destination")
+            .await?;
 
-        let semaphore = Arc::new(Semaphore::new(self.worker_count));
+        let (partition_tx, partition_rx) = tokio::sync::mpsc::channel(total_partitions + 1);
+        for p in partitions {
+            let _ = partition_tx.send(p).await;
+        }
+        drop(partition_tx);
+
+        let shared_rx = Arc::new(tokio::sync::Mutex::new(partition_rx));
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(self.worker_count * 2);
         let mut join_set = JoinSet::new();
 
-        for (id, partition) in partitions.into_iter().enumerate() {
-            let permit = semaphore.clone().acquire_owned().await?;
+        for id in 0..self.worker_count {
             let worker = Worker::new(
                 id,
                 self.source_config.clone(),
                 self.dest_config.clone(),
                 self.table_name.clone(),
             );
-
-            join_set.spawn(async move {
-                let _permit = permit;
-                // The worker already attaches table/side/partition/query context
-                // to its errors (see `Worker::copy_failed`), so propagate them
-                // verbatim rather than flattening into a less-detailed wrapper.
-                worker.run(partition).await
-            });
+            let shared_rx = shared_rx.clone();
+            let progress_tx = progress_tx.clone();
+            join_set.spawn(async move { worker.run(shared_rx, progress_tx).await });
         }
+
+        // Drop our sender so progress_rx finishes once all workers are done.
+        drop(progress_tx);
 
         let mut total_bytes = 0;
         let mut completed = 0;
@@ -143,15 +148,36 @@ impl Orchestrator {
             total_partitions,
             total_bytes: 0,
         });
-        while let Some(res) = join_set.join_next().await {
-            let bytes = res??;
-            total_bytes += bytes;
-            completed += 1;
-            on_progress(CopyProgress {
-                completed_partitions: completed,
-                total_partitions,
-                total_bytes,
-            });
+
+        loop {
+            tokio::select! {
+                Some(bytes) = progress_rx.recv() => {
+                    total_bytes += bytes;
+                    completed += 1;
+                    on_progress(CopyProgress {
+                        completed_partitions: completed,
+                        total_partitions,
+                        total_bytes,
+                    });
+                }
+                res = join_set.join_next() => {
+                    if let Some(r) = res {
+                        r??;
+                    } else {
+                        // All workers finished. Drain any remaining progress updates.
+                        while let Some(bytes) = progress_rx.recv().await {
+                            total_bytes += bytes;
+                            completed += 1;
+                            on_progress(CopyProgress {
+                                completed_partitions: completed,
+                                total_partitions,
+                                total_bytes,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
         }
 
         info!(

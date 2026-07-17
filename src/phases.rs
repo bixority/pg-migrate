@@ -38,12 +38,11 @@ pub async fn phase_migrate_all(
     // waiter. This gate is what guarantees a database's delayed restore never
     // begins until every regular pipeline (including that same database's
     // regular dump and restore) has completed.
-    let (regular_done_tx, regular_done_rx) = watch::channel(false);
-
     let mut regular_tasks = JoinSet::new();
     let mut delayed_tasks = JoinSet::new();
 
     for db_plan in plan.databases {
+        let (regular_done_tx, regular_done_rx) = watch::channel(false);
         let args = PipelineArgs {
             config: config.clone(),
             db_plan: db_plan.clone(),
@@ -54,11 +53,11 @@ pub async fn phase_migrate_all(
         };
 
         // Spawn regular pipeline
-        regular_tasks.spawn(run_regular_pipeline(args.clone()));
+        regular_tasks.spawn(run_regular_pipeline(args.clone(), Some(regular_done_tx)));
 
         // Spawn delayed pipeline if matching flags
         if !db_plan.delayed_tables.is_empty() || !db_plan.copy_rules.is_empty() {
-            delayed_tasks.spawn(run_delayed_pipeline(args, regular_done_rx.clone()));
+            delayed_tasks.spawn(run_delayed_pipeline(args, regular_done_rx));
         }
     }
 
@@ -88,11 +87,6 @@ pub async fn phase_migrate_all(
             }
         }
     }
-
-    // Open the gate for all delayed pipelines: every regular pipeline has
-    // finished, so the destination schema exists for every database. The value
-    // is latched, so a delayed pipeline that arrives later still sees it.
-    let _ = regular_done_tx.send(true);
 
     // Wait for all delayed pipelines to succeed
     loop {
@@ -140,7 +134,10 @@ async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<Own
     }
 }
 
-async fn run_regular_pipeline(args: PipelineArgs) -> Result<()> {
+async fn run_regular_pipeline(
+    args: PipelineArgs,
+    regular_done_tx: Option<watch::Sender<bool>>,
+) -> Result<()> {
     let PipelineArgs {
         config,
         db_plan,
@@ -171,6 +168,10 @@ async fn run_regular_pipeline(args: PipelineArgs) -> Result<()> {
             .lock()
             .map_err(|e| Error::LockPoisoned(e.to_string()))?
             .update(&db_name, MigrationPhase::Complete, 6, "migration complete");
+
+        if let Some(tx) = regular_done_tx {
+            let _ = tx.send(true);
+        }
 
         Ok(())
     }

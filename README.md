@@ -8,7 +8,7 @@ The tool migrates all user databases from a source server to a target server. It
 
 For very large tables, two deferral mechanisms keep them out of the critical path:
 
-- **Delayed data** — the table's schema, constraints, indexes, sequences, and triggers are created during the regular restore (so the table is fully usable), but its bulk data is dumped `--data-only` and restored in a separate **delayed pass** that only starts once *every* database's regular pipeline has finished. This lets all the schema/structure work and the small tables complete first.
+- **Delayed data** — the table's schema, constraints, indexes, sequences, and triggers are created during the regular restore (so the table is fully usable), but its bulk data is dumped `--data-only` and restored in a separate **delayed pass** that starts as soon as its own regular pipeline (schema/small tables) has finished. This lets all the schema/structure work and the small tables complete first, while large tables continue in the background.
 - **Copy engine** — for tables too large even for the delayed `pg_dump` path, a built-in streaming engine partitions the table by a time/date/hash column and pipelines raw binary `COPY OUT → COPY IN` across many parallel workers. See [COPY_ENGINE.md](COPY_ENGINE.md).
 - **Exclusion** — the `exclude` parameter lets you skip entire databases, schemas, or specific tables. These entities are not created on the target and are omitted from all migration and verification phases.
 
@@ -139,10 +139,10 @@ The tool discovers databases on the source, dumps them to `dump_root` (specified
                        +---------------+----------------+
    === release dump_sem ======================================
                                       v
-                  wait until EVERY regular pipeline is done
-                  (latched gate; guarantees this DB's own
-                   schema already exists on the target)
-                                      v
+                  wait until THIS database's regular
+                  pipeline is done (guarantees schema
+                  already exists on the target)
+                                     v
    === acquire restore_sem ===================================
                        +--------------------------------+
                        | B. delayed restoring           |
@@ -215,7 +215,7 @@ Then, in parallel (bounded by the concurrency knobs), each database runs through
 
 If a database has no delayed tables and no copy rules, it reaches `complete` here.
 
-Databases with delayed tables and/or copy rules also run a **delayed phase**. Its delayed *dump* starts as soon as `dump_sem` is free, but its *restore* waits until every regular pipeline (including this database's own) has completed:
+Databases with delayed tables and/or copy rules also run a **delayed phase**. Its delayed *dump* starts as soon as `dump_sem` is free, but its *restore* waits until its own regular pipeline has completed:
 
 | Step | Phase               | What it does                                                                                                                                                                                                   |
 |------|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -314,11 +314,16 @@ The configuration file (default `config.toml`) is shown below; the repository sh
 # Number of parallel jobs (-j) for pg_dump per database (default: 24)
 dump_jobs = 24
 
-# Number of parallel jobs (-j) for pg_restore per database (default: 12)
+# Number of parallel jobs (-j) for pg_restore per database (default: 12).
+# Automatically disabled if restore_single_transaction is true.
 restore_jobs = 12
 
+# (Optional) Use --single-transaction for pg_restore (default: false).
+# Reduces "Xact committed" count but disables parallel restore jobs (-j).
+# restore_single_transaction = false
+
 # Maximum number of databases being migrated concurrently (default: 6).
-# Also bounds the number of copy-engine workers per copy rule.
+# Also defines the size of the worker pool for copy-engine migration.
 max_parallel = 6
 
 # (Optional) Independent override for source-side concurrency (defaults to max_parallel)

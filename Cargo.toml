@@ -35,6 +35,7 @@ toml = "1.1.3"
 wildmatch = "2.6.1"
 
 [lints.rust]
+linker_messages = "allow"
 unsafe_code = "forbid"
 
 [lints.clippy]
