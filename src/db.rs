@@ -134,17 +134,15 @@ impl PoolCache {
     }
 
     pub async fn get(&self, args: &DbArgs, db: &str) -> Result<Arc<tokio_postgres::Client>> {
-        {
-            let lock = self.inner.lock().await;
-            for (key, client) in lock.iter() {
-                if key.host == args.host
-                    && key.port == args.port
-                    && key.user == args.user
-                    && *key.db == *db
-                {
-                    return Ok(client.clone());
-                }
-            }
+        let key = PoolKey {
+            host: args.host.clone(),
+            port: args.port,
+            user: args.user.clone(),
+            db: db.into(),
+        };
+
+        if let Some(client) = self.inner.lock().await.get(&key) {
+            return Ok(client.clone());
         }
 
         let mut config = tokio_postgres::Config::new();
@@ -172,13 +170,6 @@ impl PoolCache {
         });
 
         let client = Arc::new(client);
-        let key = PoolKey {
-            host: args.host.clone(),
-            port: args.port,
-            user: args.user.clone(),
-            db: db.into(),
-        };
-
         self.inner.lock().await.insert(key, client.clone());
 
         Ok(client)
@@ -636,6 +627,22 @@ pub fn done_marker(db: &str) -> Result<PathBuf> {
     Ok(state_dir()?.join(format!("{db}.done")))
 }
 
+/// Quotes a `PostgreSQL` identifier (table name, column name, etc.) by wrapping
+/// it in double quotes and escaping any existing double quotes.
+#[must_use]
+pub fn quote_ident(ident: &str) -> String {
+    format!("\"{}\"", ident.replace('"', "\"\""))
+}
+
+/// Quotes a schema-qualified table name (e.g. `schema.table` into `"schema"."table"`).
+#[must_use]
+pub fn quote_table_name(name: &str) -> String {
+    name.split('.')
+        .map(quote_ident)
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
 pub fn globals_marker() -> Result<PathBuf> {
     Ok(state_dir()?.join("globals.done"))
 }
@@ -875,5 +882,21 @@ SET x = y;
         let sql = "CREATE ROLE \"postgres\" WITH LOGIN;";
         let filtered = filter_globals_sql(sql, "postgres");
         assert_eq!(filtered, "");
+    }
+
+    #[test]
+    fn test_quote_ident() {
+        assert_eq!(quote_ident("users"), "\"users\"");
+        assert_eq!(quote_ident("user\"s"), "\"user\"\"s\"");
+    }
+
+    #[test]
+    fn test_quote_table_name() {
+        assert_eq!(quote_table_name("users"), "\"users\"");
+        assert_eq!(quote_table_name("public.users"), "\"public\".\"users\"");
+        assert_eq!(
+            quote_table_name("my schema.my table"),
+            "\"my schema\".\"my table\""
+        );
     }
 }

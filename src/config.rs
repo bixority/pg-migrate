@@ -766,6 +766,30 @@ till = \"2023-03-01\"
         assert!(!config.is_table_excluded("another", "public", "secret"));
     }
 
+    #[test]
+    fn test_table_pattern_parse() {
+        assert_eq!(
+            TablePattern::parse("db.schema.table").expect("valid pattern"),
+            TablePattern::DbSchemaTable(
+                "db".to_string(),
+                WildMatch::new("schema"),
+                WildMatch::new("table")
+            )
+        );
+
+        assert_eq!(
+            TablePattern::parse("db.table").expect("valid pattern"),
+            TablePattern::DbSchema("db".to_string(), WildMatch::new("table"))
+        );
+
+        assert_eq!(
+            TablePattern::parse("db").expect("valid pattern"),
+            TablePattern::Db("db".to_string())
+        );
+
+        assert!(TablePattern::parse("").is_none());
+    }
+
     fn build_config_with_toml(toml_config: TomlConfig) -> Arc<Config> {
         let verify_concurrency = toml_config.verify_concurrency.max(1);
         let dump_parallel = toml_config

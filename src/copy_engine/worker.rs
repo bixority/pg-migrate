@@ -195,6 +195,7 @@ impl Worker {
     ) -> Result<u64> {
         info!("Worker {} starting partition: {}", self.id, partition);
 
+        let quoted_column = crate::db::quote_ident(&partition.column);
         let conditions: Vec<String> = if partition.method == "hash" {
             let i = partition.from.as_ref().ok_or_else(|| {
                 CopyEngineError::Splitter("Hash partition missing index".to_string())
@@ -203,19 +204,18 @@ impl Worker {
                 CopyEngineError::Splitter("Hash partition missing count".to_string())
             })?;
             vec![format!(
-                "abs(hashtext({}::text)::bigint) % {} = {}",
-                partition.column, n, i
+                "abs(hashtext({quoted_column}::text)::bigint) % {n} = {i}"
             )]
         } else {
             [
                 partition
                     .from
                     .as_ref()
-                    .map(|f| format!("{} >= '{}'", partition.column, f)),
+                    .map(|f| format!("{quoted_column} >= '{f}'")),
                 partition
                     .till
                     .as_ref()
-                    .map(|t| format!("{} < '{}'", partition.column, t)),
+                    .map(|t| format!("{quoted_column} < '{t}'")),
             ]
             .into_iter()
             .flatten()
@@ -226,12 +226,11 @@ impl Worker {
         } else {
             format!(" WHERE {}", conditions.join(" AND "))
         };
-        let source_query = format!(
-            "COPY (SELECT * FROM {}{}) TO STDOUT",
-            self.table_name, where_clause
-        );
 
-        let dest_query = format!("COPY {} FROM STDIN", self.table_name);
+        let quoted_table = crate::db::quote_table_name(&self.table_name);
+        let source_query = format!("COPY (SELECT * FROM {quoted_table}{where_clause}) TO STDOUT");
+
+        let dest_query = format!("COPY {quoted_table} FROM STDIN");
 
         let stream = tx_src.copy_out(&source_query).await.map_err(|e| {
             self.copy_failed(

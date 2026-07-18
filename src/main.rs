@@ -319,28 +319,42 @@ impl log::Log for MultiLogger {
 
 fn strip_ansi(s: &str) -> String {
     let mut result = String::with_capacity(s.len());
-    let mut in_escape = false;
-    let mut skip = false;
-    for c in s.chars() {
+    let mut iter = s.chars();
+    while let Some(c) = iter.next() {
         if c == '\x1b' {
-            in_escape = true;
-            continue;
-        }
-        if in_escape {
-            if c == '[' {
-                skip = true;
-                continue;
-            }
-            if skip {
-                if c.is_ascii_alphabetic() {
-                    skip = false;
-                    in_escape = false;
+            if iter.next() == Some('[') {
+                for c in iter.by_ref() {
+                    if (0x40..=0x7E).contains(&(c as u32)) {
+                        break;
+                    }
                 }
-                continue;
             }
-            in_escape = false;
+            continue;
         }
         result.push(c);
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi() {
+        let s = "\x1b[32mgreen\x1b[0m and \x1b[1mbold\x1b[0m";
+        assert_eq!(strip_ansi(s), "green and bold");
+    }
+
+    #[test]
+    fn test_strip_ansi_no_ansi() {
+        let s = "plain text";
+        assert_eq!(strip_ansi(s), "plain text");
+    }
+
+    #[test]
+    fn test_strip_ansi_complex() {
+        let s = "\x1b[1;31mred bold\x1b[0m";
+        assert_eq!(strip_ansi(s), "red bold");
+    }
 }

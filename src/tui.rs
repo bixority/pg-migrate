@@ -9,11 +9,6 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 /// Returns the style used for migration progress bars.
-/// Returns the style used for the state table.
-///
-/// # Errors
-///
-/// Returns an error if the template is invalid.
 pub fn migration_style() -> Result<ProgressStyle> {
     ProgressStyle::with_template("{msg}")
         .map_err(|e| Error::Config(format!("Invalid progress style template: {e}").into()))
@@ -327,5 +322,28 @@ mod tests {
         let table = MigrationStates::new(&plan).render_table();
         assert!(table.contains("plain"));
         assert!(!table.contains("(delayed)"), "table was:\n{table}");
+    }
+
+    #[test]
+    fn test_render_verification_report() {
+        let mut src = BTreeMap::new();
+        src.insert("public.users".to_string(), "100".to_string());
+        src.insert("public.posts".to_string(), "50".to_string());
+
+        let mut dst = BTreeMap::new();
+        dst.insert("public.users".to_string(), "100".to_string());
+        dst.insert("public.posts".to_string(), "40".to_string());
+        dst.insert("public.comments".to_string(), "10".to_string());
+
+        let (report, mismatch) = render_verification_report("mydb", &src, &dst);
+        assert!(mismatch);
+        assert!(report.contains("mydb"));
+        assert!(report.contains("public.users"));
+        assert!(report.contains("100"));
+        assert!(report.contains("OK"));
+        assert!(report.contains("public.posts"));
+        assert!(report.contains("MISMATCH"));
+        assert!(report.contains("public.comments"));
+        assert!(report.contains("MISSING"));
     }
 }

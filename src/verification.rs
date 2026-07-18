@@ -38,21 +38,6 @@ pub fn dst_counts_path(db_name: &str, fast: bool, include_delayed: bool) -> Resu
     Ok(verify_dir()?.join(format!("{db_name}.{suffix}.json")))
 }
 
-#[allow(dead_code)]
-pub async fn verify_all(
-    config: &Config,
-    db_names: &[String],
-    cancel: CancellationToken,
-) -> Result<()> {
-    for db_name in db_names {
-        if verify_marker(db_name)?.exists() {
-            continue;
-        }
-        verify_db(config, db_name, false, cancel.clone()).await?;
-    }
-    Ok(())
-}
-
 pub async fn verify_db(
     config: &Config,
     db_name: &str,
@@ -187,8 +172,8 @@ pub async fn stat_counts(
                     res = verify_sem.clone().acquire_owned() => res?,
                     () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".into())),
                 };
-                let full_name = format!("\"{schema}\".\"{table}\"");
-                let count_query = format!("SELECT count(*) FROM {full_name}");
+                let quoted_table = crate::db::quote_table_name(&format!("{schema}.{table}"));
+                let count_query = format!("SELECT count(*) FROM {quoted_table}");
                 let count: i64 = tokio::select! {
                     res = pool.query_one(&count_query, &[]) => res?.get(0),
                     () = cancel.cancelled() => return Err(Error::Cancelled(format!("row count of {schema}.{table}").into())),

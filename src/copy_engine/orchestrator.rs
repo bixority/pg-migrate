@@ -65,7 +65,8 @@ impl Orchestrator {
             .await?
             .get(0);
 
-        let probe = format!("SELECT 1 FROM {} LIMIT 0", self.table_name);
+        let quoted_table = crate::db::quote_table_name(&self.table_name);
+        let probe = format!("SELECT 1 FROM {quoted_table} LIMIT 0");
         if let Err(e) = client.simple_query(&probe).await {
             if e.as_db_error().map(tokio_postgres::error::DbError::code)
                 == Some(&SqlState::UNDEFINED_TABLE)
