@@ -73,6 +73,14 @@ impl MigrationStates {
         }
     }
 
+    pub fn start_timing(&mut self, db: &str) {
+        if let Some(state) = self.states.get_mut(db)
+            && state.started_at.is_none()
+        {
+            state.started_at = Some(Instant::now());
+        }
+    }
+
     pub fn mark_regular_done(&mut self, db: &str) {
         if let Some(state) = self.states.get_mut(db) {
             state.mark_regular_done();

@@ -245,6 +245,11 @@ async fn run_delayed_pipeline(
             .wait_for(|&done| done)
             .await
             .map_err(|_| Error::Cancelled("regular pipelines did not complete".into()))?;
+
+        if let Ok(mut lock) = states.lock() {
+            lock.start_timing(&delayed_name);
+        }
+
         if cancel.is_cancelled() {
             return Err(Error::Cancelled("migration process interrupted".into()));
         }

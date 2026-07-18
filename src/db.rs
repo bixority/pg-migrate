@@ -60,7 +60,10 @@ impl MigrationState {
     }
 
     pub fn set_phase(&mut self, phase: MigrationPhase, step: u8, display: impl Into<String>) {
-        if self.started_at.is_none() && phase != MigrationPhase::Pending {
+        if self.started_at.is_none()
+            && phase != MigrationPhase::Pending
+            && phase != MigrationPhase::DelayedDumping
+        {
             self.started_at = Some(Instant::now());
         }
         if (phase == MigrationPhase::Complete || phase == MigrationPhase::Failed)
