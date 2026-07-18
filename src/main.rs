@@ -199,7 +199,7 @@ async fn run_migration_workflow(
     cancel.cancel();
     let _ = redraw_task.await;
 
-    let (regular_duration, migration_duration) = migrate_result?;
+    let (regular_duration, migration_total_duration) = migrate_result?;
 
     let final_table = states
         .lock()
@@ -209,16 +209,26 @@ async fn run_migration_workflow(
     total_time_pb.finish_and_clear();
 
     let elapsed = start_time.elapsed();
+    let delayed_duration = migration_total_duration.saturating_sub(regular_duration);
 
     info!(
-        "Migration complete.\nSummary:\n  Regular phase: {}\n  Migration:     {}\n  \
-         Total time:    {}",
-        indicatif::HumanDuration(regular_duration),
-        indicatif::HumanDuration(migration_duration),
-        indicatif::HumanDuration(elapsed)
+        "Migration complete.\nSummary:\n  Regular phase:     {}\n  Delayed migration: {}\n  \
+         Total time:        {}",
+        format_duration(regular_duration),
+        format_duration(delayed_duration),
+        format_duration(elapsed)
     );
 
     Ok(())
+}
+
+fn format_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    format!("{hours} hours, {minutes} minutes, {seconds} seconds")
 }
 
 fn setup_ui(

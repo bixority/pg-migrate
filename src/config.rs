@@ -252,7 +252,7 @@ impl Default for TomlConfig {
             zstd_level: 5,
             sslmode: "prefer".to_string(),
             copy_rules: None,
-            restore_single_transaction: false,
+            restore_single_transaction: true,
         }
     }
 }

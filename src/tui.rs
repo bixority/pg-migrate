@@ -98,13 +98,13 @@ impl MigrationStates {
 
         let _ = writeln!(
             output,
-            "{:<32} | {:>11} | {:>21} | {:>4} | Status",
-            "Database", "Size", "Phase", "%"
+            "{:<32} | {:>11} | {:>12} | {:>21} | {:>4} | Status",
+            "Database", "Size", "Timing", "Phase", "%"
         );
         let _ = writeln!(
             output,
-            "{:-<32}-|-{:-<11}-|-{:-<21}-|-{:-<4}-|-{:-<40}",
-            "", "", "", "", ""
+            "{:-<32}-|-{:-<11}-|-{:-<12}-|-{:-<21}-|-{:-<4}-|-{:-<40}",
+            "", "", "", "", "", ""
         );
 
         for name in &self.order {
@@ -119,10 +119,16 @@ impl MigrationStates {
             let phase = colored_phase(&state.phase);
             let percent = state.percent();
 
+            let timing = match (state.started_at, state.finished_at) {
+                (Some(start), Some(finish)) => format_table_duration(finish.duration_since(start)),
+                (Some(start), None) => format_table_duration(start.elapsed()),
+                _ => "00:00:00".to_string(),
+            };
+
             let _ = writeln!(
                 output,
-                "{:<32} | {:>11} | {:>30} | {:>3}% | {}",
-                state.db, size_str, phase, percent, state.display
+                "{:<32} | {:>11} | {:>12} | {:>30} | {:>3}% | {}",
+                state.db, size_str, timing, phase, percent, state.display
             );
         }
 
@@ -136,6 +142,15 @@ fn colored_phase(phase: &MigrationPhase) -> String {
         MigrationPhase::Failed => format!("\x1b[31m{}\x1b[0m", phase.as_str()),
         _ => format!("\x1b[36m{}\x1b[0m", phase.as_str()),
     }
+}
+
+fn format_table_duration(duration: Duration) -> String {
+    let secs = duration.as_secs();
+    let hours = secs / 3600;
+    let minutes = (secs % 3600) / 60;
+    let seconds = secs % 60;
+
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 pub type SharedMigrationStates = Arc<Mutex<MigrationStates>>;

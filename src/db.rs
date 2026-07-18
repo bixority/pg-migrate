@@ -36,6 +36,8 @@ pub struct MigrationState {
     pub display: String,
     pub error: Option<String>,
     pub regular_completed_at: Option<Instant>,
+    pub started_at: Option<Instant>,
+    pub finished_at: Option<Instant>,
 }
 
 impl MigrationState {
@@ -52,10 +54,20 @@ impl MigrationState {
             total_steps: 6,
             error: None,
             regular_completed_at: None,
+            started_at: None,
+            finished_at: None,
         }
     }
 
     pub fn set_phase(&mut self, phase: MigrationPhase, step: u8, display: impl Into<String>) {
+        if self.started_at.is_none() && phase != MigrationPhase::Pending {
+            self.started_at = Some(Instant::now());
+        }
+        if (phase == MigrationPhase::Complete || phase == MigrationPhase::Failed)
+            && self.finished_at.is_none()
+        {
+            self.finished_at = Some(Instant::now());
+        }
         self.phase = phase;
         self.step = step;
         self.display = display.into();
@@ -71,6 +83,9 @@ impl MigrationState {
         self.phase = MigrationPhase::Failed;
         self.display.clone_from(&error);
         self.error = Some(error);
+        if self.finished_at.is_none() {
+            self.finished_at = Some(Instant::now());
+        }
     }
 
     #[must_use]
