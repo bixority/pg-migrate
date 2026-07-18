@@ -97,8 +97,8 @@ The tool discovers databases on the source, dumps them to `dump_root` (specified
                        +--------------------------------+
                        | 2. restoring                   |
                        |    pg_restore -j restore_jobs  |
-                       |               --disable-       |
-                       |               triggers         |
+                       |    (or --single-transaction)   |
+                       |    --disable-triggers          |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
@@ -147,8 +147,8 @@ The tool discovers databases on the source, dumps them to `dump_root` (specified
                        +--------------------------------+
                        | B. delayed restoring           |
                        |    pg_restore --data-only      |
-                       |                --disable-      |
-                       |                triggers        |
+                       |    (or --single-transaction)   |
+                       |    --disable-triggers          |
                        +---------------+----------------+
                                        v
                        +--------------------------------+
@@ -208,7 +208,7 @@ Then, in parallel (bounded by the concurrency knobs), each database runs through
 | Step | Phase           | What it does                                                                                                                                                                                                                                                                                                                                  |
 |------|-----------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | 1    | `dumping`       | `pg_dump -Fd -j <dump_jobs> -Z zstd:<zstd_level>`. Tables matching any `delay_table_data` pattern or any `copy_rules` table are emitted with `--exclude-table-data` (schema kept, data skipped).                                                                                                                                              |
-| 2    | `restoring`     | `pg_restore -j <restore_jobs> --disable-triggers`. Restores schema, indexes, PKs, FKs, sequences, triggers, and the data of regular tables. Deferred tables exist but are empty.                                                                                                                                                              |
+| 2    | `restoring`     | `pg_restore -j <restore_jobs> (or `--single-transaction`) --disable-triggers`. Restores schema, indexes, PKs, FKs, sequences, triggers, and the data of regular tables. Deferred tables exist but are empty.                                                                                                                                                              |
 | 3    | `source counts` | `SELECT count(*)` per table on the source, cached to `$HOME/pg_verify_state/<db>.src_counts.json`. Queries run concurrently, globally bounded by `verify_concurrency`. With `fast_verify`, a single `pg_class.reltuples` query replaces per-table counts (cached to `<db>.src_counts.fast.json`). Deferred (delayed/copy) tables are skipped. |
 | 4    | `dest counts`   | Same as step 3, against the destination.                                                                                                                                                                                                                                                                                                      |
 | 5    | `verifying`     | Compare source vs. destination counts. Mismatches fail the migration. With `fast_verify`, mismatches are logged as warnings rather than failures (since `reltuples` is an estimate).                                                                                                                                                          |
@@ -220,7 +220,7 @@ Databases with delayed tables and/or copy rules also run a **delayed phase**. It
 | Step | Phase               | What it does                                                                                                                                                                                                   |
 |------|---------------------|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
 | A    | `delayed dumping`   | `pg_dump -Fd --data-only --table=<pattern>` for delayed tables, with `--exclude-table` for any copy-engine tables. (Skipped if the DB has only copy rules and no delayed tables.)                              |
-| B    | `delayed restoring` | `pg_restore --data-only --disable-triggers` COPYs the delayed data into the already-built tables.                                                                                                              |
+| B    | `delayed restoring` | `pg_restore --data-only (or `--single-transaction`) --disable-triggers` COPYs the delayed data into the already-built tables.                                                                                                              |
 | C    | `copy engine`       | For each `copy_rules` entry, partition the table and stream it with the binary COPY engine. Each rule writes a completion marker so a resumed run skips finished rules.                                        |
 | D    | `delayed verifying` | Re-run the row-count comparison of the **regular** tables (using a separate cache namespace). Delayed-data and copy-engine tables are migrated out-of-band and are **not** row-count compared in either phase. |
 
@@ -236,6 +236,7 @@ peak_source_conns  ≈  dump_parallel × (1 + dump_jobs)    # active pg_dump lea
                      + max_parallel                        # copy-engine source workers (delayed phase)
 
 peak_dest_conns    ≈  restore_parallel × (1 + restore_jobs) # active pg_restore leaders + workers
+                     # (or restore_parallel × 1 if restore_single_transaction is true)
                      + verify_concurrency                    # global cap
                      + max_parallel                          # copy-engine dest workers (delayed phase)
 ```
@@ -319,7 +320,8 @@ dump_jobs = 24
 restore_jobs = 12
 
 # (Optional) Use --single-transaction for pg_restore (default: false).
-# Reduces "Xact committed" count but disables parallel restore jobs (-j).
+# Ensures the restore of each database is atomic and reduces "Xact committed"
+# count, but disables parallel restore jobs (-j) for that database.
 # restore_single_transaction = false
 
 # Maximum number of databases being migrated concurrently (default: 6).

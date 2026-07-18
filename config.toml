@@ -6,6 +6,11 @@ dump_jobs = 12
 # Number of parallel jobs for pg_restore
 restore_jobs = 16
 
+# (Optional) Use --single-transaction for pg_restore (default: false).
+# Ensures the restore of each database is atomic and reduces "Xact committed"
+# count, but disables parallel restore jobs (-j) for that database.
+# restore_single_transaction = false
+
 # Maximum number of parallel database migrations
 max_parallel = 16
 
