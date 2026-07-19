@@ -3,8 +3,10 @@ use crate::copy_engine::splitter::Partition;
 use crate::copy_engine::worker::Worker;
 use log::{error, info};
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_postgres::error::SqlState;
+use tokio_util::sync::CancellationToken;
 
 /// Progress snapshot emitted by [`Orchestrator::run`] after each partition
 /// completes, so callers can surface copy-engine progress in their UI.
@@ -20,6 +22,13 @@ pub enum ProgressEvent {
     PartitionComplete,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct CopySettings {
+    pub worker_count: usize,
+    pub buffer_size: u64,
+    pub report_interval: u64,
+}
+
 pub struct Orchestrator {
     source_config: Arc<str>,
     dest_config: Arc<str>,
@@ -27,6 +36,8 @@ pub struct Orchestrator {
     worker_count: usize,
     buffer_size: u64,
     report_interval: u64,
+    semaphore: Arc<Semaphore>,
+    cancel: CancellationToken,
 }
 
 impl Orchestrator {
@@ -35,17 +46,19 @@ impl Orchestrator {
         source_config: impl Into<Arc<str>>,
         dest_config: impl Into<Arc<str>>,
         table_name: impl Into<Arc<str>>,
-        worker_count: usize,
-        buffer_size: u64,
-        report_interval: u64,
+        settings: CopySettings,
+        semaphore: Arc<Semaphore>,
+        cancel: CancellationToken,
     ) -> Self {
         Self {
             source_config: source_config.into(),
             dest_config: dest_config.into(),
             table_name: table_name.into(),
-            worker_count,
-            buffer_size,
-            report_interval,
+            worker_count: settings.worker_count,
+            buffer_size: settings.buffer_size,
+            report_interval: settings.report_interval,
+            semaphore,
+            cancel,
         }
     }
 
@@ -64,6 +77,7 @@ impl Orchestrator {
     /// Returns an error if the connection fails, the probe fails for a reason
     /// other than a missing table, or the table is not visible.
     async fn ensure_table_visible(&self, config: &str, side: &'static str) -> Result<()> {
+        let _permit = crate::copy_engine::acquire(&self.semaphore, &self.cancel).await?;
         let (client, connection) = tokio_postgres::connect(config, crate::tls::make_tls()).await?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
@@ -149,7 +163,10 @@ impl Orchestrator {
             );
             let shared_rx = shared_rx.clone();
             let progress_tx = progress_tx.clone();
-            join_set.spawn(async move { worker.run(shared_rx, progress_tx).await });
+            let semaphore = self.semaphore.clone();
+            let cancel = self.cancel.clone();
+            join_set
+                .spawn(async move { worker.run(shared_rx, progress_tx, semaphore, cancel).await });
         }
 
         // Drop our sender so progress_rx finishes once all workers are done.
@@ -213,13 +230,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_orchestrator_new() {
+        let sem = Arc::new(Semaphore::new(1));
+        let cancel = CancellationToken::new();
         let orch = Orchestrator::new(
             "src",
             "dest",
             "table",
-            4,
-            32 * 1024 * 1024,
-            10 * 1024 * 1024,
+            CopySettings {
+                worker_count: 4,
+                buffer_size: 32 * 1024 * 1024,
+                report_interval: 10 * 1024 * 1024,
+            },
+            sem,
+            cancel,
         );
         assert_eq!(&*orch.source_config, "src");
         assert_eq!(&*orch.dest_config, "dest");
@@ -229,13 +252,19 @@ mod tests {
 
     #[tokio::test]
     async fn test_orchestrator_empty_partitions() -> Result<()> {
+        let sem = Arc::new(Semaphore::new(1));
+        let cancel = CancellationToken::new();
         let orch = Orchestrator::new(
             "src",
             "dest",
             "table",
-            4,
-            32 * 1024 * 1024,
-            10 * 1024 * 1024,
+            CopySettings {
+                worker_count: 4,
+                buffer_size: 32 * 1024 * 1024,
+                report_interval: 10 * 1024 * 1024,
+            },
+            sem,
+            cancel,
         );
         let result = orch.run(vec![], |_| {}).await?;
         assert_eq!(result, 0);

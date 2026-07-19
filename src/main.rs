@@ -87,6 +87,8 @@ pub async fn run_copy_engine(
     config: &Config,
     db_name: &str,
     target: CopyTarget<'_>,
+    semaphore: Arc<Semaphore>,
+    cancel: CancellationToken,
     on_progress: impl FnMut(copy_engine::CopyProgress),
 ) -> Result<()> {
     // `target.table` is schema-qualified (`schema.table`): copy rules are
@@ -118,9 +120,13 @@ pub async fn run_copy_engine(
         source_conn,
         dest_conn,
         target.table,
-        config.max_parallel,
-        config.copy_buffer_size,
-        config.copy_report_interval,
+        copy_engine::CopySettings {
+            worker_count: config.max_parallel,
+            buffer_size: config.copy_buffer_size,
+            report_interval: config.copy_report_interval,
+        },
+        semaphore,
+        cancel,
     );
 
     let partitions = copy_engine::Splitter::split(

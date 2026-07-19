@@ -4,9 +4,10 @@ use crate::copy_engine::splitter::Partition;
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use log::{error, info};
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Semaphore};
 use tokio_postgres::error::SqlState;
 use tokio_postgres::{Error as PgError, Transaction};
+use tokio_util::sync::CancellationToken;
 
 pub struct Worker {
     id: usize,
@@ -132,7 +133,20 @@ impl Worker {
         &self,
         rx: Arc<Mutex<tokio::sync::mpsc::Receiver<Partition>>>,
         progress_tx: tokio::sync::mpsc::Sender<ProgressEvent>,
+        semaphore: Arc<Semaphore>,
+        cancel: CancellationToken,
     ) -> Result<u64> {
+        let first_partition = {
+            let mut guard = rx.lock().await;
+            guard.recv().await
+        };
+
+        let Some(mut partition) = first_partition else {
+            return Ok(0);
+        };
+
+        let _permit = crate::copy_engine::acquire(&semaphore, &cancel).await?;
+
         let mut client_src = self.connect_side(&self.source_config, "source").await?;
         let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
 
@@ -157,20 +171,21 @@ impl Worker {
 
         let mut total_bytes = 0;
         loop {
-            let partition = {
-                let mut guard = rx.lock().await;
-                guard.recv().await
-            };
-
-            let Some(partition) = partition else {
-                break;
-            };
-
             let bytes = self
                 .copy_partition(&tx_src, &tx_dest, &partition, &progress_tx)
                 .await?;
             total_bytes += bytes;
             let _ = progress_tx.send(ProgressEvent::PartitionComplete).await;
+
+            let next_partition = {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            };
+            if let Some(p) = next_partition {
+                partition = p;
+            } else {
+                break;
+            }
         }
 
         tx_src.commit().await.map_err(|e| {
