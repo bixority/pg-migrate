@@ -111,6 +111,9 @@ pub struct Config {
     pub fast_verify: bool,
     pub verify_concurrency: usize,
 
+    pub copy_buffer_size: u64,
+    pub copy_report_interval: u64,
+
     pub pool_cache: db::PoolCache,
 
     /// Normalised `sslmode` (`disable`/`prefer`/`require`) applied to all
@@ -233,6 +236,7 @@ pub struct TomlConfig {
     pub sslmode: String,
     pub copy_rules: Option<Vec<CopyRule>>,
     pub restore_single_transaction: bool,
+    pub copy_buffer_size_mb: Option<usize>,
 }
 
 impl Default for TomlConfig {
@@ -253,6 +257,7 @@ impl Default for TomlConfig {
             sslmode: "prefer".to_string(),
             copy_rules: None,
             restore_single_transaction: true,
+            copy_buffer_size_mb: None,
         }
     }
 }
@@ -417,6 +422,10 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
         zstd_level,
         ssl_mode: ssl_mode_label.to_string(),
         copy_rules,
+
+        copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64 * 1024 * 1024,
+        copy_report_interval: 10 * 1024 * 1024, // 10MB progress reporting interval
+
         exclude_patterns,
         deferred_patterns,
         copy_rule_patterns,
@@ -852,6 +861,10 @@ till = \"2023-03-01\"
             zstd_level: 5,
             ssl_mode: ssl_mode_label.to_string(),
             copy_rules,
+            copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64
+                * 1024
+                * 1024,
+            copy_report_interval: 10 * 1024 * 1024,
             exclude_patterns,
             deferred_patterns,
             copy_rule_patterns,

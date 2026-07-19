@@ -15,11 +15,18 @@ pub struct CopyProgress {
     pub total_bytes: u64,
 }
 
+pub enum ProgressEvent {
+    Bytes(u64),
+    PartitionComplete,
+}
+
 pub struct Orchestrator {
     source_config: Arc<str>,
     dest_config: Arc<str>,
     table_name: Arc<str>,
     worker_count: usize,
+    buffer_size: u64,
+    report_interval: u64,
 }
 
 impl Orchestrator {
@@ -29,12 +36,16 @@ impl Orchestrator {
         dest_config: impl Into<Arc<str>>,
         table_name: impl Into<Arc<str>>,
         worker_count: usize,
+        buffer_size: u64,
+        report_interval: u64,
     ) -> Self {
         Self {
             source_config: source_config.into(),
             dest_config: dest_config.into(),
             table_name: table_name.into(),
             worker_count,
+            buffer_size,
+            report_interval,
         }
     }
 
@@ -124,7 +135,7 @@ impl Orchestrator {
         drop(partition_tx);
 
         let shared_rx = Arc::new(tokio::sync::Mutex::new(partition_rx));
-        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(self.worker_count * 2);
+        let (progress_tx, mut progress_rx) = tokio::sync::mpsc::channel(self.worker_count * 1024);
         let mut join_set = JoinSet::new();
 
         for id in 0..self.worker_count {
@@ -133,6 +144,8 @@ impl Orchestrator {
                 self.source_config.clone(),
                 self.dest_config.clone(),
                 self.table_name.clone(),
+                self.buffer_size,
+                self.report_interval,
             );
             let shared_rx = shared_rx.clone();
             let progress_tx = progress_tx.clone();
@@ -152,9 +165,11 @@ impl Orchestrator {
 
         loop {
             tokio::select! {
-                Some(bytes) = progress_rx.recv() => {
-                    total_bytes += bytes;
-                    completed += 1;
+                Some(event) = progress_rx.recv() => {
+                    match event {
+                        ProgressEvent::Bytes(bytes) => total_bytes += bytes,
+                        ProgressEvent::PartitionComplete => completed += 1,
+                    }
                     on_progress(CopyProgress {
                         completed_partitions: completed,
                         total_partitions,
@@ -166,9 +181,11 @@ impl Orchestrator {
                         r??;
                     } else {
                         // All workers finished. Drain any remaining progress updates.
-                        while let Some(bytes) = progress_rx.recv().await {
-                            total_bytes += bytes;
-                            completed += 1;
+                        while let Some(event) = progress_rx.recv().await {
+                            match event {
+                                ProgressEvent::Bytes(bytes) => total_bytes += bytes,
+                                ProgressEvent::PartitionComplete => completed += 1,
+                            }
                             on_progress(CopyProgress {
                                 completed_partitions: completed,
                                 total_partitions,
@@ -196,7 +213,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_orchestrator_new() {
-        let orch = Orchestrator::new("src", "dest", "table", 4);
+        let orch = Orchestrator::new(
+            "src",
+            "dest",
+            "table",
+            4,
+            32 * 1024 * 1024,
+            10 * 1024 * 1024,
+        );
         assert_eq!(&*orch.source_config, "src");
         assert_eq!(&*orch.dest_config, "dest");
         assert_eq!(&*orch.table_name, "table");
@@ -205,7 +229,14 @@ mod tests {
 
     #[tokio::test]
     async fn test_orchestrator_empty_partitions() -> Result<()> {
-        let orch = Orchestrator::new("src", "dest", "table", 4);
+        let orch = Orchestrator::new(
+            "src",
+            "dest",
+            "table",
+            4,
+            32 * 1024 * 1024,
+            10 * 1024 * 1024,
+        );
         let result = orch.run(vec![], |_| {}).await?;
         assert_eq!(result, 0);
         Ok(())

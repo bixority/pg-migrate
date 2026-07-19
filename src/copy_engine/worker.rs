@@ -1,4 +1,5 @@
 use crate::copy_engine::error::{CopyEngineError, CopyFailure, Result};
+use crate::copy_engine::orchestrator::ProgressEvent;
 use crate::copy_engine::splitter::Partition;
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use log::{error, info};
@@ -12,6 +13,8 @@ pub struct Worker {
     source_config: Arc<str>,
     dest_config: Arc<str>,
     table_name: Arc<str>,
+    buffer_size: u64,
+    report_interval: u64,
 }
 
 impl Worker {
@@ -21,12 +24,16 @@ impl Worker {
         source_config: Arc<str>,
         dest_config: Arc<str>,
         table_name: Arc<str>,
+        buffer_size: u64,
+        report_interval: u64,
     ) -> Self {
         Self {
             id,
             source_config,
             dest_config,
             table_name,
+            buffer_size,
+            report_interval,
         }
     }
 
@@ -124,7 +131,7 @@ impl Worker {
     pub async fn run(
         &self,
         rx: Arc<Mutex<tokio::sync::mpsc::Receiver<Partition>>>,
-        progress_tx: tokio::sync::mpsc::Sender<u64>,
+        progress_tx: tokio::sync::mpsc::Sender<ProgressEvent>,
     ) -> Result<u64> {
         let mut client_src = self.connect_side(&self.source_config, "source").await?;
         let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
@@ -159,9 +166,11 @@ impl Worker {
                 break;
             };
 
-            let bytes = self.copy_partition(&tx_src, &tx_dest, &partition).await?;
+            let bytes = self
+                .copy_partition(&tx_src, &tx_dest, &partition, &progress_tx)
+                .await?;
             total_bytes += bytes;
-            let _ = progress_tx.send(bytes).await;
+            let _ = progress_tx.send(ProgressEvent::PartitionComplete).await;
         }
 
         tx_src.commit().await.map_err(|e| {
@@ -192,9 +201,120 @@ impl Worker {
         tx_src: &Transaction<'_>,
         tx_dest: &Transaction<'_>,
         partition: &Partition,
+        progress_tx: &tokio::sync::mpsc::Sender<ProgressEvent>,
     ) -> Result<u64> {
         info!("Worker {} starting partition: {}", self.id, partition);
 
+        let (source_query, dest_query) = self.build_copy_queries(partition)?;
+
+        let stream = tx_src.copy_out(&source_query).await.map_err(|e| {
+            self.copy_failed(
+                "COPY OUT",
+                "source",
+                Some(partition),
+                source_query.clone(),
+                e,
+            )
+        })?;
+        let sink = tx_dest.copy_in(&dest_query).await.map_err(|e| {
+            self.copy_failed(
+                "COPY IN",
+                "destination",
+                Some(partition),
+                dest_query.clone(),
+                e,
+            )
+        })?;
+
+        pin_mut!(stream);
+        pin_mut!(sink);
+
+        let mut total_bytes = 0;
+        let mut last_reported_bytes = 0;
+        let mut last_flushed_bytes = 0;
+
+        while let Some(row_data) = stream.next().await {
+            let data = row_data.map_err(|e| {
+                self.copy_failed(
+                    "COPY OUT (streaming)",
+                    "source",
+                    Some(partition),
+                    source_query.clone(),
+                    e,
+                )
+            })?;
+            let len = data.len() as u64;
+            total_bytes += len;
+
+            // Use `feed` to buffer the data instead of `send` which flushes after every chunk.
+            sink.feed(data).await.map_err(|e| {
+                self.copy_failed(
+                    "COPY IN (streaming)",
+                    "destination",
+                    Some(partition),
+                    dest_query.clone(),
+                    e,
+                )
+            })?;
+
+            if total_bytes - last_reported_bytes >= self.report_interval {
+                let delta = total_bytes - last_reported_bytes;
+                let _ = progress_tx.send(ProgressEvent::Bytes(delta)).await;
+                last_reported_bytes = total_bytes;
+            }
+
+            if total_bytes - last_flushed_bytes >= self.buffer_size {
+                sink.flush().await.map_err(|e| {
+                    self.copy_failed(
+                        "COPY IN (flush)",
+                        "destination",
+                        Some(partition),
+                        dest_query.clone(),
+                        e,
+                    )
+                })?;
+                last_flushed_bytes = total_bytes;
+            }
+        }
+
+        // Final flush to ensure all buffered data is sent before closing.
+        sink.flush().await.map_err(|e| {
+            self.copy_failed(
+                "COPY IN (final flush)",
+                "destination",
+                Some(partition),
+                dest_query.clone(),
+                e,
+            )
+        })?;
+
+        sink.close().await.map_err(|e| {
+            self.copy_failed(
+                "COPY IN (finalize)",
+                "destination",
+                Some(partition),
+                dest_query.clone(),
+                e,
+            )
+        })?;
+
+        // Report any remaining bytes.
+        if total_bytes > last_reported_bytes {
+            let delta = total_bytes - last_reported_bytes;
+            let _ = progress_tx.send(ProgressEvent::Bytes(delta)).await;
+        }
+
+        info!(
+            "Worker {} finished partition: {}. Total bytes: {}",
+            self.id, partition, total_bytes
+        );
+
+        Ok(total_bytes)
+    }
+
+    /// Builds the `COPY` queries for the source and destination databases based
+    /// on the partition's method and range/index.
+    fn build_copy_queries(&self, partition: &Partition) -> Result<(String, String)> {
         let quoted_column = crate::db::quote_ident(&partition.column);
         let conditions: Vec<String> = if partition.method == "hash" {
             let i = partition.from.as_ref().ok_or_else(|| {
@@ -229,71 +349,9 @@ impl Worker {
 
         let quoted_table = crate::db::quote_table_name(&self.table_name);
         let source_query = format!("COPY (SELECT * FROM {quoted_table}{where_clause}) TO STDOUT");
-
         let dest_query = format!("COPY {quoted_table} FROM STDIN");
 
-        let stream = tx_src.copy_out(&source_query).await.map_err(|e| {
-            self.copy_failed(
-                "COPY OUT",
-                "source",
-                Some(partition),
-                source_query.clone(),
-                e,
-            )
-        })?;
-        let sink = tx_dest.copy_in(&dest_query).await.map_err(|e| {
-            self.copy_failed(
-                "COPY IN",
-                "destination",
-                Some(partition),
-                dest_query.clone(),
-                e,
-            )
-        })?;
-
-        pin_mut!(stream);
-        pin_mut!(sink);
-
-        let mut total_bytes = 0;
-
-        while let Some(row_data) = stream.next().await {
-            let data = row_data.map_err(|e| {
-                self.copy_failed(
-                    "COPY OUT (streaming)",
-                    "source",
-                    Some(partition),
-                    source_query.clone(),
-                    e,
-                )
-            })?;
-            total_bytes += data.len() as u64;
-            sink.send(data).await.map_err(|e| {
-                self.copy_failed(
-                    "COPY IN (streaming)",
-                    "destination",
-                    Some(partition),
-                    dest_query.clone(),
-                    e,
-                )
-            })?;
-        }
-
-        sink.close().await.map_err(|e| {
-            self.copy_failed(
-                "COPY IN (finalize)",
-                "destination",
-                Some(partition),
-                dest_query.clone(),
-                e,
-            )
-        })?;
-
-        info!(
-            "Worker {} finished partition: {}. Total bytes: {}",
-            self.id, partition, total_bytes
-        );
-
-        Ok(total_bytes)
+        Ok((source_query, dest_query))
     }
 }
 
@@ -303,7 +361,14 @@ mod tests {
 
     #[test]
     fn test_worker_new() {
-        let worker = Worker::new(1, Arc::from("src"), Arc::from("dest"), Arc::from("table"));
+        let worker = Worker::new(
+            1,
+            Arc::from("src"),
+            Arc::from("dest"),
+            Arc::from("table"),
+            32 * 1024 * 1024,
+            10 * 1024 * 1024,
+        );
         assert_eq!(worker.id, 1);
         assert_eq!(&*worker.source_config, "src");
         assert_eq!(&*worker.dest_config, "dest");

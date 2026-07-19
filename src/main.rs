@@ -114,8 +114,14 @@ pub async fn run_copy_engine(
         config.ssl_mode
     );
 
-    let orchestrator =
-        copy_engine::Orchestrator::new(source_conn, dest_conn, target.table, config.max_parallel);
+    let orchestrator = copy_engine::Orchestrator::new(
+        source_conn,
+        dest_conn,
+        target.table,
+        config.max_parallel,
+        config.copy_buffer_size,
+        config.copy_report_interval,
+    );
 
     let partitions = copy_engine::Splitter::split(
         target.column,
