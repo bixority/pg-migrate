@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::io::Error as IoError;
 use thiserror::Error;
 use tokio::sync::AcquireError;
@@ -12,7 +13,7 @@ pub enum CopyEngineError {
     Io(#[from] IoError),
 
     #[error("Configuration error: {0}")]
-    Configuration(String),
+    Configuration(Cow<'static, str>),
 
     /// A `COPY` (or its connection) failed against a specific side of the
     /// migration. Boxed so this rich-context variant does not bloat the size of
@@ -39,13 +40,13 @@ pub enum CopyEngineError {
     )]
     TableNotFound {
         side: &'static str,
-        table: String,
-        search_path: String,
+        table: Cow<'static, str>,
+        search_path: Cow<'static, str>,
     },
 
     #[error("Worker failure in partition {partition}: {source}")]
     WorkerFailed {
-        partition: String,
+        partition: Cow<'static, str>,
         source: Box<Self>,
     },
 
@@ -53,7 +54,7 @@ pub enum CopyEngineError {
     Semaphore(#[from] AcquireError),
 
     #[error("Splitter error: {0}")]
-    Splitter(String),
+    Splitter(Cow<'static, str>),
 
     #[error("Join error: {0}")]
     Join(#[from] tokio::task::JoinError),
@@ -73,10 +74,10 @@ pub enum CopyEngineError {
 pub struct CopyFailure {
     pub stage: &'static str,
     pub side: &'static str,
-    pub table: String,
-    pub partition: String,
-    pub detail: String,
-    pub hint: String,
+    pub table: Cow<'static, str>,
+    pub partition: Cow<'static, str>,
+    pub detail: Cow<'static, str>,
+    pub hint: Cow<'static, str>,
     #[source]
     pub source: PgError,
 }
@@ -90,15 +91,15 @@ mod tests {
 
     #[test]
     fn test_error_display() {
-        let err = CopyEngineError::Configuration("invalid config".to_string());
+        let err = CopyEngineError::Configuration("invalid config".into());
         assert_eq!(format!("{err}"), "Configuration error: invalid config");
 
         let err = CopyEngineError::Io(IoError::other("disk full"));
         assert_eq!(format!("{err}"), "IO error: disk full");
 
         let worker_err = CopyEngineError::WorkerFailed {
-            partition: "part1".to_string(),
-            source: Box::new(CopyEngineError::Configuration("failed".to_string())),
+            partition: "part1".into(),
+            source: Box::new(CopyEngineError::Configuration("failed".into())),
         };
         assert_eq!(
             format!("{worker_err}"),

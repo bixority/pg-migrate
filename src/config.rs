@@ -480,7 +480,7 @@ fn validate_copy_rules(rules: &[CopyRule]) -> Result<()> {
     for rule in rules {
         if parse_fully_qualified(&rule.table).is_none() {
             return Err(Error::InvalidCopyRule {
-                table: rule.table.clone(),
+                table: rule.table.clone().into(),
                 reason: "expected 'DATABASE.SCHEMA.TABLE' format with all parts non-empty".into(),
             });
         }
@@ -504,7 +504,7 @@ pub fn validate_delay_table_data(patterns: &[String]) -> Result<()> {
     for pattern in patterns {
         if !is_valid_pattern(pattern) {
             return Err(Error::InvalidCopyRule {
-                table: pattern.clone(),
+                table: pattern.clone().into(),
                 reason: "delay_table_data entry must be 'DB', 'DB.SCHEMA', or \
                          'DB.SCHEMA.TABLE' with all parts non-empty"
                     .into(),
@@ -525,7 +525,7 @@ pub fn validate_exclude_patterns(patterns: &[String]) -> Result<()> {
     for pattern in patterns {
         if !is_valid_pattern(pattern) {
             return Err(Error::InvalidCopyRule {
-                table: pattern.clone(),
+                table: pattern.clone().into(),
                 reason: "exclude entry must be 'DB', 'DB.SCHEMA', or 'DB.SCHEMA.TABLE' with \
                          all parts non-empty"
                     .into(),

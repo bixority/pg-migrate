@@ -98,8 +98,8 @@ impl Orchestrator {
             {
                 return Err(CopyEngineError::TableNotFound {
                     side,
-                    table: self.table_name.to_string(),
-                    search_path,
+                    table: (*self.table_name).to_string().into(),
+                    search_path: search_path.into(),
                 });
             }
             return Err(CopyEngineError::Connection(e));

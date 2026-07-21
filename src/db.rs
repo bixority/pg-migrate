@@ -278,7 +278,7 @@ pub async fn dump_db(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::SpawnFailed {
-                command: "pg_dump".to_string(),
+                command: "pg_dump".into(),
                 source: e,
             })?;
 
@@ -299,8 +299,8 @@ pub async fn dump_db(
 
         if !status.success() {
             return Err(Error::ProcessFailed {
-                command: format!("pg_dump {db}"),
-                stderr: err_output.trim().to_string(),
+                command: format!("pg_dump {db}").into(),
+                stderr: err_output.trim().to_string().into(),
             });
         }
     }
@@ -329,8 +329,8 @@ pub async fn restore_db(
 
     if !dump_path.join("toc.dat").exists() {
         return Err(Error::DumpNotFound {
-            database: db.to_string(),
-            path: dump_path.display().to_string(),
+            database: db.to_string().into(),
+            path: dump_path.display().to_string().into(),
         });
     }
 
@@ -365,7 +365,7 @@ pub async fn restore_db(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::SpawnFailed {
-            command: "pg_restore".to_string(),
+            command: "pg_restore".into(),
             source: e,
         })?;
 
@@ -404,12 +404,13 @@ pub async fn restore_db(
 
     if !status.success() {
         return Err(Error::ProcessFailed {
-            command: format!("pg_restore {db}"),
+            command: format!("pg_restore {db}").into(),
             stderr: format!(
                 "status {status}\nstdout:\n{}\nstderr:\n{}",
                 stdout_output.trim(),
                 stderr_output.trim()
-            ),
+            )
+            .into(),
         });
     }
 
@@ -469,7 +470,7 @@ pub async fn dump_delayed_data(
             .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::SpawnFailed {
-                command: "pg_dump (delayed)".to_string(),
+                command: "pg_dump (delayed)".into(),
                 source: e,
             })?;
 
@@ -490,8 +491,8 @@ pub async fn dump_delayed_data(
 
         if !status.success() {
             return Err(Error::ProcessFailed {
-                command: format!("pg_dump (delayed) {db}"),
-                stderr: err_output.trim().to_string(),
+                command: format!("pg_dump (delayed) {db}").into(),
+                stderr: err_output.trim().to_string().into(),
             });
         }
     }
@@ -548,7 +549,7 @@ pub async fn restore_delayed_data(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| Error::SpawnFailed {
-            command: "pg_restore (delayed)".to_string(),
+            command: "pg_restore (delayed)".into(),
             source: e,
         })?;
 
@@ -587,12 +588,13 @@ pub async fn restore_delayed_data(
 
     if !status.success() {
         return Err(Error::ProcessFailed {
-            command: format!("pg_restore (delayed) {db}"),
+            command: format!("pg_restore (delayed) {db}").into(),
             stderr: format!(
                 "status {status}\nstdout:\n{}\nstderr:\n{}",
                 stdout_output.trim(),
                 stderr_output.trim()
-            ),
+            )
+            .into(),
         });
     }
 
@@ -616,8 +618,8 @@ pub async fn create_dbs(config: &Config, dbs: &[String], cancel: CancellationTok
                             continue;
                     }
                     return Err(Error::ProcessFailed {
-                        command: format!("CREATE DATABASE \"{db}\""),
-                        stderr: e.to_string(),
+                        command: format!("CREATE DATABASE \"{db}\"").into(),
+                        stderr: e.to_string().into(),
                     });
                 }
             }
@@ -708,7 +710,7 @@ async fn dump_globals(
         ])
         .spawn()
         .map_err(|e| Error::SpawnFailed {
-            command: "pg_dumpall".to_string(),
+            command: "pg_dumpall".into(),
             source: e,
         })?;
 
@@ -722,8 +724,8 @@ async fn dump_globals(
 
     if !status.success() {
         return Err(Error::ProcessFailed {
-            command: "pg_dumpall".to_string(),
-            stderr: "pg_dumpall failed".to_string(),
+            command: "pg_dumpall".into(),
+            stderr: "pg_dumpall failed".into(),
         });
     }
 
@@ -810,13 +812,14 @@ async fn apply_globals(
                             .hint()
                             .map(|h| format!(" (hint: {h})"))
                             .unwrap_or_default(),
-                    ),
+                    )
+                    .into(),
                 });
             }
 
             return Err(Error::ProcessFailed {
                 command: "execute globals statement".into(),
-                stderr: format!("Error: {e}\n  statement: {s}"),
+                stderr: format!("Error: {e}\n  statement: {s}").into(),
             });
         }
     }

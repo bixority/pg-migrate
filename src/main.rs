@@ -216,7 +216,7 @@ async fn run_migration_workflow(
 
     let final_table = states
         .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
         .render_table();
     table_pb.finish_with_message(final_table);
     total_time_pb.finish_and_clear();

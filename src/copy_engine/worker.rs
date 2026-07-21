@@ -3,6 +3,7 @@ use crate::copy_engine::orchestrator::ProgressEvent;
 use crate::copy_engine::splitter::Partition;
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use log::{error, info};
+use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_postgres::error::SqlState;
@@ -48,17 +49,19 @@ impl Worker {
         stage: &'static str,
         side: &'static str,
         partition: Option<&Partition>,
-        detail: String,
+        detail: impl Into<Cow<'static, str>>,
         source: PgError,
     ) -> CopyEngineError {
         let hint = self.missing_relation_hint(&source, side);
         CopyEngineError::CopyFailed(Box::new(CopyFailure {
             stage,
             side,
-            table: self.table_name.to_string(),
-            partition: partition.map_or_else(|| "none".to_string(), ToString::to_string),
-            detail,
-            hint,
+            table: (*self.table_name).to_string().into(),
+            partition: partition
+                .map_or_else(|| "none".to_string(), ToString::to_string)
+                .into(),
+            detail: detail.into(),
+            hint: hint.into(),
             source,
         }))
     }
@@ -155,7 +158,7 @@ impl Worker {
                 "Transaction start",
                 "source",
                 None,
-                "beginning source transaction".into(),
+                "beginning source transaction",
                 e,
             )
         })?;
@@ -164,7 +167,7 @@ impl Worker {
                 "Transaction start",
                 "destination",
                 None,
-                "beginning destination transaction".into(),
+                "beginning destination transaction",
                 e,
             )
         })?;
@@ -193,7 +196,7 @@ impl Worker {
                 "Transaction commit",
                 "source",
                 None,
-                "committing source transaction".into(),
+                "committing source transaction",
                 e,
             )
         })?;
@@ -202,7 +205,7 @@ impl Worker {
                 "Transaction commit",
                 "destination",
                 None,
-                "committing destination transaction".into(),
+                "committing destination transaction",
                 e,
             )
         })?;
@@ -331,31 +334,32 @@ impl Worker {
     /// on the partition's method and range/index.
     fn build_copy_queries(&self, partition: &Partition) -> Result<(String, String)> {
         let quoted_column = crate::db::quote_ident(&partition.column);
-        let conditions: Vec<String> = if partition.method == "hash" {
-            let i = partition.from.as_ref().ok_or_else(|| {
-                CopyEngineError::Splitter("Hash partition missing index".to_string())
-            })?;
-            let n = partition.till.as_ref().ok_or_else(|| {
-                CopyEngineError::Splitter("Hash partition missing count".to_string())
-            })?;
-            vec![format!(
-                "abs(hashtext({quoted_column}::text)::bigint) % {n} = {i}"
-            )]
-        } else {
-            [
-                partition
-                    .from
-                    .as_ref()
-                    .map(|f| format!("{quoted_column} >= '{f}'")),
-                partition
-                    .till
-                    .as_ref()
-                    .map(|t| format!("{quoted_column} < '{t}'")),
-            ]
-            .into_iter()
-            .flatten()
-            .collect()
-        };
+        let conditions: Vec<String> =
+            if &*partition.method == "hash" {
+                let i = partition.from.as_ref().ok_or_else(|| {
+                    CopyEngineError::Splitter("Hash partition missing index".into())
+                })?;
+                let n = partition.till.as_ref().ok_or_else(|| {
+                    CopyEngineError::Splitter("Hash partition missing count".into())
+                })?;
+                vec![format!(
+                    "abs(hashtext({quoted_column}::text)::bigint) % {n} = {i}"
+                )]
+            } else {
+                [
+                    partition
+                        .from
+                        .as_ref()
+                        .map(|f| format!("{quoted_column} >= '{f}'")),
+                    partition
+                        .till
+                        .as_ref()
+                        .map(|t| format!("{quoted_column} < '{t}'")),
+                ]
+                .into_iter()
+                .flatten()
+                .collect()
+            };
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {

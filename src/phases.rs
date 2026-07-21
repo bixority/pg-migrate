@@ -75,7 +75,7 @@ pub async fn phase_migrate_all(
     let total_duration = start.elapsed();
     let regular_duration = states
         .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
         .latest_regular_completion()
         .map_or(total_duration, |t| t.duration_since(start));
 
@@ -116,12 +116,12 @@ async fn run_regular_pipeline(
 
         states
             .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
             .mark_regular_done(&db_name);
 
         states
             .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
             .update(&db_name, MigrationPhase::Complete, 4, "migration complete");
 
         if let Some(tx) = regular_done_tx {
@@ -209,7 +209,7 @@ async fn run_delayed_pipeline(
         // Phase 4: Complete
         states
             .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
             .update(
                 &delayed_name,
                 MigrationPhase::Complete,
@@ -338,7 +338,7 @@ async fn delayed_dump_phase(
     let _dump_permit = acquire(dump_sem, cancel).await?;
     states
         .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
         .update(
             delayed_name,
             MigrationPhase::DelayedDumping,
@@ -368,7 +368,7 @@ async fn delayed_restore_phase(
 ) -> Result<()> {
     states
         .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
         .update(
             delayed_name,
             MigrationPhase::DelayedRestoring,
@@ -393,7 +393,7 @@ async fn delayed_verify_phase(
 ) -> Result<()> {
     states
         .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
         .update(
             delayed_name,
             MigrationPhase::DelayedVerifying,
@@ -418,7 +418,7 @@ async fn phase_migrate_one(
 
         states
             .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
+            .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
             .update(db_name, MigrationPhase::Dumping, 1, "dumping database");
 
         db::dump_db(
@@ -436,14 +436,14 @@ async fn phase_migrate_one(
 
     states
         .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
         .update(db_name, MigrationPhase::Restoring, 2, "restoring database");
 
     db::restore_db(config, db_name, size, cancel.clone()).await?;
 
     states
         .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .map_err(|e| Error::LockPoisoned(e.to_string().into()))?
         .update(
             db_name,
             MigrationPhase::Verifying,

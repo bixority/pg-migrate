@@ -78,8 +78,8 @@ pub async fn verify_db(
             );
         } else {
             return Err(Error::VerificationFailed {
-                database: db_name.to_string(),
-                details: "tables or row counts mismatch".to_string(),
+                database: db_name.to_string().into(),
+                details: "tables or row counts mismatch".into(),
             });
         }
     }

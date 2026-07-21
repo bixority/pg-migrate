@@ -50,17 +50,23 @@ pub enum Error {
     Cancelled(Cow<'static, str>),
 
     #[error("Process failed: {command}\nError: {stderr}")]
-    ProcessFailed { command: String, stderr: String },
+    ProcessFailed {
+        command: Cow<'static, str>,
+        stderr: Cow<'static, str>,
+    },
 
     #[error("Failed to spawn {command}: {source}")]
     SpawnFailed {
-        command: String,
+        command: Cow<'static, str>,
         #[source]
         source: std::io::Error,
     },
 
     #[error("Verification failed for {database}: {details}")]
-    VerificationFailed { database: String, details: String },
+    VerificationFailed {
+        database: Cow<'static, str>,
+        details: Cow<'static, str>,
+    },
 
     #[error("Semaphore acquire failed: {0}")]
     Semaphore(#[from] tokio::sync::AcquireError),
@@ -75,7 +81,7 @@ pub enum Error {
     Toml(#[from] toml::de::Error),
 
     #[error("Lock poisoned: {0}")]
-    LockPoisoned(String),
+    LockPoisoned(Cow<'static, str>),
 
     #[error("Copy engine error: {0}")]
     CopyEngine(#[from] crate::copy_engine::error::CopyEngineError),
@@ -90,20 +96,26 @@ pub enum Error {
     Config(Cow<'static, str>),
 
     #[error("Database '{database}' not found")]
-    DatabaseNotFound { database: String },
+    DatabaseNotFound { database: Cow<'static, str> },
 
     #[error("Dump not found for {database} at {path}")]
-    DumpNotFound { database: String, path: String },
+    DumpNotFound {
+        database: Cow<'static, str>,
+        path: Cow<'static, str>,
+    },
 
     #[error("Invalid path: {0}")]
     InvalidPath(Cow<'static, str>),
 
     #[error("Invalid copy rule for table '{table}': {reason}")]
-    InvalidCopyRule { table: String, reason: String },
+    InvalidCopyRule {
+        table: Cow<'static, str>,
+        reason: Cow<'static, str>,
+    },
 
     #[error("Error in database '{database}', phase {phase}, step {step}: {source}")]
     WithContext {
-        database: String,
+        database: Cow<'static, str>,
         phase: MigrationPhase,
         step: u8,
         #[source]
@@ -119,7 +131,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 impl Error {
     pub fn with_context(
         self,
-        database: impl Into<String>,
+        database: impl Into<Cow<'static, str>>,
         phase: MigrationPhase,
         step: u8,
     ) -> Self {

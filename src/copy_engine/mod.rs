@@ -16,7 +16,7 @@ pub(crate) async fn acquire(
     cancel: &CancellationToken,
 ) -> Result<OwnedSemaphorePermit> {
     tokio::select! {
-        res = sem.clone().acquire_owned() => Ok(res.map_err(|_| CopyEngineError::Splitter("semaphore closed".to_string()))?),
+        res = sem.clone().acquire_owned() => Ok(res.map_err(|_| CopyEngineError::Splitter("semaphore closed".into()))?),
         () = cancel.cancelled() => Err(CopyEngineError::Splitter("interrupted while waiting for semaphore".into())),
     }
 }
