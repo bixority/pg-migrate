@@ -41,7 +41,7 @@ impl MigrationStates {
                 let delayed_name = format!("{db} (delayed)");
                 order.push(delayed_name.clone());
                 let mut delayed_state = MigrationState::new(delayed_name.clone(), db_plan.size);
-                delayed_state.total_steps = 6;
+                delayed_state.total_steps = 5;
                 states.insert(delayed_name, delayed_state);
             }
         }

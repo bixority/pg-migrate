@@ -51,7 +51,7 @@ impl MigrationState {
             size,
             phase: MigrationPhase::Pending,
             step: 0,
-            total_steps: 6,
+            total_steps: 4,
             error: None,
             regular_completed_at: None,
             started_at: None,

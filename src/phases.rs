@@ -166,7 +166,7 @@ async fn run_regular_pipeline(
         states
             .lock()
             .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(&db_name, MigrationPhase::Complete, 6, "migration complete");
+            .update(&db_name, MigrationPhase::Complete, 4, "migration complete");
 
         if let Some(tx) = regular_done_tx {
             let _ = tx.send(true);
@@ -262,7 +262,7 @@ async fn run_delayed_pipeline(
             .update(
                 &delayed_name,
                 MigrationPhase::DelayedRestoring,
-                3,
+                2,
                 "restoring delayed table data",
             );
         db::restore_delayed_data(
@@ -283,7 +283,7 @@ async fn run_delayed_pipeline(
             .update(
                 &delayed_name,
                 MigrationPhase::DelayedVerifying,
-                5,
+                4,
                 "verifying all row counts (including delayed)",
             );
         verification::verify_db(&config, &db_name, true, cancel.clone()).await?;
@@ -295,7 +295,7 @@ async fn run_delayed_pipeline(
             .update(
                 &delayed_name,
                 MigrationPhase::Complete,
-                6,
+                5,
                 "migration complete (with delayed data)",
             );
 
@@ -383,7 +383,7 @@ async fn migrate_copy_rules(
                             ui_lock.update(
                                 &delayed_name,
                                 MigrationPhase::DelayedRestoring,
-                                4,
+                                3,
                                 format!(
                                     "copying {table_count} tables via copy engine ({comp_p}/{total_p} partitions, {})",
                                     HumanBytes(bytes)
@@ -452,48 +452,8 @@ async fn phase_migrate_one(
         .map_err(|e| Error::LockPoisoned(e.to_string()))?
         .update(
             db_name,
-            MigrationPhase::SourceCounts,
-            3,
-            "computing source row counts",
-        );
-
-    verification::get_or_compute_counts(
-        config,
-        &config.source,
-        db_name,
-        false,
-        true,
-        cancel.clone(),
-    )
-    .await?;
-
-    states
-        .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(
-            db_name,
-            MigrationPhase::DestinationCounts,
-            4,
-            "computing destination row counts",
-        );
-
-    verification::get_or_compute_counts(
-        config,
-        &config.destination,
-        db_name,
-        false,
-        false,
-        cancel.clone(),
-    )
-    .await?;
-
-    states
-        .lock()
-        .map_err(|e| Error::LockPoisoned(e.to_string()))?
-        .update(
-            db_name,
             MigrationPhase::Verifying,
-            5,
+            3,
             "verifying row counts",
         );
 

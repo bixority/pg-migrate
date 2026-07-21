@@ -6,9 +6,7 @@ use thiserror::Error;
 pub enum MigrationPhase {
     Pending,
     Dumping,
-    SourceCounts,
     Restoring,
-    DestinationCounts,
     Verifying,
     DelayedDumping,
     DelayedRestoring,
@@ -23,9 +21,7 @@ impl MigrationPhase {
         match self {
             Self::Pending => "pending",
             Self::Dumping => "dumping",
-            Self::SourceCounts => "source counts",
             Self::Restoring => "restoring",
-            Self::DestinationCounts => "dest counts",
             Self::Verifying => "verifying",
             Self::DelayedDumping => "delayed dumping",
             Self::DelayedRestoring => "delayed restoring",
