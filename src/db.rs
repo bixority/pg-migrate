@@ -174,6 +174,10 @@ impl PoolCache {
 
         Ok(client)
     }
+
+    pub async fn clear(&self) {
+        self.inner.lock().await.clear();
+    }
 }
 
 pub async fn discover_databases(

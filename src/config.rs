@@ -86,6 +86,7 @@ impl TablePattern {
 }
 
 /// Fully resolved configuration shared across the migration.
+#[allow(clippy::struct_excessive_bools)]
 pub struct Config {
     pub source: db::DbArgs,
     pub source_db: String,
@@ -121,6 +122,8 @@ pub struct Config {
     pub ssl_mode: String,
 
     pub copy_rules: Vec<CopyRule>,
+
+    pub confirm_delayed: bool,
 
     /// Pre-compiled patterns for efficient matching.
     pub(crate) exclude_patterns: Vec<TablePattern>,
@@ -299,6 +302,10 @@ pub struct Args {
     /// Overrides the `sslmode` value from the config file when set.
     #[arg(long)]
     sslmode: Option<String>,
+
+    /// Ask for confirmation before starting the delayed part.
+    #[arg(long)]
+    pub confirm_delayed: bool,
 }
 
 /// Loads the TOML config.
@@ -422,6 +429,7 @@ pub fn build_config(args: Args) -> Result<Arc<Config>> {
         zstd_level,
         ssl_mode: ssl_mode_label.to_string(),
         copy_rules,
+        confirm_delayed: args.confirm_delayed,
 
         copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64 * 1024 * 1024,
         copy_report_interval: 10 * 1024 * 1024, // 10MB progress reporting interval
@@ -861,6 +869,7 @@ till = \"2023-03-01\"
             zstd_level: 5,
             ssl_mode: ssl_mode_label.to_string(),
             copy_rules,
+            confirm_delayed: false,
             copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64
                 * 1024
                 * 1024,

@@ -205,6 +205,7 @@ async fn run_migration_workflow(
         &cancel,
         dump_sem,
         restore_sem,
+        mp.clone(),
     )
     .await;
 

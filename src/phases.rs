@@ -4,7 +4,7 @@ use crate::error::{Error, MigrationPhase, Result};
 use crate::plan::{DatabasePlan, MigrationPlan};
 use crate::tui::SharedMigrationStates;
 use crate::verification;
-use indicatif::HumanBytes;
+use indicatif::{HumanBytes, MultiProgress};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
@@ -28,20 +28,15 @@ pub async fn phase_migrate_all(
     cancel: &CancellationToken,
     dump_sem: Arc<Semaphore>,
     restore_sem: Arc<Semaphore>,
+    mp: Arc<MultiProgress>,
 ) -> Result<(Duration, Duration)> {
     let start = Instant::now();
-    // A `watch` (rather than `Notify`) latches the "all regular pipelines
-    // finished" state. A delayed pipeline that reaches its wait point *after*
-    // the signal is sent still observes it, instead of missing the wake and
-    // hanging — which `Notify::notify_waiters` allows for a late-scheduled
-    // waiter. This gate is what guarantees a database's delayed restore never
-    // begins until every regular pipeline (including that same database's
-    // regular dump and restore) has completed.
+    let (proceed_tx, proceed_rx) = watch::channel(false);
+
     let mut regular_tasks = JoinSet::new();
     let mut delayed_tasks = JoinSet::new();
 
     for db_plan in plan.databases {
-        let (regular_done_tx, regular_done_rx) = watch::channel(false);
         let args = PipelineArgs {
             config: config.clone(),
             db_plan: db_plan.clone(),
@@ -52,65 +47,26 @@ pub async fn phase_migrate_all(
         };
 
         // Spawn regular pipeline
-        regular_tasks.spawn(run_regular_pipeline(args.clone(), Some(regular_done_tx)));
+        regular_tasks.spawn(run_regular_pipeline(args.clone(), None));
 
         // Spawn delayed pipeline if matching flags
         if !db_plan.delayed_tables.is_empty() || !db_plan.copy_rules.is_empty() {
-            delayed_tasks.spawn(run_delayed_pipeline(args, regular_done_rx));
+            delayed_tasks.spawn(run_delayed_pipeline(args, proceed_rx.clone()));
         }
     }
 
     // Wait for all regular pipelines to succeed
-    loop {
-        tokio::select! {
-            res = regular_tasks.join_next() => {
-                match res {
-                    Some(res) => {
-                        match res? {
-                            Ok(()) => {}
-                            Err(e) => {
-                                cancel.cancel();
-                                regular_tasks.abort_all();
-                                delayed_tasks.abort_all();
-                                return Err(e);
-                            }
-                        }
-                    }
-                    None => break,
-                }
-            }
-            () = cancel.cancelled() => {
-                regular_tasks.abort_all();
-                delayed_tasks.abort_all();
-                return Err(Error::Cancelled("user interruption".into()));
-            }
-        }
-    }
+    wait_for_regular_tasks(&mut regular_tasks, &mut delayed_tasks, cancel).await?;
+
+    config.pool_cache.clear().await;
+    log::info!("Regular migration phase finished. All database connections closed.");
+
+    confirm_delayed_part(&config, &mp, cancel, &mut delayed_tasks)?;
+
+    let _ = proceed_tx.send(true);
 
     // Wait for all delayed pipelines to succeed
-    loop {
-        tokio::select! {
-            res = delayed_tasks.join_next() => {
-                match res {
-                    Some(res) => {
-                        match res? {
-                            Ok(()) => {}
-                            Err(e) => {
-                                cancel.cancel();
-                                delayed_tasks.abort_all();
-                                return Err(e);
-                            }
-                        }
-                    }
-                    None => break,
-                }
-            }
-            () = cancel.cancelled() => {
-                delayed_tasks.abort_all();
-                return Err(Error::Cancelled("user interruption".into()));
-            }
-        }
-    }
+    wait_for_delayed_tasks(&mut delayed_tasks, cancel).await?;
 
     if cancel.is_cancelled() {
         return Err(Error::Cancelled("user interruption".into()));
@@ -194,7 +150,7 @@ async fn run_regular_pipeline(
 
 async fn run_delayed_pipeline(
     args: PipelineArgs,
-    mut regular_done: watch::Receiver<bool>,
+    mut proceed: watch::Receiver<bool>,
 ) -> Result<()> {
     let PipelineArgs {
         config,
@@ -209,41 +165,27 @@ async fn run_delayed_pipeline(
     let delayed_name = format!("{db_name} (delayed)");
 
     let res: Result<()> = async {
-        // Phase 1: Delayed Dumping
-        {
-            let _dump_permit = acquire(&dump_sem, &cancel).await?;
-            states
-                .lock()
-                .map_err(|e| Error::LockPoisoned(e.to_string()))?
-                .update(
-                    &delayed_name,
-                    MigrationPhase::DelayedDumping,
-                    1,
-                    "dumping delayed table data",
-                );
-            db::dump_delayed_data(
-                &config,
-                &db_name,
-                &db_plan.delayed_tables,
-                &db_plan
-                    .copy_rules
-                    .iter()
-                    .map(|r| r.table.clone())
-                    .collect::<Vec<_>>(),
-                cancel.clone(),
-            )
-            .await?;
-        }
-
-        // Wait for regular pipelines to finish before proceeding to restore
-        // phases. This is what guarantees the delayed restore below never starts
-        // before this database's own regular dump and restore have completed.
-        // `wait_for` returns immediately if the gate is already open, and errors
-        // only if the sender was dropped without opening it (a torn-down run).
-        regular_done
+        // Wait for all regular pipelines to finish before starting any delayed work.
+        // This ensures the DB can be restarted and connections refreshed.
+        proceed
             .wait_for(|&done| done)
             .await
             .map_err(|_| Error::Cancelled("regular pipelines did not complete".into()))?;
+
+        if cancel.is_cancelled() {
+            return Err(Error::Cancelled("migration process interrupted".into()));
+        }
+
+        // Phase 1: Delayed Dumping
+        delayed_dump_phase(
+            &config,
+            &db_plan,
+            &delayed_name,
+            &states,
+            &dump_sem,
+            &cancel,
+        )
+        .await?;
 
         if let Ok(mut lock) = states.lock() {
             lock.start_timing(&delayed_name);
@@ -256,37 +198,13 @@ async fn run_delayed_pipeline(
         let _restore_permit = acquire(&restore_sem, &cancel).await?;
 
         // Phase 2: Delayed Restoring
-        states
-            .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(
-                &delayed_name,
-                MigrationPhase::DelayedRestoring,
-                2,
-                "restoring delayed table data",
-            );
-        db::restore_delayed_data(
-            &config,
-            &db_name,
-            !db_plan.delayed_tables.is_empty(),
-            cancel.clone(),
-        )
-        .await?;
+        delayed_restore_phase(&config, &db_plan, &delayed_name, &states, &cancel).await?;
 
         // Phase 2.5: Copy Engine
         migrate_copy_rules(config.clone(), &db_plan, &delayed_name, &states, &cancel).await?;
 
         // Phase 3: Delayed Verifying
-        states
-            .lock()
-            .map_err(|e| Error::LockPoisoned(e.to_string()))?
-            .update(
-                &delayed_name,
-                MigrationPhase::DelayedVerifying,
-                4,
-                "verifying all row counts (including delayed)",
-            );
-        verification::verify_db(&config, &db_name, true, cancel.clone()).await?;
+        delayed_verify_phase(&config, &db_plan, &delayed_name, &states, &cancel).await?;
 
         // Phase 4: Complete
         states
@@ -409,6 +327,82 @@ async fn migrate_copy_rules(
     Ok(())
 }
 
+async fn delayed_dump_phase(
+    config: &Config,
+    db_plan: &DatabasePlan,
+    delayed_name: &str,
+    states: &SharedMigrationStates,
+    dump_sem: &Arc<Semaphore>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    let _dump_permit = acquire(dump_sem, cancel).await?;
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            delayed_name,
+            MigrationPhase::DelayedDumping,
+            1,
+            "dumping delayed table data",
+        );
+    db::dump_delayed_data(
+        config,
+        &db_plan.name,
+        &db_plan.delayed_tables,
+        &db_plan
+            .copy_rules
+            .iter()
+            .map(|r| r.table.clone())
+            .collect::<Vec<_>>(),
+        cancel.clone(),
+    )
+    .await
+}
+
+async fn delayed_restore_phase(
+    config: &Config,
+    db_plan: &DatabasePlan,
+    delayed_name: &str,
+    states: &SharedMigrationStates,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            delayed_name,
+            MigrationPhase::DelayedRestoring,
+            2,
+            "restoring delayed table data",
+        );
+    db::restore_delayed_data(
+        config,
+        &db_plan.name,
+        !db_plan.delayed_tables.is_empty(),
+        cancel.clone(),
+    )
+    .await
+}
+
+async fn delayed_verify_phase(
+    config: &Config,
+    db_plan: &DatabasePlan,
+    delayed_name: &str,
+    states: &SharedMigrationStates,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    states
+        .lock()
+        .map_err(|e| Error::LockPoisoned(e.to_string()))?
+        .update(
+            delayed_name,
+            MigrationPhase::DelayedVerifying,
+            4,
+            "verifying all row counts (including delayed)",
+        );
+    verification::verify_db(config, &db_plan.name, true, cancel.clone()).await
+}
+
 async fn phase_migrate_one(
     config: &Config,
     db_plan: &DatabasePlan,
@@ -459,5 +453,92 @@ async fn phase_migrate_one(
 
     verification::verify_db(config, db_name, false, cancel.clone()).await?;
 
+    Ok(())
+}
+
+async fn wait_for_regular_tasks(
+    regular_tasks: &mut JoinSet<Result<()>>,
+    delayed_tasks: &mut JoinSet<Result<()>>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            res = regular_tasks.join_next() => {
+                match res {
+                    Some(res) => {
+                        if let Err(e) = res? {
+                            cancel.cancel();
+                            regular_tasks.abort_all();
+                            delayed_tasks.abort_all();
+                            return Err(e);
+                        }
+                    }
+                    None => break,
+                }
+            }
+            () = cancel.cancelled() => {
+                regular_tasks.abort_all();
+                delayed_tasks.abort_all();
+                return Err(Error::Cancelled("user interruption".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn wait_for_delayed_tasks(
+    delayed_tasks: &mut JoinSet<Result<()>>,
+    cancel: &CancellationToken,
+) -> Result<()> {
+    loop {
+        tokio::select! {
+            res = delayed_tasks.join_next() => {
+                match res {
+                    Some(res) => {
+                        if let Err(e) = res? {
+                            cancel.cancel();
+                            delayed_tasks.abort_all();
+                            return Err(e);
+                        }
+                    }
+                    None => break,
+                }
+            }
+            () = cancel.cancelled() => {
+                delayed_tasks.abort_all();
+                return Err(Error::Cancelled("user interruption".into()));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn confirm_delayed_part(
+    config: &Config,
+    mp: &MultiProgress,
+    cancel: &CancellationToken,
+    delayed_tasks: &mut JoinSet<Result<()>>,
+) -> Result<()> {
+    if config.confirm_delayed {
+        let confirmed = mp.suspend(|| {
+            use std::io::{self, Write};
+            print!("\nRegular phase finished. Continue with delayed migration? [y/N]: ");
+            let _ = io::stdout().flush();
+            let mut input = String::new();
+            if io::stdin().read_line(&mut input).is_ok() {
+                input.trim().to_lowercase() == "y"
+            } else {
+                false
+            }
+        });
+
+        if !confirmed {
+            cancel.cancel();
+            delayed_tasks.abort_all();
+            return Err(Error::Cancelled(
+                "User declined to continue delayed migration".into(),
+            ));
+        }
+    }
     Ok(())
 }
