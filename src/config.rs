@@ -536,8 +536,94 @@ pub fn validate_exclude_patterns(patterns: &[String]) -> Result<()> {
 }
 
 #[cfg(test)]
+pub fn get_test_config(toml_config: TomlConfig) -> Arc<Config> {
+    build_config_with_toml(toml_config)
+}
+
+#[cfg(test)]
+fn build_config_with_toml(toml_config: TomlConfig) -> Arc<Config> {
+    let verify_concurrency = toml_config.verify_concurrency.max(1);
+    let dump_parallel = toml_config
+        .dump_parallel
+        .unwrap_or(toml_config.max_parallel)
+        .max(1);
+    let restore_parallel = toml_config
+        .restore_parallel
+        .unwrap_or(toml_config.max_parallel)
+        .max(1);
+
+    let ssl_mode = tokio_postgres::config::SslMode::Prefer;
+    let ssl_mode_label = "prefer";
+
+    let copy_rules = toml_config.copy_rules.unwrap_or_default();
+    let delay_table_data = toml_config.delay_table_data.unwrap_or_default();
+    let exclude = toml_config.exclude.unwrap_or_default();
+
+    let exclude_patterns = exclude
+        .iter()
+        .filter_map(|s| TablePattern::parse(s))
+        .collect();
+    let deferred_patterns = deferred_table_patterns_iter(&delay_table_data, &copy_rules)
+        .filter_map(TablePattern::parse)
+        .collect();
+    let copy_rule_patterns = copy_rules
+        .iter()
+        .filter_map(|r| TablePattern::parse(&r.table))
+        .collect();
+
+    Arc::new(Config {
+        source: db::DbArgs {
+            host: "localhost".into(),
+            port: 5432,
+            user: "postgres".into(),
+            pass: "pass".into(),
+        },
+        source_db: "postgres".to_string(),
+        destination: db::DbArgs {
+            host: "localhost".into(),
+            port: 5432,
+            user: "postgres".into(),
+            pass: "pass".into(),
+        },
+        destination_db: "postgres".to_string(),
+        dump_jobs: toml_config.dump_jobs,
+        restore_jobs: toml_config.restore_jobs,
+        restore_single_transaction: toml_config.restore_single_transaction,
+        max_parallel: toml_config.max_parallel,
+        dump_parallel,
+        restore_parallel,
+        dump_root: toml_config.dump_root.into(),
+        migrate_globals: toml_config.migrate_globals,
+        delay_table_data,
+        exclude,
+        fast_verify: toml_config.fast_verify,
+        verify_concurrency,
+        pool_cache: db::PoolCache::new(ssl_mode),
+        verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
+        zstd_level: 5,
+        ssl_mode: ssl_mode_label.to_string(),
+        copy_rules,
+        confirm_delayed: false,
+        copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64
+            * 1024
+            * 1024,
+        copy_report_interval: 10 * 1024 * 1024,
+        exclude_patterns,
+        deferred_patterns,
+        copy_rule_patterns,
+    })
+}
+
+#[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{CopyRule,
+                TablePattern, TomlConfig,
+                build_config_with_toml, default_split_by_column, deferred_table_patterns_iter,
+                load_toml_config, validate_copy_rules, validate_delay_table_data,
+    };
+    use crate::error::{Error, Result};
+    use std::path::Path;
+    use wildmatch::WildMatch;
 
     fn copy_rule(table: &str) -> CopyRule {
         CopyRule {
@@ -548,6 +634,7 @@ mod tests {
             method: None,
         }
     }
+
 
     #[test]
     fn toml_parsing_missing_delay_table_data() -> Result<()> {
@@ -806,77 +893,5 @@ till = \"2023-03-01\"
 
         assert!(TablePattern::parse("").is_none());
     }
-
-    fn build_config_with_toml(toml_config: TomlConfig) -> Arc<Config> {
-        let verify_concurrency = toml_config.verify_concurrency.max(1);
-        let dump_parallel = toml_config
-            .dump_parallel
-            .unwrap_or(toml_config.max_parallel)
-            .max(1);
-        let restore_parallel = toml_config
-            .restore_parallel
-            .unwrap_or(toml_config.max_parallel)
-            .max(1);
-
-        let ssl_mode = tokio_postgres::config::SslMode::Prefer;
-        let ssl_mode_label = "prefer";
-
-        let copy_rules = toml_config.copy_rules.unwrap_or_default();
-        let delay_table_data = toml_config.delay_table_data.unwrap_or_default();
-        let exclude = toml_config.exclude.unwrap_or_default();
-
-        let exclude_patterns = exclude
-            .iter()
-            .filter_map(|s| TablePattern::parse(s))
-            .collect();
-        let deferred_patterns = deferred_table_patterns_iter(&delay_table_data, &copy_rules)
-            .filter_map(TablePattern::parse)
-            .collect();
-        let copy_rule_patterns = copy_rules
-            .iter()
-            .filter_map(|r| TablePattern::parse(&r.table))
-            .collect();
-
-        Arc::new(Config {
-            source: db::DbArgs {
-                host: "localhost".into(),
-                port: 5432,
-                user: "postgres".into(),
-                pass: "pass".into(),
-            },
-            source_db: "postgres".to_string(),
-            destination: db::DbArgs {
-                host: "localhost".into(),
-                port: 5432,
-                user: "postgres".into(),
-                pass: "pass".into(),
-            },
-            destination_db: "postgres".to_string(),
-            dump_jobs: toml_config.dump_jobs,
-            restore_jobs: toml_config.restore_jobs,
-            restore_single_transaction: toml_config.restore_single_transaction,
-            max_parallel: toml_config.max_parallel,
-            dump_parallel,
-            restore_parallel,
-            dump_root: toml_config.dump_root.into(),
-            migrate_globals: toml_config.migrate_globals,
-            delay_table_data,
-            exclude,
-            fast_verify: toml_config.fast_verify,
-            verify_concurrency,
-            pool_cache: db::PoolCache::new(ssl_mode),
-            verify_sem: Arc::new(Semaphore::new(verify_concurrency)),
-            zstd_level: 5,
-            ssl_mode: ssl_mode_label.to_string(),
-            copy_rules,
-            confirm_delayed: false,
-            copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64
-                * 1024
-                * 1024,
-            copy_report_interval: 10 * 1024 * 1024,
-            exclude_patterns,
-            deferred_patterns,
-            copy_rule_patterns,
-        })
-    }
 }
+

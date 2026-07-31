@@ -1,8 +1,8 @@
-use crate::Config;
 use crate::db::DbArgs;
 use crate::error::{Error, Result};
 use crate::tui::render_verification_report;
 use crate::verify_dir;
+use crate::{Config, db};
 use futures::stream::{self, StreamExt};
 use log::{info, warn};
 use std::collections::{BTreeMap, HashSet};
@@ -172,7 +172,7 @@ pub async fn stat_counts(
                     res = verify_sem.clone().acquire_owned() => res?,
                     () = cancel.cancelled() => return Err(Error::Cancelled("waiting for verify slot".into())),
                 };
-                let quoted_table = crate::db::quote_table_name(&format!("{schema}.{table}"));
+                let quoted_table = db::quote_table_name(&format!("{schema}.{table}"));
                 let count_query = format!("SELECT count(*) FROM {quoted_table}");
                 let count: i64 = tokio::select! {
                     res = pool.query_one(&count_query, &[]) => res?.get(0),

@@ -1,6 +1,7 @@
 use crate::copy_engine::error::{CopyEngineError, Result};
 use crate::copy_engine::splitter::Partition;
 use crate::copy_engine::worker::Worker;
+use crate::{copy_engine, db, tls};
 use log::{error, info};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
@@ -77,8 +78,8 @@ impl Orchestrator {
     /// Returns an error if the connection fails, the probe fails for a reason
     /// other than a missing table, or the table is not visible.
     async fn ensure_table_visible(&self, config: &str, side: &'static str) -> Result<()> {
-        let _permit = crate::copy_engine::acquire(&self.semaphore, &self.cancel).await?;
-        let (client, connection) = tokio_postgres::connect(config, crate::tls::make_tls()).await?;
+        let _permit = copy_engine::acquire(&self.semaphore, &self.cancel).await?;
+        let (client, connection) = tokio_postgres::connect(config, tls::make_tls()).await?;
         tokio::spawn(async move {
             if let Err(e) = connection.await {
                 error!("{side} preflight connection error: {e}");
@@ -90,7 +91,7 @@ impl Orchestrator {
             .await?
             .get(0);
 
-        let quoted_table = crate::db::quote_table_name(&self.table_name);
+        let quoted_table = db::quote_table_name(&self.table_name);
         let probe = format!("SELECT 1 FROM {quoted_table} LIMIT 0");
         if let Err(e) = client.simple_query(&probe).await {
             if e.as_db_error().map(tokio_postgres::error::DbError::code)

@@ -65,12 +65,49 @@ async fn main() -> Result<()> {
 }
 
 /// A single copy-engine migration target: the table to copy and how to split it.
+#[derive(Copy, Clone, Debug)]
 pub struct CopyTarget<'a> {
     pub table: &'a str,
     pub column: &'a str,
     pub from: Option<&'a str>,
     pub till: Option<&'a str>,
     pub method: Option<&'a str>,
+}
+
+impl CopyTarget<'_> {
+    #[must_use]
+    pub fn to_owned(&self) -> CopyTargetOwned {
+        CopyTargetOwned {
+            table: self.table.to_string(),
+            column: self.column.to_string(),
+            from: self.from.map(str::to_string),
+            till: self.till.map(str::to_string),
+            method: self.method.map(str::to_string),
+        }
+    }
+}
+
+/// An owned version of [`CopyTarget`] for use in async blocks.
+#[derive(Clone, Debug)]
+pub struct CopyTargetOwned {
+    pub table: String,
+    pub column: String,
+    pub from: Option<String>,
+    pub till: Option<String>,
+    pub method: Option<String>,
+}
+
+impl CopyTargetOwned {
+    #[must_use]
+    pub fn as_target(&self) -> CopyTarget<'_> {
+        CopyTarget {
+            table: &self.table,
+            column: &self.column,
+            from: self.from.as_deref(),
+            till: self.till.as_deref(),
+            method: self.method.as_deref(),
+        }
+    }
 }
 
 /// Runs the copy engine for a specific table.

@@ -1,6 +1,6 @@
-use crate::Config;
 use crate::error::{Error, MigrationPhase, Result};
 use crate::state_dir;
+use crate::{Config, tls};
 use indicatif::HumanBytes;
 use log::info;
 use std::collections::HashMap;
@@ -154,7 +154,7 @@ impl PoolCache {
             .dbname(db)
             .ssl_mode(self.ssl_mode);
 
-        let tls = crate::tls::make_tls();
+        let tls = tls::make_tls();
         let (client, connection) =
             tokio::time::timeout(Duration::from_secs(30), config.connect(tls))
                 .await
@@ -225,6 +225,7 @@ pub fn delayed_done_marker(db: &str) -> Result<PathBuf> {
     Ok(state_dir()?.join(format!("{db}.delayed_done")))
 }
 
+#[cfg_attr(test, allow(dead_code))]
 pub fn copy_rule_done_marker(db: &str, table: &str, hash: u64) -> Result<PathBuf> {
     Ok(state_dir()?.join(format!("{db}.{table}.copy.{hash:x}.done")))
 }
@@ -752,7 +753,7 @@ async fn apply_globals(
 
     let (client, connection) = tokio::time::timeout(
         Duration::from_secs(30),
-        db_config.connect(crate::tls::make_tls()),
+        db_config.connect(tls::make_tls()),
     )
     .await
     .map_err(|_| {

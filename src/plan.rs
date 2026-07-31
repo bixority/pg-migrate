@@ -1,5 +1,6 @@
+use crate::config::CopyRule;
 use crate::copy_engine::Splitter;
-use crate::{Config, Error, Result};
+use crate::{Config, Error, Result, db};
 use indicatif::HumanBytes;
 use log::{info, warn};
 use std::collections::HashSet;
@@ -256,7 +257,7 @@ async fn resolve_range(
     config: &Config,
     db_name: &str,
     table_name: &str,
-    rule: &crate::config::CopyRule,
+    rule: &CopyRule,
     cancel: &CancellationToken,
 ) -> Result<(Option<String>, Option<String>)> {
     let from = rule.from.clone();
@@ -275,8 +276,8 @@ async fn resolve_range(
         () = cancel.cancelled() => return Err(Error::Cancelled("planning interrupted".into())),
     };
 
-    let quoted_column = crate::db::quote_ident(&rule.split_by_column);
-    let quoted_table = crate::db::quote_table_name(table_name);
+    let quoted_column = db::quote_ident(&rule.split_by_column);
+    let quoted_table = db::quote_table_name(table_name);
     let query = format!("SELECT min({quoted_column})::text FROM {quoted_table}");
     let from: Option<String> = pool.query_one(&query, &[]).await?.get(0);
     if let Some(ref f) = from {

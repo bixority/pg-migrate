@@ -1,6 +1,7 @@
 use crate::copy_engine::error::{CopyEngineError, CopyFailure, Result};
 use crate::copy_engine::orchestrator::ProgressEvent;
 use crate::copy_engine::splitter::Partition;
+use crate::{copy_engine, db, tls};
 use futures_util::{SinkExt, StreamExt, pin_mut};
 use log::{error, info};
 use std::borrow::Cow;
@@ -103,7 +104,7 @@ impl Worker {
         config: &str,
         side: &'static str,
     ) -> Result<tokio_postgres::Client> {
-        let (client, connection) = tokio_postgres::connect(config, crate::tls::make_tls())
+        let (client, connection) = tokio_postgres::connect(config, tls::make_tls())
             .await
             .map_err(|e| {
                 self.copy_failed(
@@ -148,7 +149,7 @@ impl Worker {
             return Ok(0);
         };
 
-        let _permit = crate::copy_engine::acquire(&semaphore, &cancel).await?;
+        let _permit = copy_engine::acquire(&semaphore, &cancel).await?;
 
         let mut client_src = self.connect_side(&self.source_config, "source").await?;
         let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
@@ -333,7 +334,7 @@ impl Worker {
     /// Builds the `COPY` queries for the source and destination databases based
     /// on the partition's method and range/index.
     fn build_copy_queries(&self, partition: &Partition) -> Result<(String, String)> {
-        let quoted_column = crate::db::quote_ident(&partition.column);
+        let quoted_column = db::quote_ident(&partition.column);
         let conditions: Vec<String> =
             if &*partition.method == "hash" {
                 let i = partition.from.as_ref().ok_or_else(|| {
@@ -366,7 +367,7 @@ impl Worker {
             format!(" WHERE {}", conditions.join(" AND "))
         };
 
-        let quoted_table = crate::db::quote_table_name(&self.table_name);
+        let quoted_table = db::quote_table_name(&self.table_name);
         let source_query = format!("COPY (SELECT * FROM {quoted_table}{where_clause}) TO STDOUT");
         let dest_query = format!("COPY {quoted_table} FROM STDIN");
 

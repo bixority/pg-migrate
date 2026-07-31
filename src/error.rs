@@ -1,3 +1,4 @@
+use crate::copy_engine;
 use std::borrow::Cow;
 use std::fmt;
 use thiserror::Error;
@@ -84,7 +85,7 @@ pub enum Error {
     LockPoisoned(Cow<'static, str>),
 
     #[error("Copy engine error: {0}")]
-    CopyEngine(#[from] crate::copy_engine::error::CopyEngineError),
+    CopyEngine(#[from] copy_engine::error::CopyEngineError),
 
     #[error("Environment error: {0}")]
     Env(Cow<'static, str>),
