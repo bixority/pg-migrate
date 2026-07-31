@@ -130,6 +130,7 @@ pub enum Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 impl Error {
+    #[must_use]
     pub fn with_context(
         self,
         database: impl Into<Cow<'static, str>>,

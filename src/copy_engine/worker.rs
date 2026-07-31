@@ -12,12 +12,12 @@ use tokio_postgres::{Error as PgError, Transaction};
 use tokio_util::sync::CancellationToken;
 
 pub struct Worker {
-    id: usize,
-    source_config: Arc<str>,
-    dest_config: Arc<str>,
-    table_name: Arc<str>,
-    buffer_size: u64,
-    report_interval: u64,
+    pub id: usize,
+    pub source_config: Arc<str>,
+    pub dest_config: Arc<str>,
+    pub table_name: Arc<str>,
+    pub buffer_size: u64,
+    pub report_interval: u64,
 }
 
 impl Worker {
@@ -372,26 +372,5 @@ impl Worker {
         let dest_query = format!("COPY {quoted_table} FROM STDIN");
 
         Ok((source_query, dest_query))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_worker_new() {
-        let worker = Worker::new(
-            1,
-            Arc::from("src"),
-            Arc::from("dest"),
-            Arc::from("table"),
-            32 * 1024 * 1024,
-            10 * 1024 * 1024,
-        );
-        assert_eq!(worker.id, 1);
-        assert_eq!(&*worker.source_config, "src");
-        assert_eq!(&*worker.dest_config, "dest");
-        assert_eq!(&*worker.table_name, "table");
     }
 }

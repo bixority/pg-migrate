@@ -31,14 +31,14 @@ pub struct CopySettings {
 }
 
 pub struct Orchestrator {
-    source_config: Arc<str>,
-    dest_config: Arc<str>,
-    table_name: Arc<str>,
-    worker_count: usize,
-    buffer_size: u64,
-    report_interval: u64,
-    semaphore: Arc<Semaphore>,
-    cancel: CancellationToken,
+    pub source_config: Arc<str>,
+    pub dest_config: Arc<str>,
+    pub table_name: Arc<str>,
+    pub worker_count: usize,
+    pub buffer_size: u64,
+    pub report_interval: u64,
+    pub semaphore: Arc<Semaphore>,
+    pub cancel: CancellationToken,
 }
 
 impl Orchestrator {
@@ -222,53 +222,5 @@ impl Orchestrator {
         );
 
         Ok(total_bytes)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn test_orchestrator_new() {
-        let sem = Arc::new(Semaphore::new(1));
-        let cancel = CancellationToken::new();
-        let orch = Orchestrator::new(
-            "src",
-            "dest",
-            "table",
-            CopySettings {
-                worker_count: 4,
-                buffer_size: 32 * 1024 * 1024,
-                report_interval: 10 * 1024 * 1024,
-            },
-            sem,
-            cancel,
-        );
-        assert_eq!(&*orch.source_config, "src");
-        assert_eq!(&*orch.dest_config, "dest");
-        assert_eq!(&*orch.table_name, "table");
-        assert_eq!(orch.worker_count, 4);
-    }
-
-    #[tokio::test]
-    async fn test_orchestrator_empty_partitions() -> Result<()> {
-        let sem = Arc::new(Semaphore::new(1));
-        let cancel = CancellationToken::new();
-        let orch = Orchestrator::new(
-            "src",
-            "dest",
-            "table",
-            CopySettings {
-                worker_count: 4,
-                buffer_size: 32 * 1024 * 1024,
-                report_interval: 10 * 1024 * 1024,
-            },
-            sem,
-            cancel,
-        );
-        let result = orch.run(vec![], |_| {}).await?;
-        assert_eq!(result, 0);
-        Ok(())
     }
 }
