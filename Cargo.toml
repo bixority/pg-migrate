@@ -16,7 +16,7 @@ cli = ["dep:clap"]
 
 [dependencies]
 chrono = "0.4.45"
-clap = { version = "4.6.4", features = ["derive"], optional = true }
+clap = { version = "4.6.5", features = ["derive"], optional = true }
 env_logger = "0.11.11"
 futures = { version = "0.3.33", default-features = false, features = ["std", "async-await"] }
 futures-util = "0.3.33"
