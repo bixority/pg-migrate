@@ -1,4 +1,7 @@
-use pg_migrate::config::{CopyRule, TablePattern, TomlConfig, get_test_config, validate_copy_rules, validate_delay_table_data};
+use pg_migrate::config::{
+    CopyRule, TablePattern, TomlConfig, get_test_config, validate_copy_rules,
+    validate_delay_table_data,
+};
 use pg_migrate::error::{Error, Result};
 use wildmatch::WildMatch;
 

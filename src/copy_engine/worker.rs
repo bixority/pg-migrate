@@ -333,9 +333,9 @@ impl Worker {
 
     /// Builds the `COPY` queries for the source and destination databases based
     /// on the partition's method and range/index.
-    fn build_copy_queries(&self, partition: &Partition) -> Result<(String, String)> {
+    pub fn build_copy_queries(&self, partition: &Partition) -> Result<(String, String)> {
         let quoted_column = db::quote_ident(&partition.column);
-        let conditions: Vec<String> =
+        let mut conditions: Vec<String> =
             if &*partition.method == "hash" {
                 let i = partition.from.as_ref().ok_or_else(|| {
                     CopyEngineError::Splitter("Hash partition missing index".into())
@@ -361,6 +361,12 @@ impl Worker {
                 .flatten()
                 .collect()
             };
+
+        if partition.include_nulls
+            && let Some(last) = conditions.pop()
+        {
+            conditions.push(format!("({last} OR {quoted_column} IS NULL)"));
+        }
         let where_clause = if conditions.is_empty() {
             String::new()
         } else {

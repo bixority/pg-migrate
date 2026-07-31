@@ -1,12 +1,14 @@
-mod types;
 mod client;
 pub mod dump_restore;
 mod globals;
+mod types;
 
+pub use client::{create_dbs, discover_databases};
+pub use dump_restore::{
+    copy_rule_done_marker, dump_db, dump_delayed_data, restore_db, restore_delayed_data,
+};
+pub use globals::{filter_globals_sql, migrate_globals};
 pub use types::{DbArgs, MigrationState, PoolCache, PoolKey};
-pub use client::{discover_databases, create_dbs};
-pub use dump_restore::{dump_db, restore_db, dump_delayed_data, restore_delayed_data, copy_rule_done_marker};
-pub use globals::{migrate_globals, filter_globals_sql};
 
 /// Quotes a `PostgreSQL` identifier (table name, column name, etc.) by wrapping
 /// it in double quotes and escaping any existing double quotes.

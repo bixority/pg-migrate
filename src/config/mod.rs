@@ -208,9 +208,7 @@ fn build_config_with_toml(toml_config: TomlConfig) -> Arc<Config> {
         ssl_mode: ssl_mode_label.to_string(),
         copy_rules,
         confirm_delayed: false,
-        copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64
-            * 1024
-            * 1024,
+        copy_buffer_size: toml_config.copy_buffer_size_mb.unwrap_or(32).max(1) as u64 * 1024 * 1024,
         copy_report_interval: 10 * 1024 * 1024,
         exclude_patterns,
         deferred_patterns,

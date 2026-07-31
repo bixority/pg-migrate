@@ -1,7 +1,7 @@
-use pg_migrate::tui::{MigrationStates, render_verification_report};
 use pg_migrate::plan::{CopyRulePlan, DatabasePlan, MigrationPlan};
-use std::sync::Arc;
+use pg_migrate::tui::{MigrationStates, render_verification_report};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 fn db_plan(name: &str, delayed: Vec<String>, copy: Vec<CopyRulePlan>) -> DatabasePlan {
     DatabasePlan {

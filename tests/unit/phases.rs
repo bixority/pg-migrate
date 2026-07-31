@@ -1,9 +1,9 @@
-use pg_migrate::error::{Error, MigrationPhase};
-use pg_migrate::phases::{wait_for_delayed_tasks, PipelineArgs};
-use pg_migrate::phases::delayed::run_delayed_pipeline_steps_internal;
-use pg_migrate::phases::copy::migrate_copy_rules_internal;
-use pg_migrate::plan::{DatabasePlan, MigrationPlan, CopyRulePlan};
 use pg_migrate::config::{TomlConfig, get_test_config};
+use pg_migrate::error::{Error, MigrationPhase};
+use pg_migrate::phases::copy::migrate_copy_rules_internal;
+use pg_migrate::phases::delayed::run_delayed_pipeline_steps_internal;
+use pg_migrate::phases::{PipelineArgs, wait_for_delayed_tasks};
+use pg_migrate::plan::{CopyRulePlan, DatabasePlan, MigrationPlan};
 use pg_migrate::tui;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,16 +42,14 @@ async fn test_wait_for_delayed_tasks_aborts_all_on_failure() {
     let mut set = JoinSet::new();
     let cancel = CancellationToken::new();
 
-    set.spawn(async { 
+    set.spawn(async {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        Ok(()) 
+        Ok(())
     });
-    set.spawn(async { 
-        Err(Error::Config("worker failed".into())) 
-    });
+    set.spawn(async { Err(Error::Config("worker failed".into())) });
 
     let res = wait_for_delayed_tasks(&mut set, &cancel).await;
-    
+
     assert!(res.is_err());
     assert!(cancel.is_cancelled());
 }
@@ -68,7 +66,7 @@ async fn test_migrate_copy_rules_internal_failure() {
     };
     let states = tui::shared_migration_states(&plan);
     let cancel = CancellationToken::new();
-    
+
     let config = get_test_config(TomlConfig {
         max_parallel: 2,
         ..Default::default()
@@ -89,8 +87,9 @@ async fn test_migrate_copy_rules_internal_failure() {
                     Ok(())
                 }
             })
-        }
-    ).await;
+        },
+    )
+    .await;
 
     assert!(res.is_err());
 }
@@ -100,13 +99,13 @@ async fn test_run_delayed_pipeline_ui_update_on_failure() {
     let mut db_plan_raw = mock_db_plan("test_db");
     db_plan_raw.copy_rules.push(mock_copy_rule("table1"));
     let db_plan = Arc::new(db_plan_raw);
-    
+
     let plan = MigrationPlan {
         databases: vec![db_plan.clone()],
     };
     let states = tui::shared_migration_states(&plan);
     let cancel = CancellationToken::new();
-    
+
     let args = PipelineArgs {
         config: get_test_config(TomlConfig::default()),
         db_plan,
@@ -118,16 +117,17 @@ async fn test_run_delayed_pipeline_ui_update_on_failure() {
 
     let (_proceed_tx, proceed_rx) = watch::channel(true);
 
-    let res = run_delayed_pipeline_steps_internal(
-        args,
-        proceed_rx,
-        |_args, _proceed| async {
-            Err(Error::Config("something failed".into()))
-        }
-    ).await;
+    let res = run_delayed_pipeline_steps_internal(args, proceed_rx, |_args, _proceed| async {
+        Err(Error::Config("something failed".into()))
+    })
+    .await;
 
     assert!(res.is_err());
-    
-    let (phase, _step) = states.lock().expect("lock poisoned").get_state("test_db (delayed)").expect("row should exist");
+
+    let (phase, _step) = states
+        .lock()
+        .expect("lock poisoned")
+        .get_state("test_db (delayed)")
+        .expect("row should exist");
     assert_eq!(phase, MigrationPhase::Failed);
 }

@@ -1,5 +1,5 @@
-use pg_migrate::copy_engine::splitter::{Partition, Splitter, parse_ts};
 use pg_migrate::copy_engine::Result;
+use pg_migrate::copy_engine::splitter::{Partition, Splitter, parse_ts};
 
 #[test]
 fn test_partition_display_bounded() {
@@ -8,6 +8,7 @@ fn test_partition_display_bounded() {
         from: Some("2023-01-01".to_string()),
         till: Some("2023-01-02".to_string()),
         method: "time".into(),
+        include_nulls: false,
     };
     assert_eq!(format!("{p}"), "created_at [2023-01-01 - 2023-01-02)");
 }
@@ -19,8 +20,9 @@ fn test_partition_display_unbounded() {
         from: None,
         till: None,
         method: "time".into(),
+        include_nulls: true,
     };
-    assert_eq!(format!("{p}"), "created_at [-∞ - +∞)");
+    assert_eq!(format!("{p}"), "created_at [-∞ - +∞) + NULLs");
 }
 
 #[test]
@@ -30,6 +32,7 @@ fn test_partition_display_half_open() {
         from: Some("2023-01-01".to_string()),
         till: None,
         method: "time".into(),
+        include_nulls: false,
     };
     assert_eq!(format!("{from_only}"), "ts [2023-01-01 - +∞)");
 
@@ -38,8 +41,9 @@ fn test_partition_display_half_open() {
         from: None,
         till: Some("2024-01-01".to_string()),
         method: "time".into(),
+        include_nulls: true,
     };
-    assert_eq!(format!("{till_only}"), "ts [-∞ - 2024-01-01)");
+    assert_eq!(format!("{till_only}"), "ts [-∞ - 2024-01-01) + NULLs");
 }
 
 #[test]
@@ -319,8 +323,7 @@ fn test_split_by_date_partial_edges() -> Result<()> {
 
 #[test]
 fn test_split_by_date_day_alias() -> Result<()> {
-    let partitions =
-        Splitter::split("ts", Some("2023-01-01"), Some("2023-01-03"), Some("day"), 4)?;
+    let partitions = Splitter::split("ts", Some("2023-01-01"), Some("2023-01-03"), Some("day"), 4)?;
     assert_eq!(partitions.len(), 2);
     assert_eq!(&*partitions[0].method, "day");
     Ok(())
@@ -345,10 +348,13 @@ fn test_split_hash() -> Result<()> {
     assert_eq!(partitions.len(), 3);
     assert_eq!(partitions[0].from.as_deref(), Some("0"));
     assert_eq!(partitions[0].till.as_deref(), Some("3"));
+    assert!(partitions[0].include_nulls);
     assert_eq!(&*partitions[0].method, "hash");
     assert_eq!(partitions[1].from.as_deref(), Some("1"));
     assert_eq!(partitions[1].till.as_deref(), Some("3"));
+    assert!(!partitions[1].include_nulls);
     assert_eq!(partitions[2].from.as_deref(), Some("2"));
     assert_eq!(partitions[2].till.as_deref(), Some("3"));
+    assert!(!partitions[2].include_nulls);
     Ok(())
 }

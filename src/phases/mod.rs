@@ -1,7 +1,7 @@
-use crate::error::{Result, Error};
+use crate::Config;
+use crate::error::{Error, Result};
 use crate::plan::MigrationPlan;
 use crate::tui::SharedMigrationStates;
-use crate::Config;
 use indicatif::MultiProgress;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -9,9 +9,9 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
-pub mod regular;
-pub mod delayed;
 pub mod copy;
+pub mod delayed;
+pub mod regular;
 
 pub use regular::phase_migrate_one;
 
@@ -88,7 +88,10 @@ pub async fn phase_migrate_all(
     Ok((regular_duration, total_duration))
 }
 
-pub(crate) async fn acquire(sem: &Arc<Semaphore>, cancel: &CancellationToken) -> Result<OwnedSemaphorePermit> {
+pub(crate) async fn acquire(
+    sem: &Arc<Semaphore>,
+    cancel: &CancellationToken,
+) -> Result<OwnedSemaphorePermit> {
     tokio::select! {
         res = sem.clone().acquire_owned() => Ok(res?),
         () = cancel.cancelled() => Err(Error::Cancelled("semaphore acquisition".into())),

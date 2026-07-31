@@ -1,13 +1,13 @@
+use super::{PipelineArgs, acquire};
+use crate::Config;
 use crate::db;
 use crate::error::{Error, MigrationPhase, Result};
 use crate::plan::DatabasePlan;
 use crate::tui::SharedMigrationStates;
 use crate::verification;
-use crate::Config;
 use std::sync::Arc;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_util::sync::CancellationToken;
-use super::{PipelineArgs, acquire};
 
 pub async fn run_regular_pipeline(
     args: PipelineArgs,

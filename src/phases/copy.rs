@@ -1,13 +1,13 @@
-use crate::{run_copy_engine, CopyTarget};
 #[cfg(not(test))]
 use crate::db;
 use crate::error::{Error, MigrationPhase, Result};
 use crate::plan::DatabasePlan;
 use crate::tui::SharedMigrationStates;
 use crate::{Config, copy_engine};
+use crate::{CopyTarget, run_copy_engine};
 use indicatif::HumanBytes;
-use std::sync::Arc;
 use std::future::Future;
+use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;

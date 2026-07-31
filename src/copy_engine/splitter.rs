@@ -9,6 +9,7 @@ pub struct Partition {
     pub till: Option<String>,
     pub column: Arc<str>,
     pub method: Arc<str>,
+    pub include_nulls: bool,
 }
 
 impl Display for Partition {
@@ -16,11 +17,13 @@ impl Display for Partition {
         if &*self.method == "hash" {
             let i = self.from.as_deref().unwrap_or("?");
             let n = self.till.as_deref().unwrap_or("?");
-            return write!(f, "{} [hash {}/{}]", self.column, i, n);
+            let nulls = if self.include_nulls { " + NULLs" } else { "" };
+            return write!(f, "{} [hash {}/{}{}]", self.column, i, n, nulls);
         }
         let from = self.from.as_deref().unwrap_or("-∞");
         let till = self.till.as_deref().unwrap_or("+∞");
-        write!(f, "{} [{} - {})", self.column, from, till)
+        let nulls = if self.include_nulls { " + NULLs" } else { "" };
+        write!(f, "{} [{} - {}){}", self.column, from, till, nulls)
     }
 }
 
@@ -69,6 +72,7 @@ impl Splitter {
                 from: None,
                 till: till.map(str::to_string),
                 method: method_arc,
+                include_nulls: true,
             }]);
         };
         let (upper, open_last) = resolve_upper(till);
@@ -124,6 +128,7 @@ impl Splitter {
                     from: Some(from.to_rfc3339()),
                     till: None,
                     method,
+                    include_nulls: true,
                 }]);
             }
             return Ok(vec![]);
@@ -140,10 +145,12 @@ impl Splitter {
                 from: Some(from.to_rfc3339()),
                 till: last_till,
                 method,
+                include_nulls: true,
             }]);
         }
 
         let mut partitions = Vec::with_capacity(num_partitions);
+
         for i in 0..num_partitions {
             let i_i64 = i64::try_from(i)
                 .map_err(|_| CopyEngineError::Splitter("Partition index is too large".into()))?;
@@ -160,6 +167,7 @@ impl Splitter {
                 from: Some(p_from.to_rfc3339()),
                 till: p_till,
                 method: method.clone(),
+                include_nulls: i == 0,
             });
         }
 
@@ -196,6 +204,7 @@ impl Splitter {
                     from: Some(from.to_rfc3339()),
                     till: None,
                     method,
+                    include_nulls: true,
                 }]);
             }
             return Ok(vec![]);
@@ -203,6 +212,7 @@ impl Splitter {
 
         let mut partitions = Vec::new();
         let mut cursor = from;
+        let mut first = true;
         while cursor < till {
             let p_till = next_utc_midnight(cursor)?.min(till);
             let is_last = p_till >= till;
@@ -215,8 +225,10 @@ impl Splitter {
                     Some(p_till.to_rfc3339())
                 },
                 method: method.clone(),
+                include_nulls: first,
             });
             cursor = p_till;
+            first = false;
         }
 
         Ok(partitions)
@@ -231,6 +243,7 @@ impl Splitter {
                 from: Some(i.to_string()),
                 till: Some(num_partitions.to_string()),
                 method: method.clone(),
+                include_nulls: i == 0,
             })
             .collect()
     }
@@ -297,4 +310,3 @@ pub fn parse_ts(ts: &str) -> Result<DateTime<Utc>> {
         "Invalid timestamp format: '{ts}'. Supported: RFC3339, 'YYYY-MM-DD HH:MM:SS[.f]', 'YYYY-MM-DD'"
     ).into()))
 }
-

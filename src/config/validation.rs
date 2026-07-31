@@ -1,5 +1,5 @@
-use crate::error::{Error, Result};
 use super::types::CopyRule;
+use crate::error::{Error, Result};
 
 pub fn parse_fully_qualified(entry: &str) -> Option<(&str, &str, &str)> {
     let mut parts = entry.split('.');

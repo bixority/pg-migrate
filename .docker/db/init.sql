@@ -28,6 +28,11 @@ BEGIN
         );
 
         EXECUTE format(
+            'INSERT INTO %I (val, created_at) VALUES (NULL, NULL), (''only val'', NULL), (NULL, ''2021-06-01 00:00:00'')',
+            t_name
+        );
+
+        EXECUTE format(
             'CREATE INDEX %I ON %I (created_at)',
             idx_name, t_name
         );

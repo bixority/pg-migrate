@@ -1,4 +1,4 @@
-use pg_migrate::copy_engine::{Orchestrator, CopySettings, Result};
+use pg_migrate::copy_engine::{CopySettings, Orchestrator, Result};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;

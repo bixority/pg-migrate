@@ -1,3 +1,4 @@
+use super::dump_restore::globals_marker;
 use crate::error::{Error, Result};
 use crate::{Config, tls};
 use log::info;
@@ -7,7 +8,6 @@ use std::time::Duration;
 use tokio::process::Command;
 use tokio::select;
 use tokio_util::sync::CancellationToken;
-use super::dump_restore::globals_marker;
 
 pub async fn migrate_globals(config: &Config, cancel: CancellationToken) -> Result<()> {
     if globals_marker()?.exists() {
@@ -37,14 +37,23 @@ async fn dump_globals(
         .kill_on_drop(true)
         .env("PGPASSWORD", &*config.source.pass)
         .args([
-            "-h", &*config.source.host,
-            "-p", &port,
-            "-U", &*config.source.user,
+            "-h",
+            &*config.source.host,
+            "-p",
+            &port,
+            "-U",
+            &*config.source.user,
             "--globals-only",
-            "-f", globals_path.to_str().ok_or_else(|| Error::InvalidPath(globals_path.display().to_string().into()))?,
+            "-f",
+            globals_path
+                .to_str()
+                .ok_or_else(|| Error::InvalidPath(globals_path.display().to_string().into()))?,
         ])
         .spawn()
-        .map_err(|e| Error::SpawnFailed { command: "pg_dumpall".into(), source: e })?;
+        .map_err(|e| Error::SpawnFailed {
+            command: "pg_dumpall".into(),
+            source: e,
+        })?;
 
     let status = select! {
         res = child.wait() => res?,
@@ -82,16 +91,18 @@ async fn apply_globals(
         .dbname(&config.destination_db)
         .ssl_mode(config.pool_cache.ssl_mode);
 
-    let (client, connection) = tokio::time::timeout(
-        Duration::from_secs(30),
-        db_config.connect(tls::make_tls()),
-    )
-    .await
-    .map_err(|_| {
-        Error::Timeout(
-            format!("to {} database {} for globals", &*config.destination.host, config.destination_db).into(),
-        )
-    })??;
+    let (client, connection) =
+        tokio::time::timeout(Duration::from_secs(30), db_config.connect(tls::make_tls()))
+            .await
+            .map_err(|_| {
+                Error::Timeout(
+                    format!(
+                        "to {} database {} for globals",
+                        &*config.destination.host, config.destination_db
+                    )
+                    .into(),
+                )
+            })??;
 
     tokio::spawn(async move {
         if let Err(e) = connection.await {
@@ -103,7 +114,9 @@ async fn apply_globals(
     let sql_normalized = sql.replace(";\r\n", ";\n");
     for stmt in sql_normalized.split(";\n") {
         let s = stmt.trim();
-        if s.is_empty() { continue; }
+        if s.is_empty() {
+            continue;
+        }
         let exec_sql = format!("{s};");
 
         let res = select! {
@@ -114,12 +127,28 @@ async fn apply_globals(
         if let Err(e) = res {
             if let Some(db_err) = e.as_db_error() {
                 let msg = db_err.message();
-                if msg.contains("already exists") || msg.contains("MD5-encrypted password") || msg.contains("MD5 password support is deprecated") {
+                if msg.contains("already exists")
+                    || msg.contains("MD5-encrypted password")
+                    || msg.contains("MD5 password support is deprecated")
+                {
                     continue;
                 }
                 return Err(Error::ProcessFailed {
                     command: "execute globals statement".into(),
-                    stderr: format!("Error [{}]: {}{}{}\n  statement: {s}", db_err.code().code(), msg, db_err.detail().map(|d| format!(" (detail: {d})")).unwrap_or_default(), db_err.hint().map(|h| format!(" (hint: {h})")).unwrap_or_default()).into(),
+                    stderr: format!(
+                        "Error [{}]: {}{}{}\n  statement: {s}",
+                        db_err.code().code(),
+                        msg,
+                        db_err
+                            .detail()
+                            .map(|d| format!(" (detail: {d})"))
+                            .unwrap_or_default(),
+                        db_err
+                            .hint()
+                            .map(|h| format!(" (hint: {h})"))
+                            .unwrap_or_default()
+                    )
+                    .into(),
                 });
             }
             return Err(Error::ProcessFailed {
@@ -144,10 +173,14 @@ pub fn filter_globals_sql(content: &str, dest_user: &str) -> String {
 
     for line in content.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with('\\') { continue; }
+        if trimmed.starts_with('\\') {
+            continue;
+        }
 
         if (line.starts_with("CREATE ROLE ") || line.starts_with("ALTER ROLE "))
-            && patterns.iter().any(|p| line.contains(p) || line.ends_with(p))
+            && patterns
+                .iter()
+                .any(|p| line.contains(p) || line.ends_with(p))
         {
             info!("Skipping migration of role '{dest_user}' to avoid password overwrite.");
             continue;

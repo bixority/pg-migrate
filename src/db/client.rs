@@ -1,5 +1,5 @@
-use crate::error::{Error, Result};
 use crate::Config;
+use crate::error::{Error, Result};
 use tokio::select;
 use tokio_util::sync::CancellationToken;
 

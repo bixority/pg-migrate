@@ -1,4 +1,4 @@
-use pg_migrate::tls::{parse_ssl_mode, ssl_mode_str, make_tls};
+use pg_migrate::tls::{make_tls, parse_ssl_mode, ssl_mode_str};
 use tokio_postgres::config::SslMode;
 
 #[test]

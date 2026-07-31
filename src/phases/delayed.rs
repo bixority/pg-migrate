@@ -1,12 +1,12 @@
+use super::{PipelineArgs, acquire, copy};
+use crate::Config;
 use crate::db;
 use crate::error::{Error, MigrationPhase, Result};
 use crate::tui::SharedMigrationStates;
 use crate::verification;
-use crate::Config;
 use std::sync::Arc;
 use tokio::sync::{Semaphore, watch};
 use tokio_util::sync::CancellationToken;
-use super::{PipelineArgs, acquire, copy};
 
 pub async fn run_delayed_pipeline(
     args: PipelineArgs,
