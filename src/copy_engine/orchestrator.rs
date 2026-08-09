@@ -92,8 +92,7 @@ impl Orchestrator {
                 &[],
             )
             .await
-            .map(|row| row.get(0))
-            .unwrap_or(false);
+            .is_ok_and(|row| row.get(0));
 
         let quoted_table = db::quote_table_name(&self.table_name);
         let filter_generated = if has_attgenerated {
