@@ -1,4 +1,4 @@
-use pg_migrate::db::{filter_globals_sql, quote_ident, quote_table_name};
+use pg_migrate::db::{filter_globals_sql, quote_ident, quote_literal, quote_table_name, DiscoveredDb};
 
 #[test]
 fn test_filter_globals_sql() {
@@ -58,4 +58,29 @@ fn test_quote_table_name() {
         quote_table_name("my schema.my table"),
         "\"my schema\".\"my table\""
     );
+}
+
+#[test]
+fn test_quote_literal() {
+    assert_eq!(quote_literal("UTF8"), "'UTF8'");
+    assert_eq!(quote_literal("en_US.UTF-8"), "'en_US.UTF-8'");
+    assert_eq!(quote_literal("O'Reilly"), "'O''Reilly'");
+}
+
+#[test]
+fn test_discovered_db_struct() {
+    let db = DiscoveredDb {
+        name: "mydb".to_string(),
+        size: 1024,
+        encoding: "UTF8".to_string(),
+        datcollate: "en_US.UTF-8".to_string(),
+        datctype: "en_US.UTF-8".to_string(),
+        owner: "dev".to_string(),
+    };
+    assert_eq!(db.name, "mydb");
+    assert_eq!(db.size, 1024);
+    assert_eq!(db.encoding, "UTF8");
+    assert_eq!(db.datcollate, "en_US.UTF-8");
+    assert_eq!(db.datctype, "en_US.UTF-8");
+    assert_eq!(db.owner, "dev");
 }

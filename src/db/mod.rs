@@ -3,7 +3,7 @@ pub mod dump_restore;
 mod globals;
 mod types;
 
-pub use client::{create_dbs, discover_databases};
+pub use client::{create_dbs, discover_databases, DiscoveredDb};
 pub use dump_restore::{
     copy_rule_done_marker, dump_db, dump_delayed_data, restore_db, restore_delayed_data,
 };
@@ -24,4 +24,11 @@ pub fn quote_table_name(name: &str) -> String {
         .map(quote_ident)
         .collect::<Vec<_>>()
         .join(".")
+}
+
+/// Quotes a string literal for `PostgreSQL` by wrapping it in single quotes
+/// and escaping any existing single quotes.
+#[must_use]
+pub fn quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }

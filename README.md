@@ -200,7 +200,7 @@ Per-server, before any database:
 1. **Preparation** — create `$HOME/pg_migrate_state` and `$HOME/pg_verify_state`.
 2. **Discovery** — list user databases on the source via `pg_database`, ordered by size ascending.
 3. **Globals** (when `migrate_globals = true`) — `pg_dumpall --globals-only`, filter out `CREATE/ALTER ROLE` lines that would overwrite the destination superuser, and execute the rest. Existing-object errors (and deprecated-MD5-password warnings) are tolerated.
-4. **Database creation** — `CREATE DATABASE` for every discovered database on the target (already-exists errors are warned and ignored).
+4. **Database creation** — `CREATE DATABASE` for every discovered database on the target, setting its owner, encoding, collation, and ctype to match the source (already-exists errors are warned and ignored).
 5. **Planning** — query the source catalog and classify every table as **regular**, **delayed**, or **copy-engine** (copy wins over delayed, delayed wins over regular). The plan is printed before migration starts.
 
 Then, in parallel (bounded by the concurrency knobs), each database runs through a **regular phase**:

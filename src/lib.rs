@@ -159,12 +159,12 @@ pub async fn run_migration_workflow(
         cancel_signal.cancel();
     });
 
-    let dbs_with_sizes = db::discover_databases(&config, cancel.clone()).await?;
-    let dbs_with_sizes: Vec<(String, u64)> = dbs_with_sizes
+    let discovered_dbs = db::discover_databases(&config, cancel.clone()).await?;
+    let discovered_dbs: Vec<db::DiscoveredDb> = discovered_dbs
         .into_iter()
-        .filter(|(name, _)| {
-            if config.is_db_excluded(name) {
-                info!("Excluding database: {name}");
+        .filter(|db| {
+            if config.is_db_excluded(&db.name) {
+                info!("Excluding database: {}", db.name);
                 false
             } else {
                 true
@@ -172,16 +172,21 @@ pub async fn run_migration_workflow(
         })
         .collect();
 
-    let db_names_owned: Vec<String> = dbs_with_sizes.iter().map(|(n, _)| n.clone()).collect();
+    let db_names_owned: Vec<String> = discovered_dbs.iter().map(|db| db.name.clone()).collect();
 
     info!("Databases: {db_names_owned:?}");
 
-    if dbs_with_sizes.is_empty() {
+    if discovered_dbs.is_empty() {
         info!("No databases found to migrate.");
         return Ok(());
     }
 
-    prepare_destination(&config, &db_names_owned, cancel.clone()).await?;
+    prepare_destination(&config, &discovered_dbs, cancel.clone()).await?;
+
+    let dbs_with_sizes: Vec<(String, u64)> = discovered_dbs
+        .iter()
+        .map(|db| (db.name.clone(), db.size))
+        .collect();
 
     let plan = plan::create_plan(config.clone(), &dbs_with_sizes, cancel.clone()).await?;
     plan.print();
@@ -265,14 +270,14 @@ fn setup_ui(
 
 async fn prepare_destination(
     config: &Config,
-    db_names: &[String],
+    dbs: &[db::DiscoveredDb],
     cancel: CancellationToken,
 ) -> Result<()> {
     if config.migrate_globals {
         db::migrate_globals(config, cancel.clone()).await?;
     }
 
-    db::create_dbs(config, db_names, cancel.clone()).await?;
+    db::create_dbs(config, dbs, cancel.clone()).await?;
     Ok(())
 }
 
