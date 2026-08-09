@@ -10,6 +10,7 @@ fn test_worker_new() {
         Arc::from("src"),
         Arc::from("dest"),
         Arc::from("table"),
+        Arc::from([]),
         32 * 1024 * 1024,
         10 * 1024 * 1024,
     );
@@ -26,6 +27,7 @@ fn test_build_copy_queries_hash_with_nulls() -> Result<()> {
         Arc::from("src"),
         Arc::from("dest"),
         Arc::from("public.table"),
+        Arc::from([Box::from("id"), Box::from("val")]),
         1024,
         1024,
     );
@@ -39,7 +41,7 @@ fn test_build_copy_queries_hash_with_nulls() -> Result<()> {
     let (source_query, _) = worker.build_copy_queries(&partition)?;
     assert_eq!(
         source_query,
-        "COPY (SELECT * FROM \"public\".\"table\" WHERE (abs(hashtext(\"val\"::text)::bigint) % 2 = 0 OR \"val\" IS NULL)) TO STDOUT"
+        "COPY (SELECT \"id\", \"val\" FROM \"public\".\"table\" WHERE (abs(hashtext(\"val\"::text)::bigint) % 2 = 0 OR \"val\" IS NULL)) TO STDOUT"
     );
     Ok(())
 }
@@ -51,6 +53,7 @@ fn test_build_copy_queries_hash_no_nulls() -> Result<()> {
         Arc::from("src"),
         Arc::from("dest"),
         Arc::from("table"),
+        Arc::from([Box::from("id"), Box::from("val")]),
         1024,
         1024,
     );
@@ -64,7 +67,7 @@ fn test_build_copy_queries_hash_no_nulls() -> Result<()> {
     let (source_query, _) = worker.build_copy_queries(&partition)?;
     assert_eq!(
         source_query,
-        "COPY (SELECT * FROM \"table\" WHERE abs(hashtext(\"val\"::text)::bigint) % 2 = 1) TO STDOUT"
+        "COPY (SELECT \"id\", \"val\" FROM \"table\" WHERE abs(hashtext(\"val\"::text)::bigint) % 2 = 1) TO STDOUT"
     );
     Ok(())
 }
@@ -76,6 +79,7 @@ fn test_build_copy_queries_range_with_nulls() -> Result<()> {
         Arc::from("src"),
         Arc::from("dest"),
         Arc::from("table"),
+        Arc::from([Box::from("id"), Box::from("val")]),
         1024,
         1024,
     );
@@ -89,7 +93,7 @@ fn test_build_copy_queries_range_with_nulls() -> Result<()> {
     let (source_query, _) = worker.build_copy_queries(&partition)?;
     assert_eq!(
         source_query,
-        "COPY (SELECT * FROM \"table\" WHERE (\"val\" < '2024-01-01' OR \"val\" IS NULL)) TO STDOUT"
+        "COPY (SELECT \"id\", \"val\" FROM \"table\" WHERE (\"val\" < '2024-01-01' OR \"val\" IS NULL)) TO STDOUT"
     );
     Ok(())
 }

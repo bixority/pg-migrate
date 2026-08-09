@@ -16,6 +16,7 @@ pub struct Worker {
     pub source_config: Arc<str>,
     pub dest_config: Arc<str>,
     pub table_name: Arc<str>,
+    pub columns: Arc<[Box<str>]>,
     pub buffer_size: u64,
     pub report_interval: u64,
 }
@@ -27,6 +28,7 @@ impl Worker {
         source_config: Arc<str>,
         dest_config: Arc<str>,
         table_name: Arc<str>,
+        columns: Arc<[Box<str>]>,
         buffer_size: u64,
         report_interval: u64,
     ) -> Self {
@@ -35,6 +37,7 @@ impl Worker {
             source_config,
             dest_config,
             table_name,
+            columns,
             buffer_size,
             report_interval,
         }
@@ -374,8 +377,17 @@ impl Worker {
         };
 
         let quoted_table = db::quote_table_name(&self.table_name);
-        let source_query = format!("COPY (SELECT * FROM {quoted_table}{where_clause}) TO STDOUT");
-        let dest_query = format!("COPY {quoted_table} FROM STDIN");
+        let quoted_columns = self
+            .columns
+            .iter()
+            .map(|c| db::quote_ident(c))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        let source_query = format!(
+            "COPY (SELECT {quoted_columns} FROM {quoted_table}{where_clause}) TO STDOUT"
+        );
+        let dest_query = format!("COPY {quoted_table} ({quoted_columns}) FROM STDIN");
 
         Ok((source_query, dest_query))
     }

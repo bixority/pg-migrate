@@ -63,20 +63,58 @@ impl Orchestrator {
         }
     }
 
-    /// Probes whether `self.table_name` is visible to a copy connection on one
-    /// `side` ("source" or "destination"), using the same unqualified name
-    /// resolution (and therefore the same `search_path`) the `COPY` will use.
-    ///
-    /// A `SELECT ... LIMIT 0` resolves the relation exactly as `COPY` does but
-    /// reads no rows, so a missing table produces Postgres' `undefined_table`
-    /// (SQLSTATE 42P01) — which is translated into a [`CopyEngineError::TableNotFound`]
-    /// carrying the side and the resolved `search_path`. Any other error (e.g.
-    /// connectivity, privileges) is surfaced verbatim.
+    /// Probes the source table to fetch its column list (excluding generated and
+    /// dropped columns) and ensure it's visible. Returns the list of column
+    /// names.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection fails, the probe fails for a reason
     /// other than a missing table, or the table is not visible.
+    async fn fetch_source_columns(&self) -> Result<Vec<String>> {
+        let _permit = copy_engine::acquire(&self.semaphore, &self.cancel).await?;
+        let (client, connection) =
+            tokio_postgres::connect(&self.source_config, tls::make_tls()).await?;
+        tokio::spawn(async move {
+            if let Err(e) = connection.await {
+                error!("source preflight connection error: {e}");
+            }
+        });
+
+        let search_path: String = client
+            .query_one("SELECT array_to_string(current_schemas(true), ', ')", &[])
+            .await?
+            .get(0);
+
+        let quoted_table = db::quote_table_name(&self.table_name);
+        let query = format!(
+            "SELECT attname FROM pg_attribute \
+             WHERE attrelid = '{quoted_table}'::regclass \
+             AND attnum > 0 AND NOT attisdropped \
+             AND (CASE WHEN EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_attribute'::regclass AND attname = 'attgenerated') \
+                  THEN attgenerated = '' ELSE true END) \
+             ORDER BY attnum"
+        );
+
+        let rows = client.query(&query, &[]).await.map_err(|e| {
+            if e.as_db_error().map(tokio_postgres::error::DbError::code)
+                == Some(&SqlState::UNDEFINED_TABLE)
+            {
+                return CopyEngineError::TableNotFound {
+                    side: "source",
+                    table: (*self.table_name).to_string().into(),
+                    search_path: search_path.into(),
+                };
+            }
+            CopyEngineError::Connection(e)
+        })?;
+
+        Ok(rows.iter().map(|r| r.get(0)).collect())
+    }
+
+    /// Probes whether `self.table_name` is visible to a copy connection on the
+    /// destination side, using the same unqualified name resolution (and
+    /// therefore the same `search_path`) the `COPY` will use.
     async fn ensure_table_visible(&self, config: &str, side: &'static str) -> Result<()> {
         let _permit = copy_engine::acquire(&self.semaphore, &self.cancel).await?;
         let (client, connection) = tokio_postgres::connect(config, tls::make_tls()).await?;
@@ -138,8 +176,13 @@ impl Orchestrator {
         // visible to the copy connection. Without this, a missing table only
         // surfaces as an opaque per-partition `COPY` error that does not say
         // which side, or why.
-        self.ensure_table_visible(&self.source_config, "source")
-            .await?;
+        let columns: Arc<[Box<str>]> = self
+            .fetch_source_columns()
+            .await?
+            .into_iter()
+            .map(String::into_boxed_str)
+            .collect();
+
         self.ensure_table_visible(&self.dest_config, "destination")
             .await?;
 
@@ -159,6 +202,7 @@ impl Orchestrator {
                 self.source_config.clone(),
                 self.dest_config.clone(),
                 self.table_name.clone(),
+                columns.clone(),
                 self.buffer_size,
                 self.report_interval,
             );
