@@ -3,7 +3,7 @@ pub mod dump_restore;
 mod globals;
 mod types;
 
-pub use client::{create_dbs, discover_databases, DiscoveredDb};
+pub use client::{DiscoveredDb, create_dbs, discover_databases};
 pub use dump_restore::{
     copy_rule_done_marker, dump_db, dump_delayed_data, restore_db, restore_delayed_data,
 };

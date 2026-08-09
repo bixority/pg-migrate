@@ -1,4 +1,6 @@
-use pg_migrate::db::{filter_globals_sql, quote_ident, quote_literal, quote_table_name, DiscoveredDb};
+use pg_migrate::db::{
+    DiscoveredDb, filter_globals_sql, quote_ident, quote_literal, quote_table_name,
+};
 
 #[test]
 fn test_filter_globals_sql() {

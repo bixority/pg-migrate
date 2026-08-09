@@ -384,9 +384,8 @@ impl Worker {
             .collect::<Vec<_>>()
             .join(", ");
 
-        let source_query = format!(
-            "COPY (SELECT {quoted_columns} FROM {quoted_table}{where_clause}) TO STDOUT"
-        );
+        let source_query =
+            format!("COPY (SELECT {quoted_columns} FROM {quoted_table}{where_clause}) TO STDOUT");
         let dest_query = format!("COPY {quoted_table} ({quoted_columns}) FROM STDIN");
 
         Ok((source_query, dest_query))
