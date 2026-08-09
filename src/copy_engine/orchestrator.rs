@@ -86,13 +86,26 @@ impl Orchestrator {
             .await?
             .get(0);
 
+        let has_attgenerated: bool = client
+            .query_one(
+                "SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_attribute'::regclass AND attname = 'attgenerated')",
+                &[],
+            )
+            .await
+            .map(|row| row.get(0))
+            .unwrap_or(false);
+
         let quoted_table = db::quote_table_name(&self.table_name);
+        let filter_generated = if has_attgenerated {
+            "AND attgenerated = '' "
+        } else {
+            ""
+        };
         let query = format!(
             "SELECT attname FROM pg_attribute \
              WHERE attrelid = '{quoted_table}'::regclass \
              AND attnum > 0 AND NOT attisdropped \
-             AND (CASE WHEN EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid = 'pg_attribute'::regclass AND attname = 'attgenerated') \
-                  THEN attgenerated = '' ELSE true END) \
+             {filter_generated}\
              ORDER BY attnum"
         );
 
