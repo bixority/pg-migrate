@@ -41,7 +41,7 @@ fn test_build_copy_queries_hash_with_nulls() -> Result<()> {
     let (source_query, _) = worker.build_copy_queries(&partition)?;
     assert_eq!(
         source_query,
-        "COPY (SELECT \"id\", \"val\" FROM \"public\".\"table\" WHERE (abs(hashtext(\"val\"::text)::bigint) % 2 = 0 OR \"val\" IS NULL)) TO STDOUT"
+        "COPY (SELECT \"id\", \"val\" FROM \"public\".\"table\" WHERE ((abs(hashtext(\"val\"::text)::bigint) % 2 = 0) OR \"val\" IS NULL)) TO STDOUT"
     );
     Ok(())
 }
@@ -93,7 +93,33 @@ fn test_build_copy_queries_range_with_nulls() -> Result<()> {
     let (source_query, _) = worker.build_copy_queries(&partition)?;
     assert_eq!(
         source_query,
-        "COPY (SELECT \"id\", \"val\" FROM \"table\" WHERE (\"val\" < '2024-01-01' OR \"val\" IS NULL)) TO STDOUT"
+        "COPY (SELECT \"id\", \"val\" FROM \"table\" WHERE ((\"val\" < '2024-01-01') OR \"val\" IS NULL)) TO STDOUT"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_build_copy_queries_range_from_till_with_nulls() -> Result<()> {
+    let worker = Worker::new(
+        1,
+        Arc::from("src"),
+        Arc::from("dest"),
+        Arc::from("table"),
+        Arc::from([Box::from("id"), Box::from("val")]),
+        1024,
+        1024,
+    );
+    let partition = Partition {
+        column: "val".into(),
+        from: Some("2023-01-01".to_string()),
+        till: Some("2024-01-01".to_string()),
+        method: "time".into(),
+        include_nulls: true,
+    };
+    let (source_query, _) = worker.build_copy_queries(&partition)?;
+    assert_eq!(
+        source_query,
+        "COPY (SELECT \"id\", \"val\" FROM \"table\" WHERE ((\"val\" >= '2023-01-01' AND \"val\" < '2024-01-01') OR \"val\" IS NULL)) TO STDOUT"
     );
     Ok(())
 }

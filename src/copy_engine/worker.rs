@@ -157,30 +157,50 @@ impl Worker {
         let mut client_src = self.connect_side(&self.source_config, "source").await?;
         let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
 
-        let tx_src = client_src.transaction().await.map_err(|e| {
-            self.copy_failed(
-                "Transaction start",
-                "source",
-                None,
-                "beginning source transaction",
-                e,
-            )
-        })?;
-        let tx_dest = client_dest.transaction().await.map_err(|e| {
-            self.copy_failed(
-                "Transaction start",
-                "destination",
-                None,
-                "beginning destination transaction",
-                e,
-            )
-        })?;
-
         let mut total_bytes = 0;
         loop {
+            let tx_src = client_src.transaction().await.map_err(|e| {
+                self.copy_failed(
+                    "Transaction start",
+                    "source",
+                    Some(&partition),
+                    "beginning source transaction",
+                    e,
+                )
+            })?;
+            let tx_dest = client_dest.transaction().await.map_err(|e| {
+                self.copy_failed(
+                    "Transaction start",
+                    "destination",
+                    Some(&partition),
+                    "beginning destination transaction",
+                    e,
+                )
+            })?;
+
             let bytes = self
                 .copy_partition(&tx_src, &tx_dest, &partition, &progress_tx)
                 .await?;
+
+            tx_src.commit().await.map_err(|e| {
+                self.copy_failed(
+                    "Transaction commit",
+                    "source",
+                    Some(&partition),
+                    "committing source transaction",
+                    e,
+                )
+            })?;
+            tx_dest.commit().await.map_err(|e| {
+                self.copy_failed(
+                    "Transaction commit",
+                    "destination",
+                    Some(&partition),
+                    "committing destination transaction",
+                    e,
+                )
+            })?;
+
             total_bytes += bytes;
             let _ = progress_tx.send(ProgressEvent::PartitionComplete).await;
 
@@ -194,25 +214,6 @@ impl Worker {
                 break;
             }
         }
-
-        tx_src.commit().await.map_err(|e| {
-            self.copy_failed(
-                "Transaction commit",
-                "source",
-                None,
-                "committing source transaction",
-                e,
-            )
-        })?;
-        tx_dest.commit().await.map_err(|e| {
-            self.copy_failed(
-                "Transaction commit",
-                "destination",
-                None,
-                "committing destination transaction",
-                e,
-            )
-        })?;
 
         Ok(total_bytes)
     }
@@ -338,7 +339,7 @@ impl Worker {
     /// on the partition's method and range/index.
     pub fn build_copy_queries(&self, partition: &Partition) -> Result<(String, String)> {
         let quoted_column = db::quote_ident(&partition.column);
-        let mut conditions: Vec<String> =
+        let conditions: Vec<String> =
             if &*partition.method == "hash" {
                 let i = partition.from.as_ref().ok_or_else(|| {
                     CopyEngineError::Splitter("Hash partition missing index".into())
@@ -365,15 +366,25 @@ impl Worker {
                 .collect()
             };
 
-        if partition.include_nulls
-            && let Some(last) = conditions.pop()
-        {
-            conditions.push(format!("({last} OR {quoted_column} IS NULL)"));
-        }
-        let where_clause = if conditions.is_empty() {
+        let mut where_body = if conditions.is_empty() {
             String::new()
         } else {
-            format!(" WHERE {}", conditions.join(" AND "))
+            conditions.join(" AND ")
+        };
+
+        if partition.include_nulls {
+            let null_cond = format!("{quoted_column} IS NULL");
+            where_body = if where_body.is_empty() {
+                null_cond
+            } else {
+                format!("(({where_body}) OR {null_cond})")
+            };
+        }
+
+        let where_clause = if where_body.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {where_body}")
         };
 
         let quoted_table = db::quote_table_name(&self.table_name);
