@@ -2,17 +2,12 @@ FROM --platform=$TARGETOS/$TARGETARCH docker.io/library/rust:1.97.1-slim-trixie 
 LABEL org.opencontainers.image.description="PostgreSQL migration tool"
 LABEL authors="Olegs Korsaks"
 
-ARG upx_version=5.2.0
 ARG TARGETARCH
 ARG TARGETOS
 
 WORKDIR /build
 
-RUN apt update && apt install -y --no-install-recommends make curl xz-utils musl-tools musl-dev && \
-  curl -Ls https://github.com/upx/upx/releases/download/v${upx_version}/upx-${upx_version}-${TARGETARCH}_${TARGETOS}.tar.xz -o - | tar xvJf - -C /tmp && \
-  cp /tmp/upx-${upx_version}-${TARGETARCH}_${TARGETOS}/upx /usr/local/bin/ && \
-  chmod +x /usr/local/bin/upx && \
-  apt remove -y xz-utils && \
+RUN apt update && apt install -y --no-install-recommends make musl-tools musl-dev && \
   rm -rf /var/lib/apt/lists/*
 
 COPY ./ /build/

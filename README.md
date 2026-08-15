@@ -19,8 +19,7 @@ For very large tables, two deferral mechanisms keep them out of the critical pat
 To build a static binary for the current architecture, use the provided Makefile. It requires Rust and the musl target.
 
 - `make build` — release binary at `target/<arch>-unknown-linux-musl/release/pg-migrate`.
-- `make compress` — strip and compress the binary with UPX (brute).
-- `make release` — `build` + `compress` in one step.
+- `make release` — build for release.
 - `make clean` — `cargo clean`.
 
 Alternatively, `cargo build --release` produces a non-static binary at `target/release/pg-migrate`.
