@@ -154,11 +154,11 @@ impl Worker {
 
         let _permit = copy_engine::acquire(&semaphore, &cancel).await?;
 
-        let mut client_src = self.connect_side(&self.source_config, "source").await?;
-        let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
-
         let mut total_bytes = 0;
         loop {
+            let mut client_src = self.connect_side(&self.source_config, "source").await?;
+            let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
+
             let tx_src = client_src.transaction().await.map_err(|e| {
                 self.copy_failed(
                     "Transaction start",
@@ -203,6 +203,10 @@ impl Worker {
 
             total_bytes += bytes;
             let _ = progress_tx.send(ProgressEvent::PartitionComplete).await;
+
+            // Explicitly drop connections after each partition to ensure they are closed.
+            drop(client_src);
+            drop(client_dest);
 
             let next_partition = {
                 let mut guard = rx.lock().await;

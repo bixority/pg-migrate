@@ -93,23 +93,27 @@ pub async fn run_copy_engine(
     cancel: CancellationToken,
     on_progress: impl FnMut(copy_engine::CopyProgress),
 ) -> Result<()> {
+    let keepalive_params =
+        "keepalives=1 keepalives_idle=60 keepalives_interval=10";
     let source_conn = format!(
-        "host={} port={} user={} password={} dbname={} sslmode={}",
+        "host={} port={} user={} password={} dbname={} sslmode={} {}",
         config.source.host,
         config.source.port,
         config.source.user,
         config.source.pass,
         db_name,
-        config.ssl_mode
+        config.ssl_mode,
+        keepalive_params
     );
     let dest_conn = format!(
-        "host={} port={} user={} password={} dbname={} sslmode={}",
+        "host={} port={} user={} password={} dbname={} sslmode={} {}",
         config.destination.host,
         config.destination.port,
         config.destination.user,
         config.destination.pass,
         db_name,
-        config.ssl_mode
+        config.ssl_mode,
+        keepalive_params
     );
 
     let orchestrator = copy_engine::Orchestrator::new(
@@ -130,7 +134,7 @@ pub async fn run_copy_engine(
         target.from,
         target.till,
         target.method,
-        config.max_parallel,
+        config.max_parallel * 10,
     )?;
 
     orchestrator.run(partitions, on_progress).await?;

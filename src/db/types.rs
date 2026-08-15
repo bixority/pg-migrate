@@ -132,7 +132,10 @@ impl PoolCache {
             .user(&*args.user)
             .password(&*args.pass)
             .dbname(db)
-            .ssl_mode(self.ssl_mode);
+            .ssl_mode(self.ssl_mode)
+            .keepalives(true)
+            .keepalives_idle(Duration::from_mins(1))
+            .keepalives_interval(Duration::from_secs(10));
 
         let tls = tls::make_tls();
         let (client, connection) =

@@ -1,6 +1,6 @@
 [package]
 name = "pg-migrate"
-version = "0.7.11"
+version = "0.7.12"
 edition = "2024"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
