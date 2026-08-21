@@ -1,4 +1,4 @@
-FROM --platform=$TARGETOS/$TARGETARCH docker.io/library/rust:1.97.1-slim-trixie AS build-image
+FROM --platform=$TARGETOS/$TARGETARCH docker.io/library/rust:1.98.0-slim-trixie AS build-image
 LABEL org.opencontainers.image.description="PostgreSQL migration tool"
 LABEL authors="Olegs Korsaks"
 
@@ -22,7 +22,7 @@ RUN echo "Target architecture is: ${TARGETARCH}" && \
         echo "Unsupported architecture: ${TARGETARCH}"; exit 1; \
     fi
 
-FROM --platform=$TARGETOS/$TARGETARCH docker.io/library/postgres:18.4 AS runtime
+FROM --platform=$TARGETOS/$TARGETARCH docker.io/library/postgres:18.6 AS runtime
 LABEL org.opencontainers.image.description="PostgreSQL migration tool"
 LABEL authors="Olegs Korsaks"
 
