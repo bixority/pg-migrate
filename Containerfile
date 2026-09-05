@@ -1,4 +1,4 @@
-FROM --platform=$TARGETOS/$TARGETARCH docker.io/library/rust:1.98.0-slim-trixie AS build-image
+FROM --platform=$TARGETOS/$TARGETARCH docker.io/library/rust:1.98.1-slim-trixie AS build-image
 LABEL org.opencontainers.image.description="PostgreSQL migration tool"
 LABEL authors="Olegs Korsaks"
 
