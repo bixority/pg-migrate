@@ -378,12 +378,12 @@ fn test_partition_split_in_half_time() {
     assert!(!p2.include_nulls);
 
     // Verify midpoint is between from and till
-    let t_from = parse_ts(p1.from.as_deref().expect("from should be present"))
-        .expect("from should parse");
-    let t_mid = parse_ts(p1.till.as_deref().expect("mid should be present"))
-        .expect("mid should parse");
-    let t_till = parse_ts(p2.till.as_deref().expect("till should be present"))
-        .expect("till should parse");
+    let t_from =
+        parse_ts(p1.from.as_deref().expect("from should be present")).expect("from should parse");
+    let t_mid =
+        parse_ts(p1.till.as_deref().expect("mid should be present")).expect("mid should parse");
+    let t_till =
+        parse_ts(p2.till.as_deref().expect("till should be present")).expect("till should parse");
     assert!(t_mid > t_from);
     assert!(t_mid < t_till);
 }

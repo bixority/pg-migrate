@@ -7,8 +7,8 @@ use log::{error, info};
 use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
-use tokio_postgres::error::SqlState;
 use tokio_postgres::Error as PgError;
+use tokio_postgres::error::SqlState;
 use tokio_util::sync::CancellationToken;
 
 pub struct Worker {
@@ -200,7 +200,9 @@ impl Worker {
                 Ok(bytes) => return Ok(bytes),
                 Err(err) => {
                     if reported_bytes > 0 {
-                        let _ = progress_tx.send(ProgressEvent::RevertBytes(reported_bytes)).await;
+                        let _ = progress_tx
+                            .send(ProgressEvent::RevertBytes(reported_bytes))
+                            .await;
                     }
 
                     attempt += 1;
@@ -214,7 +216,8 @@ impl Worker {
                     {
                         log::warn!(
                             "Worker {} partition {} failed after {MAX_RETRIES} attempts ({err}); dynamically splitting into smaller partitions:\n  sub 1: {p1}\n  sub 2: {p2}",
-                            self.id, partition
+                            self.id,
+                            partition
                         );
                         let _ = progress_tx.send(ProgressEvent::PartitionSplit).await;
                         let b1 = Box::pin(self.process_partition(
@@ -239,7 +242,8 @@ impl Worker {
                     let backoff = std::time::Duration::from_secs(2 * (attempt as u64));
                     log::warn!(
                         "Worker {} partition {} failed (attempt {attempt}/{MAX_RETRIES}): {err}. Retrying in {backoff:?}...",
-                        self.id, partition
+                        self.id,
+                        partition
                     );
                     tokio::select! {
                         () = tokio::time::sleep(backoff) => {},
