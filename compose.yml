@@ -3,7 +3,7 @@ name: pg-migrate
 services:
   db-old:
     image: docker.io/library/postgres:9.5
-    command: ["postgres", "-c", "max_connections=300"]
+    command: ["postgres", "-c", "max_connections=300", "-c", "max_wal_size=2GB", "-c", "checkpoint_timeout=10min"]
     ports:
       - "5432:5432"
     environment:
@@ -14,7 +14,8 @@ services:
       test: [ "CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB -h $$(hostname -i)" ]
       interval: 3s
       timeout: 15s
-      retries: 10
+      retries: 30
+      start_period: 60s
     volumes:
       - ./.docker/db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro,Z
     networks:
@@ -41,7 +42,10 @@ services:
     build:
       context: ./
       dockerfile: Containerfile
+    volumes:
+      - ./config.toml:/config.toml:ro,Z
     command: [
+      "--config", "/config.toml",
       "--from-host", "db-old",
       "--from-port", "5432",
       "--from-user", "dev",
@@ -50,9 +54,6 @@ services:
       "--to-port", "5432",
       "--to-user", "dev",
       "--to-pass", "dev",
-      "--max-parallel", "4",
-      "--delay-table-data", "pdb1.public.table3",
-      "--delay-table-data", "pdb2.public.table*",
     ]
     depends_on:
       db-old:
