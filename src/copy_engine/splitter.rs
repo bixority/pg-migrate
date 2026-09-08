@@ -27,6 +27,85 @@ impl Display for Partition {
     }
 }
 
+impl Partition {
+    /// Attempts to split this partition into two equal sub-partitions.
+    ///
+    /// For time/date partitions, it calculates the midpoint between `from` and `till`
+    /// (or current time if `till` is open-ended).
+    /// For hash partitions with modulus `n` and remainder `i`, it doubles the modulus to `2n`
+    /// producing remainder `i` and `i + n`.
+    ///
+    /// Returns `None` if the partition cannot be meaningfully subdivided (e.g. interval is too small,
+    /// or lower bound is unbounded).
+    #[must_use]
+    pub fn split_in_half(&self) -> Option<(Self, Self)> {
+        if &*self.method == "hash" {
+            let i: usize = self.from.as_deref()?.parse().ok()?;
+            let n: usize = self.till.as_deref()?.parse().ok()?;
+            if n == 0 {
+                return None;
+            }
+            let new_n = n.checked_mul(2)?;
+            let p1 = Self {
+                column: self.column.clone(),
+                from: Some(i.to_string()),
+                till: Some(new_n.to_string()),
+                method: self.method.clone(),
+                include_nulls: self.include_nulls,
+            };
+            let p2 = Self {
+                column: self.column.clone(),
+                from: Some((i + n).to_string()),
+                till: Some(new_n.to_string()),
+                method: self.method.clone(),
+                include_nulls: false,
+            };
+            return Some((p1, p2));
+        }
+
+        let from_ts = self.from.as_deref()?;
+        let from = parse_ts(from_ts).ok()?;
+
+        let (till, open_last) = match self.till.as_deref() {
+            Some(till_str) => (parse_ts(till_str).ok()?, false),
+            None => (Utc::now(), true),
+        };
+
+        let duration = till.signed_duration_since(from);
+        let total_ms = duration.num_milliseconds();
+        if total_ms < 2000 {
+            return None;
+        }
+
+        let mid = from + chrono::Duration::milliseconds(total_ms / 2);
+        if mid <= from || mid >= till {
+            return None;
+        }
+
+        let p1 = Self {
+            column: self.column.clone(),
+            from: Some(from.to_rfc3339()),
+            till: Some(mid.to_rfc3339()),
+            method: self.method.clone(),
+            include_nulls: self.include_nulls,
+        };
+
+        let p2 = Self {
+            column: self.column.clone(),
+            from: Some(mid.to_rfc3339()),
+            till: if open_last {
+                None
+            } else {
+                Some(till.to_rfc3339())
+            },
+            method: self.method.clone(),
+            include_nulls: false,
+        };
+
+        Some((p1, p2))
+    }
+}
+
 pub struct Splitter;
 
 impl Splitter {

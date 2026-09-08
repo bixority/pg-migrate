@@ -164,7 +164,7 @@ async fn identify_copy_rules(
                 from.as_deref(),
                 till.as_deref(),
                 rule.method.as_deref(),
-                config.max_parallel,
+                config.max_parallel * 10,
             )?;
 
             db_plan.copy_rules.push(CopyRulePlan {

@@ -18,3 +18,31 @@ fn test_error_display() {
         "Worker failure in partition part1: Configuration error: failed"
     );
 }
+
+#[test]
+fn test_error_retryable() {
+    let io_err = CopyEngineError::Io(IoError::other("reset by peer"));
+    assert!(io_err.is_retryable());
+
+    let config_err = CopyEngineError::Configuration("bad setting".into());
+    assert!(!config_err.is_retryable());
+
+    let table_err = CopyEngineError::TableNotFound {
+        side: "destination",
+        table: "public.ord_log".into(),
+        search_path: "public".into(),
+    };
+    assert!(!table_err.is_retryable());
+
+    let worker_io_err = CopyEngineError::WorkerFailed {
+        partition: "part1".into(),
+        source: Box::new(CopyEngineError::Io(IoError::other("broken pipe"))),
+    };
+    assert!(worker_io_err.is_retryable());
+
+    let worker_config_err = CopyEngineError::WorkerFailed {
+        partition: "part1".into(),
+        source: Box::new(CopyEngineError::Configuration("bad setting".into())),
+    };
+    assert!(!worker_config_err.is_retryable());
+}

@@ -3,6 +3,7 @@ use std::io::Error as IoError;
 use thiserror::Error;
 use tokio::sync::AcquireError;
 use tokio_postgres::Error as PgError;
+use tokio_postgres::error::SqlState;
 
 #[derive(Debug, Error)]
 pub enum CopyEngineError {
@@ -80,6 +81,42 @@ pub struct CopyFailure {
     pub hint: Cow<'static, str>,
     #[source]
     pub source: PgError,
+}
+
+impl CopyEngineError {
+    #[must_use]
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Connection(e) => Self::is_pg_retryable(e),
+            Self::Io(_) => true,
+            Self::CopyFailed(failure) => Self::is_pg_retryable(&failure.source),
+            Self::WorkerFailed { source, .. } => source.is_retryable(),
+            Self::Configuration(_)
+            | Self::TableNotFound { .. }
+            | Self::Semaphore(_)
+            | Self::Splitter(_)
+            | Self::Join(_) => false,
+        }
+    }
+
+    fn is_pg_retryable(err: &PgError) -> bool {
+        if err.is_closed() {
+            return true;
+        }
+        err.as_db_error().is_none_or(|db_err| {
+            let code = db_err.code();
+            !matches!(
+                *code,
+                SqlState::UNDEFINED_TABLE
+                    | SqlState::UNDEFINED_COLUMN
+                    | SqlState::SYNTAX_ERROR
+                    | SqlState::INVALID_CATALOG_NAME
+                    | SqlState::INVALID_SCHEMA_NAME
+                    | SqlState::INSUFFICIENT_PRIVILEGE
+                    | SqlState::INVALID_PASSWORD
+            )
+        })
+    }
 }
 
 pub type Result<T> = std::result::Result<T, CopyEngineError>;

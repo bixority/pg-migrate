@@ -358,3 +358,70 @@ fn test_split_hash() -> Result<()> {
     assert!(!partitions[2].include_nulls);
     Ok(())
 }
+
+#[test]
+fn test_partition_split_in_half_time() {
+    let p = Partition {
+        column: "dtcrea".into(),
+        from: Some("2024-11-15T09:10:09.820+00:00".to_string()),
+        till: Some("2025-02-06T01:45:14.730+00:00".to_string()),
+        method: "time".into(),
+        include_nulls: true,
+    };
+
+    let (p1, p2) = p.split_in_half().expect("should split in half");
+    assert_eq!(&*p1.column, "dtcrea");
+    assert_eq!(p1.from, p.from);
+    assert_eq!(p1.till, p2.from);
+    assert_eq!(p2.till, p.till);
+    assert!(p1.include_nulls);
+    assert!(!p2.include_nulls);
+
+    // Verify midpoint is between from and till
+    let t_from = parse_ts(p1.from.as_deref().expect("from should be present"))
+        .expect("from should parse");
+    let t_mid = parse_ts(p1.till.as_deref().expect("mid should be present"))
+        .expect("mid should parse");
+    let t_till = parse_ts(p2.till.as_deref().expect("till should be present"))
+        .expect("till should parse");
+    assert!(t_mid > t_from);
+    assert!(t_mid < t_till);
+}
+
+#[test]
+fn test_partition_split_in_half_open_last() {
+    let p = Partition {
+        column: "dtcrea".into(),
+        from: Some("2024-01-01T00:00:00+00:00".to_string()),
+        till: None,
+        method: "time".into(),
+        include_nulls: false,
+    };
+
+    let (p1, p2) = p.split_in_half().expect("should split in half");
+    assert_eq!(p1.from, p.from);
+    assert_eq!(p1.till, p2.from);
+    assert!(p2.till.is_none());
+    assert!(!p1.include_nulls);
+    assert!(!p2.include_nulls);
+}
+
+#[test]
+fn test_partition_split_in_half_hash() {
+    let p = Partition {
+        column: "id".into(),
+        from: Some("1".to_string()),
+        till: Some("4".to_string()),
+        method: "hash".into(),
+        include_nulls: true,
+    };
+
+    let (p1, p2) = p.split_in_half().expect("should split in half");
+    assert_eq!(p1.from.as_deref(), Some("1"));
+    assert_eq!(p1.till.as_deref(), Some("8"));
+    assert!(p1.include_nulls);
+
+    assert_eq!(p2.from.as_deref(), Some("5"));
+    assert_eq!(p2.till.as_deref(), Some("8"));
+    assert!(!p2.include_nulls);
+}

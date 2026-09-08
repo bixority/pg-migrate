@@ -93,7 +93,8 @@ pub async fn run_copy_engine(
     cancel: CancellationToken,
     on_progress: impl FnMut(copy_engine::CopyProgress),
 ) -> Result<()> {
-    let keepalive_params = "keepalives=1 keepalives_idle=60 keepalives_interval=10";
+    let keepalive_params =
+        "keepalives=1 keepalives_idle=30 keepalives_interval=10 keepalives_retries=5";
     let source_conn = format!(
         "host={} port={} user={} password={} dbname={} sslmode={} {}",
         config.source.host,

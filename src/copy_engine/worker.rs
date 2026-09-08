@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Semaphore};
 use tokio_postgres::error::SqlState;
-use tokio_postgres::{Error as PgError, Transaction};
+use tokio_postgres::Error as PgError;
 use tokio_util::sync::CancellationToken;
 
 pub struct Worker {
@@ -127,15 +127,13 @@ impl Worker {
     }
 
     /// Runs the worker loop, pulling partitions from the channel and processing
-    /// them over a single pair of connections and a single pair of transactions.
+    /// them with automatic retry and subdivision.
     ///
     /// # Errors
     ///
     /// Returns an error if:
-    /// - Connection to the source or destination database fails.
-    /// - A transaction cannot be started.
-    /// - Any partition copy fails.
-    /// - A transaction cannot be committed.
+    /// - Connection to the source or destination database fails permanently.
+    /// - Any partition copy fails after retries and cannot be subdivided.
     pub async fn run(
         &self,
         rx: Arc<Mutex<tokio::sync::mpsc::Receiver<Partition>>>,
@@ -156,57 +154,12 @@ impl Worker {
 
         let mut total_bytes = 0;
         loop {
-            let mut client_src = self.connect_side(&self.source_config, "source").await?;
-            let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
-
-            let tx_src = client_src.transaction().await.map_err(|e| {
-                self.copy_failed(
-                    "Transaction start",
-                    "source",
-                    Some(&partition),
-                    "beginning source transaction",
-                    e,
-                )
-            })?;
-            let tx_dest = client_dest.transaction().await.map_err(|e| {
-                self.copy_failed(
-                    "Transaction start",
-                    "destination",
-                    Some(&partition),
-                    "beginning destination transaction",
-                    e,
-                )
-            })?;
-
             let bytes = self
-                .copy_partition(&tx_src, &tx_dest, &partition, &progress_tx)
+                .process_partition(&partition, &progress_tx, &cancel, 4)
                 .await?;
-
-            tx_src.commit().await.map_err(|e| {
-                self.copy_failed(
-                    "Transaction commit",
-                    "source",
-                    Some(&partition),
-                    "committing source transaction",
-                    e,
-                )
-            })?;
-            tx_dest.commit().await.map_err(|e| {
-                self.copy_failed(
-                    "Transaction commit",
-                    "destination",
-                    Some(&partition),
-                    "committing destination transaction",
-                    e,
-                )
-            })?;
 
             total_bytes += bytes;
             let _ = progress_tx.send(ProgressEvent::PartitionComplete).await;
-
-            // Explicitly drop connections after each partition to ensure they are closed.
-            drop(client_src);
-            drop(client_dest);
 
             let next_partition = {
                 let mut guard = rx.lock().await;
@@ -222,17 +175,105 @@ impl Worker {
         Ok(total_bytes)
     }
 
-    /// Copies a single partition using the provided transactions.
-    async fn copy_partition(
+    /// Processes a partition with retries and exponential backoff. If transient failures
+    /// persist after retries, attempts to dynamically subdivide the partition into smaller chunks.
+    async fn process_partition(
         &self,
-        tx_src: &Transaction<'_>,
-        tx_dest: &Transaction<'_>,
         partition: &Partition,
         progress_tx: &tokio::sync::mpsc::Sender<ProgressEvent>,
+        cancel: &CancellationToken,
+        max_depth: usize,
+    ) -> Result<u64> {
+        const MAX_RETRIES: usize = 3;
+        let mut attempt = 0;
+
+        loop {
+            if cancel.is_cancelled() {
+                return Err(CopyEngineError::Configuration("cancelled".into()));
+            }
+
+            let mut reported_bytes = 0;
+            match self
+                .do_copy_partition(partition, progress_tx, &mut reported_bytes)
+                .await
+            {
+                Ok(bytes) => return Ok(bytes),
+                Err(err) => {
+                    if reported_bytes > 0 {
+                        let _ = progress_tx.send(ProgressEvent::RevertBytes(reported_bytes)).await;
+                    }
+
+                    attempt += 1;
+                    if !err.is_retryable() || cancel.is_cancelled() {
+                        return Err(err);
+                    }
+
+                    if attempt > MAX_RETRIES
+                        && max_depth > 0
+                        && let Some((p1, p2)) = partition.split_in_half()
+                    {
+                        log::warn!(
+                            "Worker {} partition {} failed after {MAX_RETRIES} attempts ({err}); dynamically splitting into smaller partitions:\n  sub 1: {p1}\n  sub 2: {p2}",
+                            self.id, partition
+                        );
+                        let _ = progress_tx.send(ProgressEvent::PartitionSplit).await;
+                        let b1 = Box::pin(self.process_partition(
+                            &p1,
+                            progress_tx,
+                            cancel,
+                            max_depth - 1,
+                        ))
+                        .await?;
+                        let _ = progress_tx.send(ProgressEvent::PartitionComplete).await;
+
+                        let b2 = Box::pin(self.process_partition(
+                            &p2,
+                            progress_tx,
+                            cancel,
+                            max_depth - 1,
+                        ))
+                        .await?;
+                        return Ok(b1 + b2);
+                    }
+
+                    let backoff = std::time::Duration::from_secs(2 * (attempt as u64));
+                    log::warn!(
+                        "Worker {} partition {} failed (attempt {attempt}/{MAX_RETRIES}): {err}. Retrying in {backoff:?}...",
+                        self.id, partition
+                    );
+                    tokio::select! {
+                        () = tokio::time::sleep(backoff) => {},
+                        () = cancel.cancelled() => {
+                            return Err(CopyEngineError::Configuration("cancelled".into()));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Performs the streaming COPY from source to destination for a single partition.
+    #[allow(clippy::too_many_lines)]
+    async fn do_copy_partition(
+        &self,
+        partition: &Partition,
+        progress_tx: &tokio::sync::mpsc::Sender<ProgressEvent>,
+        reported_bytes: &mut u64,
     ) -> Result<u64> {
         info!("Worker {} starting partition: {}", self.id, partition);
 
         let (source_query, dest_query) = self.build_copy_queries(partition)?;
+
+        let mut client_src = self.connect_side(&self.source_config, "source").await?;
+        let tx_src = client_src.transaction().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction start",
+                "source",
+                Some(partition),
+                "beginning source transaction",
+                e,
+            )
+        })?;
 
         let stream = tx_src.copy_out(&source_query).await.map_err(|e| {
             self.copy_failed(
@@ -243,6 +284,18 @@ impl Worker {
                 e,
             )
         })?;
+
+        let mut client_dest = self.connect_side(&self.dest_config, "destination").await?;
+        let tx_dest = client_dest.transaction().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction start",
+                "destination",
+                Some(partition),
+                "beginning destination transaction",
+                e,
+            )
+        })?;
+
         let sink = tx_dest.copy_in(&dest_query).await.map_err(|e| {
             self.copy_failed(
                 "COPY IN",
@@ -259,6 +312,8 @@ impl Worker {
         let mut total_bytes = 0;
         let mut last_reported_bytes = 0;
         let mut last_flushed_bytes = 0;
+        let mut last_flushed_time = tokio::time::Instant::now();
+        let flush_interval = tokio::time::Duration::from_secs(5);
 
         while let Some(row_data) = stream.next().await {
             let data = row_data.map_err(|e| {
@@ -273,7 +328,6 @@ impl Worker {
             let len = data.len() as u64;
             total_bytes += len;
 
-            // Use `feed` to buffer the data instead of `send` which flushes after every chunk.
             sink.feed(data).await.map_err(|e| {
                 self.copy_failed(
                     "COPY IN (streaming)",
@@ -288,9 +342,14 @@ impl Worker {
                 let delta = total_bytes - last_reported_bytes;
                 let _ = progress_tx.send(ProgressEvent::Bytes(delta)).await;
                 last_reported_bytes = total_bytes;
+                *reported_bytes = total_bytes;
             }
 
-            if total_bytes - last_flushed_bytes >= self.buffer_size {
+            let now = tokio::time::Instant::now();
+            if total_bytes - last_flushed_bytes >= self.buffer_size
+                || (total_bytes > last_flushed_bytes
+                    && now.duration_since(last_flushed_time) >= flush_interval)
+            {
                 sink.flush().await.map_err(|e| {
                     self.copy_failed(
                         "COPY IN (flush)",
@@ -301,6 +360,7 @@ impl Worker {
                     )
                 })?;
                 last_flushed_bytes = total_bytes;
+                last_flushed_time = now;
             }
         }
 
@@ -325,11 +385,35 @@ impl Worker {
             )
         })?;
 
+        tx_dest.commit().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction commit",
+                "destination",
+                Some(partition),
+                "committing destination transaction",
+                e,
+            )
+        })?;
+
+        tx_src.commit().await.map_err(|e| {
+            self.copy_failed(
+                "Transaction commit",
+                "source",
+                Some(partition),
+                "committing source transaction",
+                e,
+            )
+        })?;
+
         // Report any remaining bytes.
         if total_bytes > last_reported_bytes {
             let delta = total_bytes - last_reported_bytes;
             let _ = progress_tx.send(ProgressEvent::Bytes(delta)).await;
+            *reported_bytes = total_bytes;
         }
+
+        drop(client_src);
+        drop(client_dest);
 
         info!(
             "Worker {} finished partition: {}. Total bytes: {}",

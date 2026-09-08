@@ -20,7 +20,9 @@ pub struct CopyProgress {
 
 pub enum ProgressEvent {
     Bytes(u64),
+    RevertBytes(u64),
     PartitionComplete,
+    PartitionSplit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -174,7 +176,7 @@ impl Orchestrator {
         partitions: Vec<Partition>,
         mut on_progress: impl FnMut(CopyProgress),
     ) -> Result<u64> {
-        let total_partitions = partitions.len();
+        let mut total_partitions = partitions.len();
         info!(
             "Starting migration for table {} with {} workers and {total_partitions} partitions",
             self.table_name, self.worker_count,
@@ -242,7 +244,11 @@ impl Orchestrator {
                 Some(event) = progress_rx.recv() => {
                     match event {
                         ProgressEvent::Bytes(bytes) => total_bytes += bytes,
+                        ProgressEvent::RevertBytes(bytes) => {
+                            total_bytes = total_bytes.saturating_sub(bytes);
+                        }
                         ProgressEvent::PartitionComplete => completed += 1,
+                        ProgressEvent::PartitionSplit => total_partitions += 1,
                     }
                     on_progress(CopyProgress {
                         completed_partitions: completed,
@@ -258,7 +264,11 @@ impl Orchestrator {
                         while let Some(event) = progress_rx.recv().await {
                             match event {
                                 ProgressEvent::Bytes(bytes) => total_bytes += bytes,
+                                ProgressEvent::RevertBytes(bytes) => {
+                                    total_bytes = total_bytes.saturating_sub(bytes);
+                                }
                                 ProgressEvent::PartitionComplete => completed += 1,
+                                ProgressEvent::PartitionSplit => total_partitions += 1,
                             }
                             on_progress(CopyProgress {
                                 completed_partitions: completed,
