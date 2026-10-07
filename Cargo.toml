@@ -1,8 +1,8 @@
 [package]
 name = "pg-migrate"
-version = "0.7.14"
+version = "0.7.15"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.99"
 description = "PostgreSQL migration tool"
 license = "GPL-3.0-only"
 
@@ -17,18 +17,18 @@ cli = ["dep:clap"]
 
 [dependencies]
 chrono = "0.4.45"
-clap = { version = "4.6.6", features = ["derive"], optional = true }
+clap = { version = "4.6.7", features = ["derive"], optional = true }
 env_logger = "0.11.11"
 futures = { version = "0.3.34", default-features = false, features = ["std", "async-await"] }
 futures-util = "0.3.34"
 indicatif = "0.18.6"
 indicatif-log-bridge = "0.2.3"
 log = "0.4.34"
-rustls = { version = "0.23.44", default-features = false, features = ["ring"] }
+rustls = { version = "0.23.45", default-features = false, features = ["ring"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
-thiserror = "2.0.20"
-tokio = { version = "1.53.1", features = ["full"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["full"] }
 tokio-postgres = { version = "0.7.18", features = ["with-serde_json-1", "with-chrono-0_4"] }
 tokio-postgres-rustls = "0.14.0"
 tokio-util = "0.7.19"
